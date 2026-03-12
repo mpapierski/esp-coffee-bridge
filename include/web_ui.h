@@ -927,7 +927,7 @@ static const char kPage[] PROGMEM = R"HTML(
           <div class="value-item"><span>Station</span><span>${state.status?.staConnected ? escapeHtml(state.status.staIp || state.status.staSsid || "connected") : "offline"}</span></div>
           <div class="value-item"><span>AP</span><span>${escapeHtml(state.status?.apIp || "")}</span></div>
           <div class="value-item"><span>Scan</span><span>${state.status?.lastScanResultCount ?? 0} devices</span></div>
-          <div class="value-item"><span>Stored session</span><span>${state.status?.hasStoredSessionKey ? escapeHtml(state.status.storedSessionKeyHex) : "none"}</span></div>
+          <div class="value-item"><span>Protocol sessions</span><span>${state.status?.protocolSessionCount ?? 0}</span></div>
         </div>
       </section>
     `;
@@ -1483,21 +1483,30 @@ static const char kPage[] PROGMEM = R"HTML(
     };
   }
 
-  function renderDiagnosticsSection(machine) {
+  function renderDiagnosticsSection(machine, summary) {
     const output = state.diagnostics.output ? escapeHtml(pretty(state.diagnostics.output)) : "{}";
     const logs = state.diagnostics.logs ? escapeHtml(pretty(state.diagnostics.logs)) : "No logs loaded.";
     const defaults = diagnosticsDefault(machine);
+    const protocolSession = summary?.protocolSession || {};
+    const sessionAge = protocolSession.setAtMs ? formatAgo(protocolSession.setAtMs) : "";
     return `
       <section class="panel">
         <h2 class="section-title">Diagnostics</h2>
-        <p class="muted">This page keeps the raw bridge packet tools, but scopes every request to the saved machine address currently opened in the dashboard.</p>
+        <p class="muted">This page keeps the raw bridge packet tools, but scopes every request to the saved machine currently opened in the dashboard.</p>
       </section>
 
       <section class="grid two">
         <article class="diag-block">
-          <h3>Stored session key</h3>
+          <h3>Protocol session key</h3>
+          <div class="value-list" style="margin-bottom:16px;">
+            <div class="value-item"><span>Current session</span><span>${protocolSession.hasSession ? escapeHtml(protocolSession.sessionHex) : "none"}</span></div>
+            <div class="value-item"><span>Source</span><span>${escapeHtml(protocolSession.source || "-")}</span></div>
+            <div class="value-item"><span>Updated</span><span>${escapeHtml(sessionAge || "never")}</span></div>
+          </div>
           <form data-action="diag-session-set">
             <input type="hidden" name="serial" value="${escapeHtml(machine.serial)}">
+            <input type="hidden" name="address" value="${escapeHtml(machine.address)}">
+            <input type="hidden" name="addressType" value="${escapeHtml(String(machine.addressType ?? 0))}">
             <label class="label">Session hex
               <input type="text" name="sessionHex" placeholder="1234">
             </label>
@@ -1506,7 +1515,7 @@ static const char kPage[] PROGMEM = R"HTML(
             </label>
             <div class="row">
               <button type="submit">Set session</button>
-              <button type="button" class="secondary" data-action="diag-session-clear">Clear</button>
+              <button type="button" class="secondary" data-action="diag-session-clear" data-serial="${escapeHtml(machine.serial)}" data-address="${escapeHtml(machine.address)}" data-address-type="${escapeHtml(String(machine.addressType ?? 0))}">Clear</button>
             </div>
           </form>
         </article>
@@ -1540,6 +1549,7 @@ static const char kPage[] PROGMEM = R"HTML(
         <article class="diag-block">
           <h3>Send frame</h3>
           <form data-action="diag-send-frame">
+            <input type="hidden" name="serial" value="${escapeHtml(machine.serial)}">
             <input type="hidden" name="address" value="${escapeHtml(machine.address)}">
             <div class="field-grid">
               <label class="label">Command
@@ -1570,6 +1580,7 @@ static const char kPage[] PROGMEM = R"HTML(
         <article class="diag-block">
           <h3>App-style probe</h3>
           <form data-action="diag-app-probe">
+            <input type="hidden" name="serial" value="${escapeHtml(machine.serial)}">
             <input type="hidden" name="address" value="${escapeHtml(machine.address)}">
             <div class="field-grid">
               <label class="label">HR register
@@ -1677,28 +1688,30 @@ static const char kPage[] PROGMEM = R"HTML(
     }
 
     let summary = getMachineCache(serial).summary;
-    try {
-      summary = await loadMachineSummary(serial, true);
-    } catch (error) {
-      setFlash(`Live summary unavailable for ${machine.alias || machine.serial}: ${error.message}`, "error");
+    if (!summary) {
+      try {
+        summary = await loadMachineSummary(serial, true);
+      } catch (error) {
+        setFlash(`Live summary unavailable for ${machine.alias || machine.serial}: ${error.message}`, "error");
+      }
     }
 
     let body = "";
     try {
       if (section === "recipes") {
         const [recipesData, savedData] = await Promise.all([
-          loadMachineRecipes(serial, true),
-          loadSavedRecipes(serial, true).catch(() => ({ recipes: [] }))
+          loadMachineRecipes(serial, false),
+          loadSavedRecipes(serial, false).catch(() => ({ recipes: [] }))
         ]);
         body = renderRecipesSection(machine, recipesData, savedData);
       } else if (section === "saved") {
-        body = renderSavedRecipesSection(machine, await loadSavedRecipes(serial, true));
+        body = renderSavedRecipesSection(machine, await loadSavedRecipes(serial, false));
       } else if (section === "stats") {
-        body = renderStatsSection(await loadMachineStats(serial, true));
+        body = renderStatsSection(await loadMachineStats(serial, false));
       } else if (section === "settings") {
-        body = renderSettingsSection(machine, await loadMachineSettings(serial, true));
+        body = renderSettingsSection(machine, await loadMachineSettings(serial, false));
       } else if (section === "diagnostics") {
-        body = renderDiagnosticsSection(machine);
+        body = renderDiagnosticsSection(machine, summary);
       } else {
         body = `<section class="panel"><div class="empty">Unknown machine section.</div></section>`;
       }
@@ -1722,14 +1735,16 @@ static const char kPage[] PROGMEM = R"HTML(
     }
 
     let summary = getMachineCache(serial).summary;
-    try {
-      summary = await loadMachineSummary(serial, true);
-    } catch (error) {
-      setFlash(`Live summary unavailable for ${machine.alias || machine.serial}: ${error.message}`, "error");
+    if (!summary) {
+      try {
+        summary = await loadMachineSummary(serial, true);
+      } catch (error) {
+        setFlash(`Live summary unavailable for ${machine.alias || machine.serial}: ${error.message}`, "error");
+      }
     }
 
     try {
-      const recipeData = await loadRecipeDetail(serial, slot, true);
+      const recipeData = await loadRecipeDetail(serial, slot, false);
       app.innerHTML = renderMachineHeader(machine, summary, "saved") + renderRecipeDetail(machine, recipeData, slot);
     } catch (error) {
       setFlash(error.message || "Recipe request failed.", "error");
@@ -1863,8 +1878,16 @@ static const char kPage[] PROGMEM = R"HTML(
       }
 
       if (action === "diag-session-clear") {
-        const response = await runWithFlash("Clearing stored session key…", () => api(`${PROTOCOL_API}/session`, { json: { clear: true } }), "Stored session key cleared.");
+        const serial = button.dataset.serial;
+        const address = button.dataset.address;
+        const addressType = button.dataset.addressType;
+        const response = await runWithFlash("Clearing machine protocol session…", () => api(`${PROTOCOL_API}/session`, {
+          json: { clear: true, serial, address, addressType }
+        }), "Protocol session cleared.");
         state.diagnostics.output = response;
+        if (serial) {
+          invalidateMachine(serial);
+        }
         await refreshCore();
         await renderRoute();
       }
@@ -2042,13 +2065,20 @@ static const char kPage[] PROGMEM = R"HTML(
       }
 
       if (action === "diag-session-set") {
-        const response = await runWithFlash("Saving stored session key…", () => api(`${PROTOCOL_API}/session`, {
+        const serial = String(form.elements.serial.value || "").trim();
+        const response = await runWithFlash("Saving machine protocol session…", () => api(`${PROTOCOL_API}/session`, {
           json: {
+            serial,
+            address: String(form.elements.address.value || "").trim(),
+            addressType: String(form.elements.addressType.value || "").trim(),
             sessionHex: String(form.elements.sessionHex.value || "").trim(),
             source: String(form.elements.source.value || "machine-diagnostics").trim()
           }
-        }), "Stored session key updated.");
+        }), "Protocol session updated.");
         state.diagnostics.output = response;
+        if (serial) {
+          invalidateMachine(serial);
+        }
         await refreshCore();
         await renderRoute();
       }
@@ -2068,8 +2098,10 @@ static const char kPage[] PROGMEM = R"HTML(
       }
 
       if (action === "diag-send-frame") {
+        const serial = String(form.elements.serial.value || "").trim();
         const response = await runWithFlash("Sending frame…", () => api(`${PROTOCOL_API}/send-frame`, {
           json: {
+            serial,
             address: form.elements.address.value,
             command: String(form.elements.command.value || "").trim(),
             payloadHex: String(form.elements.payloadHex.value || "").trim(),
@@ -2083,12 +2115,17 @@ static const char kPage[] PROGMEM = R"HTML(
           }
         }), "Frame sent.");
         state.diagnostics.output = response;
+        if (serial) {
+          invalidateMachine(serial);
+        }
         await renderRoute();
       }
 
       if (action === "diag-app-probe") {
+        const serial = String(form.elements.serial.value || "").trim();
         const response = await runWithFlash("Running app-style probe…", () => api(`${PROTOCOL_API}/app-probe`, {
           json: {
+            serial,
             address: form.elements.address.value,
             hrRegisterId: parseNumberField(form, "hrRegisterId") || 200,
             waitMs: parseNumberField(form, "waitMs") || 3000,
@@ -2103,6 +2140,9 @@ static const char kPage[] PROGMEM = R"HTML(
           }
         }), "App-style probe finished.");
         state.diagnostics.output = response;
+        if (serial) {
+          invalidateMachine(serial);
+        }
         await renderRoute();
       }
 
@@ -2151,7 +2191,7 @@ static const char kPage[] PROGMEM = R"HTML(
         await refreshCore();
         renderSidebar();
         const current = route();
-        if (current.name === "dashboard" || current.name === "machine" || current.name === "recipe-detail") {
+        if (current.name === "dashboard") {
           await renderRoute({ showLoading: false });
         }
       } catch (error) {

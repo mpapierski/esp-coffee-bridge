@@ -186,6 +186,7 @@ Body:
 
 ```json
 {
+  "serial": "756573071020106-----",
   "sessionHex": "1234",
   "source": "manual"
 }
@@ -195,11 +196,12 @@ Or clear it:
 
 ```json
 {
-  "clear": true
+  "clear": true,
+  "serial": "756573071020106-----"
 }
 ```
 
-This stores a 2-byte session key for later app-style requests. The current stored value is also exposed by `GET /api/status`.
+This stores a 2-byte proprietary protocol session key for one saved machine target. `GET /api/status` exposes only the number of cached protocol sessions; the actual session value is available from that machine’s summary/diagnostics view.
 
 `/api/protocol/send-frame` body:
 
@@ -290,8 +292,8 @@ It emulates the inherited library worker path more closely:
 - optional disconnect/reconnect after pairing
 - enable `AD02` notifications once
 - run internal library-style `HU`
-- on `HU` success, store the 2-byte session key
-- then send public-frame style `HV` / `HL` / `HX` / `HR` requests using that stored session automatically when available
+- on `HU` success, store the 2-byte session key for the current target machine
+- then send public-frame style `HV` / `HL` / `HX` / `HR` requests using that target-scoped stored session automatically when available
 - on `HU` failure, optionally disconnect immediately like the library worker
 
 `/api/protocol/hu` body:

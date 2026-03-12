@@ -34,6 +34,9 @@ inline constexpr uint16_t HE_FACTORY_RESET_RECIPES  = 0x0033;
 struct RegisterProbe {
     const char* name;
     uint16_t id;
+    const char* title;
+    const char* section;
+    const char* unit;
 };
 
 extern const RegisterProbe STATS_8000_PROBES[];
@@ -208,6 +211,8 @@ bool decodeHxResponse(const std::vector<ByteVector>& chunks, bool encrypted, Pro
 
 void selectStandardRecipes(const ModelInfo& modelInfo,
                            std::vector<const StandardRecipeDescriptor*>& selectedOut);
+void selectStatsDescriptors(const ModelInfo& modelInfo,
+                            std::vector<const RegisterProbe*>& selectedOut);
 bool resolveMyCoffeeLayout(const ModelInfo& modelInfo, MyCoffeeLayout& layoutOut);
 uint16_t myCoffeeSlotBase(uint8_t slotIndex);
 bool decodeHaResponse(const std::vector<ByteVector>& chunks,

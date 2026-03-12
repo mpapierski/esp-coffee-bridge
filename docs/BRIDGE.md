@@ -26,7 +26,7 @@ Current embedded bridge UI is now organized around remembered machines rather th
   - `GET /api/machines/{serial}/settings`
   - `POST /api/machines/{serial}/settings`
 - diagnostics page
-  - the new dashboard scopes diagnostics to the saved machine address, but it still uses the existing low-level routes:
+  - the new dashboard scopes diagnostics and protocol-session cache to the saved machine, but it still uses the existing low-level routes:
     - `/api/protocol/send-frame`
     - `/api/protocol/app-probe`
     - `/api/protocol/settings-probe`
@@ -116,8 +116,16 @@ Current firmware behavior:
     - `79x`: `espresso`, `coffee`, `americano`, `cappuccino`, `latte_macchiato`, `milk`, `hot_water`, `my_coffee`
     - unit: count
   - maintenance:
-    - `filter_dependency`
-    - unit: flag / small numeric status
+    - `700` live-verified on model `756`:
+    - `clean_brewing_unit`, `clean_frother`, `rinse_cycles`, `filter_changes`, `descaling`, `beverages_via_app`
+    - `descale_percent`, `descale_warning`, `brew_unit_clean_percent`, `brew_unit_clean_warning`
+    - `frother_clean_percent`, `frother_clean_warning`, `filter_percent`, `filter_warning`, `filter_dependency`
+    - units: count, percent, or flag depending on field
+    - live example values on model `756`:
+    - `clean_brewing_unit=31`, `clean_frother=1`, `descaling=3`
+    - `descale_percent=59`, `brew_unit_clean_percent=13`, `frother_clean_percent=13`
+    - `filter_dependency=0`
+    - `79x` maintenance beyond `filter_dependency` is not live-verified in the bridge yet
 
 ### Family 8000
 

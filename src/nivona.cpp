@@ -279,24 +279,24 @@ const ModelRule MODEL_RULES[] = {
     {"670", "Eugster670", "670", "NICR 670", "600", SettingsFamily::Family600, 5, RecipeTextEncoding::LegacySingleByte, false, true, false, false, 0x0B},
     {"675", "Eugster675", "675", "NICR 675", "600", SettingsFamily::Family600, 5, RecipeTextEncoding::LegacySingleByte, false, true, false, false, 0x0B},
     {"680", "Eugster680", "680", "NICR 680", "600", SettingsFamily::Family600, 5, RecipeTextEncoding::LegacySingleByte, false, true, false, false, 0x0B},
-    {"756", "Eugster756", "756", "NICR 756", "700", SettingsFamily::Family700, 1, RecipeTextEncoding::LegacySingleByte, false, true, false, false, 0x0B},
-    {"758", "Eugster758", "758", "NICR 758", "700", SettingsFamily::Family700, 1, RecipeTextEncoding::LegacySingleByte, false, false, false, false, 0x0B},
-    {"759", "Eugster759", "759", "NICR 759", "700", SettingsFamily::Family700, 1, RecipeTextEncoding::LegacySingleByte, false, true, false, false, 0x0B},
-    {"768", "Eugster768", "768", "NICR 768", "700", SettingsFamily::Family700, 1, RecipeTextEncoding::LegacySingleByte, false, true, false, false, 0x0B},
-    {"769", "Eugster769", "769", "NICR 769", "700", SettingsFamily::Family700, 1, RecipeTextEncoding::LegacySingleByte, false, true, false, false, 0x0B},
-    {"778", "Eugster778", "778", "NICR 778", "700", SettingsFamily::Family700, 1, RecipeTextEncoding::LegacySingleByte, false, true, false, false, 0x0B},
-    {"779", "Eugster779", "779", "NICR 779", "700", SettingsFamily::Family700, 1, RecipeTextEncoding::LegacySingleByte, false, true, false, false, 0x0B},
-    {"788", "Eugster788", "788", "NICR 788", "700", SettingsFamily::Family700, 5, RecipeTextEncoding::LegacySingleByte, false, true, false, false, 0x0B},
-    {"789", "Eugster789", "789", "NICR 789", "700", SettingsFamily::Family700, 5, RecipeTextEncoding::LegacySingleByte, false, true, false, false, 0x0B},
-    {"790", "Eugster790", "790", "NICR 790", "79x", SettingsFamily::Family700, 5, RecipeTextEncoding::LegacySingleByte, true, true, false, false, 0x0B},
-    {"791", "Eugster791", "791", "NICR 791", "79x", SettingsFamily::Family700, 5, RecipeTextEncoding::LegacySingleByte, true, true, false, false, 0x0B},
-    {"792", "Eugster792", "792", "NICR 792", "79x", SettingsFamily::Family700, 5, RecipeTextEncoding::LegacySingleByte, true, true, false, false, 0x0B},
-    {"793", "Eugster793", "793", "NICR 793", "79x", SettingsFamily::Family700, 5, RecipeTextEncoding::LegacySingleByte, true, true, false, false, 0x0B},
-    {"794", "Eugster794", "794", "NICR 794", "79x", SettingsFamily::Family700, 5, RecipeTextEncoding::LegacySingleByte, true, true, false, false, 0x0B},
-    {"795", "Eugster795", "795", "NICR 795", "79x", SettingsFamily::Family700, 5, RecipeTextEncoding::LegacySingleByte, true, true, false, false, 0x0B},
-    {"796", "Eugster796", "796", "NICR 796", "79x", SettingsFamily::Family700, 5, RecipeTextEncoding::LegacySingleByte, true, true, false, false, 0x0B},
-    {"797", "Eugster797", "797", "NICR 797", "79x", SettingsFamily::Family700, 5, RecipeTextEncoding::LegacySingleByte, true, true, false, false, 0x0B},
-    {"799", "Eugster799", "799", "NICR 799", "79x", SettingsFamily::Family700, 5, RecipeTextEncoding::LegacySingleByte, true, true, false, false, 0x0B},
+    {"756", "Eugster756", "756", "NICR 756", "700", SettingsFamily::Family700, 1, RecipeTextEncoding::LegacySingleByte, false, true, false, true, 0x0B},
+    {"758", "Eugster758", "758", "NICR 758", "700", SettingsFamily::Family700, 1, RecipeTextEncoding::LegacySingleByte, false, false, false, true, 0x0B},
+    {"759", "Eugster759", "759", "NICR 759", "700", SettingsFamily::Family700, 1, RecipeTextEncoding::LegacySingleByte, false, true, false, true, 0x0B},
+    {"768", "Eugster768", "768", "NICR 768", "700", SettingsFamily::Family700, 1, RecipeTextEncoding::LegacySingleByte, false, true, false, true, 0x0B},
+    {"769", "Eugster769", "769", "NICR 769", "700", SettingsFamily::Family700, 1, RecipeTextEncoding::LegacySingleByte, false, true, false, true, 0x0B},
+    {"778", "Eugster778", "778", "NICR 778", "700", SettingsFamily::Family700, 1, RecipeTextEncoding::LegacySingleByte, false, true, false, true, 0x0B},
+    {"779", "Eugster779", "779", "NICR 779", "700", SettingsFamily::Family700, 1, RecipeTextEncoding::LegacySingleByte, false, true, false, true, 0x0B},
+    {"788", "Eugster788", "788", "NICR 788", "700", SettingsFamily::Family700, 5, RecipeTextEncoding::LegacySingleByte, false, true, false, true, 0x0B},
+    {"789", "Eugster789", "789", "NICR 789", "700", SettingsFamily::Family700, 5, RecipeTextEncoding::LegacySingleByte, false, true, false, true, 0x0B},
+    {"790", "Eugster790", "790", "NICR 790", "79x", SettingsFamily::Family700, 5, RecipeTextEncoding::LegacySingleByte, true, true, false, true, 0x0B},
+    {"791", "Eugster791", "791", "NICR 791", "79x", SettingsFamily::Family700, 5, RecipeTextEncoding::LegacySingleByte, true, true, false, true, 0x0B},
+    {"792", "Eugster792", "792", "NICR 792", "79x", SettingsFamily::Family700, 5, RecipeTextEncoding::LegacySingleByte, true, true, false, true, 0x0B},
+    {"793", "Eugster793", "793", "NICR 793", "79x", SettingsFamily::Family700, 5, RecipeTextEncoding::LegacySingleByte, true, true, false, true, 0x0B},
+    {"794", "Eugster794", "794", "NICR 794", "79x", SettingsFamily::Family700, 5, RecipeTextEncoding::LegacySingleByte, true, true, false, true, 0x0B},
+    {"795", "Eugster795", "795", "NICR 795", "79x", SettingsFamily::Family700, 5, RecipeTextEncoding::LegacySingleByte, true, true, false, true, 0x0B},
+    {"796", "Eugster796", "796", "NICR 796", "79x", SettingsFamily::Family700, 5, RecipeTextEncoding::LegacySingleByte, true, true, false, true, 0x0B},
+    {"797", "Eugster797", "797", "NICR 797", "79x", SettingsFamily::Family700, 5, RecipeTextEncoding::LegacySingleByte, true, true, false, true, 0x0B},
+    {"799", "Eugster799", "799", "NICR 799", "79x", SettingsFamily::Family700, 5, RecipeTextEncoding::LegacySingleByte, true, true, false, true, 0x0B},
     {"920", "NICR920", "920", "NICR 920", "900", SettingsFamily::Family900, 9, RecipeTextEncoding::Utf16Le, false, true, true, false, 0x0B},
     {"930", "NICR930", "930", "NICR 930", "900", SettingsFamily::Family900, 9, RecipeTextEncoding::Utf16Le, false, true, true, false, 0x0B},
     {"960", "Eugster960", "960", "NICR 960", "900-light", SettingsFamily::Family900Light, 9, RecipeTextEncoding::Utf16Le, false, true, true, false, 0x0B},
@@ -402,36 +402,77 @@ ByteVector encodeUtf16LeName(const String& name) {
 } // namespace
 
 const RegisterProbe STATS_8000_PROBES[] = {
-    {"espresso", 200},
-    {"coffee", 201},
-    {"americano", 202},
-    {"cappuccino", 203},
-    {"caffe_latte", 204},
-    {"macchiato", 205},
-    {"warm_milk", 206},
-    {"hot_water", 207},
-    {"my_coffee", 208},
-    {"steam_drinks", 209},
-    {"powder_coffee", 210},
-    {"total_beverages", 213},
-    {"clean_coffee_system", 214},
-    {"clean_frother", 215},
-    {"rinse_cycles", 216},
-    {"filter_changes", 219},
-    {"descaling", 220},
-    {"beverages_via_app", 221},
-    {"descale_percent", 600},
-    {"descale_warning", 601},
-    {"brew_unit_clean_percent", 610},
-    {"brew_unit_clean_warning", 611},
-    {"frother_clean_percent", 620},
-    {"frother_clean_warning", 621},
-    {"filter_percent", 640},
-    {"filter_warning", 641},
-    {"filter_dependency", 642},
+    {"espresso", 200, "Espresso", "beverages", "count"},
+    {"coffee", 201, "Coffee", "beverages", "count"},
+    {"americano", 202, "Americano", "beverages", "count"},
+    {"cappuccino", 203, "Cappuccino", "beverages", "count"},
+    {"caffe_latte", 204, "Caffe latte", "beverages", "count"},
+    {"macchiato", 205, "Latte macchiato", "beverages", "count"},
+    {"warm_milk", 206, "Warm milk", "beverages", "count"},
+    {"hot_water", 207, "Hot water", "beverages", "count"},
+    {"my_coffee", 208, "My coffee", "beverages", "count"},
+    {"steam_drinks", 209, "Steam drinks", "beverages", "count"},
+    {"powder_coffee", 210, "Powder coffee", "beverages", "count"},
+    {"total_beverages", 213, "Total beverages", "beverages", "count"},
+    {"clean_coffee_system", 214, "Clean coffee system", "maintenance", "count"},
+    {"clean_frother", 215, "Clean frother", "maintenance", "count"},
+    {"rinse_cycles", 216, "Rinse cycles", "maintenance", "count"},
+    {"filter_changes", 219, "Filter changes", "maintenance", "count"},
+    {"descaling", 220, "Descaling", "maintenance", "count"},
+    {"beverages_via_app", 221, "Beverages via app", "maintenance", "count"},
+    {"descale_percent", 600, "Descale progress", "maintenance", "percent"},
+    {"descale_warning", 601, "Descale warning", "maintenance", "flag"},
+    {"brew_unit_clean_percent", 610, "Brew unit clean progress", "maintenance", "percent"},
+    {"brew_unit_clean_warning", 611, "Brew unit clean warning", "maintenance", "flag"},
+    {"frother_clean_percent", 620, "Frother clean progress", "maintenance", "percent"},
+    {"frother_clean_warning", 621, "Frother clean warning", "maintenance", "flag"},
+    {"filter_percent", 640, "Filter progress", "maintenance", "percent"},
+    {"filter_warning", 641, "Filter warning", "maintenance", "flag"},
+    {"filter_dependency", 642, "Filter dependency", "maintenance", "flag"},
 };
 
 const size_t STATS_8000_PROBE_COUNT = arraySize(STATS_8000_PROBES);
+
+const RegisterProbe STATS_700_PROBES[] = {
+    {"espresso", 200, "Espresso", "beverages", "count"},
+    {"cream", 201, "Cream", "beverages", "count"},
+    {"lungo", 202, "Lungo", "beverages", "count"},
+    {"americano", 203, "Americano", "beverages", "count"},
+    {"cappuccino", 204, "Cappuccino", "beverages", "count"},
+    {"latte_macchiato", 205, "Latte macchiato", "beverages", "count"},
+    {"milk", 206, "Milk", "beverages", "count"},
+    {"hot_water", 207, "Hot water", "beverages", "count"},
+    {"my_coffee", 208, "My coffee", "beverages", "count"},
+    {"total_beverages", 213, "Total beverages", "beverages", "count"},
+    {"clean_brewing_unit", 214, "Cleaning brewing unit", "maintenance", "count"},
+    {"clean_frother", 215, "Cleaning frother", "maintenance", "count"},
+    {"rinse_cycles", 216, "Rinse cycles", "maintenance", "count"},
+    {"filter_changes", 219, "Filter changes", "maintenance", "count"},
+    {"descaling", 220, "Descaling", "maintenance", "count"},
+    {"beverages_via_app", 221, "Beverages via app", "maintenance", "count"},
+    {"descale_percent", 600, "Descaling progress", "maintenance", "percent"},
+    {"descale_warning", 601, "Descaling warning", "maintenance", "flag"},
+    {"brew_unit_clean_percent", 610, "Brewing unit cleaning progress", "maintenance", "percent"},
+    {"brew_unit_clean_warning", 611, "Brewing unit cleaning warning", "maintenance", "flag"},
+    {"frother_clean_percent", 620, "Frother cleaning progress", "maintenance", "percent"},
+    {"frother_clean_warning", 621, "Frother cleaning warning", "maintenance", "flag"},
+    {"filter_percent", 640, "Filter progress", "maintenance", "percent"},
+    {"filter_warning", 641, "Filter warning", "maintenance", "flag"},
+    {"filter_dependency", 105, "Filter dependency", "maintenance", "flag"},
+};
+
+const RegisterProbe STATS_79X_PROBES[] = {
+    {"espresso", 200, "Espresso", "beverages", "count"},
+    {"coffee", 201, "Coffee", "beverages", "count"},
+    {"americano", 202, "Americano", "beverages", "count"},
+    {"cappuccino", 203, "Cappuccino", "beverages", "count"},
+    {"latte_macchiato", 205, "Latte macchiato", "beverages", "count"},
+    {"milk", 206, "Milk", "beverages", "count"},
+    {"hot_water", 207, "Hot water", "beverages", "count"},
+    {"my_coffee", 208, "My coffee", "beverages", "count"},
+    {"total_beverages", 213, "Total beverages", "beverages", "count"},
+    {"filter_dependency", 105, "Filter dependency", "maintenance", "flag"},
+};
 
 String hexEncode(const uint8_t* data, size_t length) {
     static const char* HEX_DIGITS = "0123456789ABCDEF";
@@ -1074,6 +1115,26 @@ void selectStandardRecipes(const ModelInfo& modelInfo,
     } else if (modelInfo.familyKey == "8000") {
         table = RECIPES_8000;
         count = arraySize(RECIPES_8000);
+    }
+    for (size_t i = 0; i < count; ++i) {
+        selectedOut.push_back(&table[i]);
+    }
+}
+
+void selectStatsDescriptors(const ModelInfo& modelInfo,
+                            std::vector<const RegisterProbe*>& selectedOut) {
+    selectedOut.clear();
+    const RegisterProbe* table = nullptr;
+    size_t count = 0;
+    if (modelInfo.familyKey == "700") {
+        table = STATS_700_PROBES;
+        count = arraySize(STATS_700_PROBES);
+    } else if (modelInfo.familyKey == "79x") {
+        table = STATS_79X_PROBES;
+        count = arraySize(STATS_79X_PROBES);
+    } else if (modelInfo.familyKey == "8000") {
+        table = STATS_8000_PROBES;
+        count = arraySize(STATS_8000_PROBES);
     }
     for (size_t i = 0; i < count; ++i) {
         selectedOut.push_back(&table[i]);

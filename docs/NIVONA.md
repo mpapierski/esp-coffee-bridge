@@ -1364,6 +1364,23 @@ Maintenance/status via `HR`:
   - `204 = cappuccino` exists only on non-`79x` `700`
   - these families stop at `208 = my coffee`
   - filter dependency register is `105`
+  - live-verified on model `756` / family `700`:
+    - `214 = cleaning brewing unit`, value `31`
+    - `215 = cleaning frother`, value `1`
+    - `216 = rinse cycles`, value `5080`
+    - `219 = filter changes`, value `0`
+    - `220 = descaling`, value `3`
+    - `221 = beverages via app`, value `2`
+    - `600 = descaling progress`, value `59`
+    - `601 = descaling warning`, value `0`
+    - `610 = brewing unit cleaning progress`, value `13`
+    - `611 = brewing unit cleaning warning`, value `0`
+    - `620 = frother cleaning progress`, value `13`
+    - `621 = frother cleaning warning`, value `0`
+    - `640 = filter progress`, value `0`
+    - `641 = filter warning`, value `0`
+    - `105 = filter dependency`, value `0`
+  - `79x` maintenance registers beyond `105` are not live-verified yet
 - `600` is sparser:
   - recipe stats present are `200`, `201`, `203`, `204`, `206`, `207`, `208`
   - filter dependency register is `105`

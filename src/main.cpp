@@ -27,6 +27,7 @@ constexpr char APP_BUILD_TIME[] = __DATE__ " " __TIME__;
 constexpr uint32_t SCAN_MS      = 5000;
 constexpr uint32_t HTTP_TIMEOUT = 10000;
 constexpr uint32_t DEFAULT_RECONNECT_DELAY_MS = 750;
+constexpr uint32_t NOTIFICATION_BATCH_SETTLE_MS = 60;
 constexpr size_t LOG_CAPACITY   = 128;
 
 void rxNotifyCallback(NimBLERemoteCharacteristic* characteristic, uint8_t* data, size_t length, bool isNotify);
@@ -75,6 +76,15 @@ struct SavedMachine {
     uint32_t savedAtMs{0};
 };
 
+struct ProtocolSessionEntry {
+    String serial;
+    String address;
+    uint8_t addressType{BLE_ADDR_PUBLIC};
+    ByteVector sessionKey;
+    String source;
+    uint32_t setAtMs{0};
+};
+
 WebServer server(80);
 Preferences preferences;
 Preferences machinePreferences;
@@ -94,6 +104,7 @@ std::vector<ByteVector> notificationHistory;
 std::vector<uint32_t> notificationHistoryMs;
 String selectedAddress;
 uint8_t selectedAddressType = BLE_ADDR_PUBLIC;
+String selectedMachineSerial;
 String wifiStaSsid;
 String pairingStatus        = "idle";
 String lastError;
@@ -101,9 +112,7 @@ String lastHuSeedHex;
 String lastHuRequestHex;
 String lastHuResponseHex;
 String lastHuParseStatus;
-ByteVector storedSessionKey;
-String storedSessionSource;
-uint32_t storedSessionSetAtMs = 0;
+std::vector<ProtocolSessionEntry> protocolSessions;
 bool notificationsEnabled = false;
 String notificationMode = "notify";
 int lastScanReason        = 0;
@@ -114,6 +123,9 @@ uint32_t lastIdleScanAtMs = 0;
 constexpr uint32_t IDLE_SCAN_INTERVAL_MS = 30000;
 constexpr uint32_t ACTIVE_SCAN_SUPPRESS_MS = 15000;
 uint32_t scanSuppressedUntilMs = 0;
+bool idleScanInProgress = false;
+bool blockingScanInProgress = false;
+uint32_t idleScanStartedAtMs = 0;
 
 NimBLEClient* client                              = nullptr;
 NimBLERemoteService* disService                   = nullptr;
@@ -124,6 +136,9 @@ NimBLERemoteCharacteristic* nivonaTx              = nullptr;
 NimBLERemoteCharacteristic* nivonaAux1            = nullptr;
 NimBLERemoteCharacteristic* nivonaAux2            = nullptr;
 NimBLERemoteCharacteristic* nivonaName            = nullptr;
+
+extern NimBLEScanCallbacks* scanCallbacksPtr;
+void refreshAllSavedMachinePresence();
 
 ScanRecord recordFromAdvertisedDevice(const NimBLEAdvertisedDevice* device) {
     ScanRecord record;
@@ -191,6 +206,8 @@ bool notificationModeUsesNotify(const String& mode) {
     return !mode.equalsIgnoreCase("indicate");
 }
 
+void copyNotificationHistory(std::vector<ByteVector>& chunksOut, std::vector<uint32_t>& timesOut);
+
 void clearNotificationBuffer() {
     if (notifyDataMutex != nullptr && xSemaphoreTake(notifyDataMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
         lastNotificationBytes.clear();
@@ -218,6 +235,46 @@ bool waitForNotification(uint32_t timeoutMs, ByteVector& out) {
     return true;
 }
 
+bool waitForNotificationBatch(uint32_t timeoutMs,
+                              std::vector<ByteVector>& chunksOut,
+                              std::vector<uint32_t>& timesOut) {
+    chunksOut.clear();
+    timesOut.clear();
+    if (timeoutMs == 0) {
+        copyNotificationHistory(chunksOut, timesOut);
+        return !chunksOut.empty();
+    }
+    if (notificationLatch == nullptr || notifyDataMutex == nullptr) {
+        return false;
+    }
+
+    ByteVector firstChunk;
+    if (!waitForNotification(timeoutMs, firstChunk)) {
+        return false;
+    }
+
+    const uint32_t startedAt = millis();
+    uint32_t lastNotificationAt = millis();
+    while ((millis() - startedAt) < timeoutMs) {
+        const uint32_t elapsed = millis() - startedAt;
+        const uint32_t remaining = timeoutMs > elapsed ? timeoutMs - elapsed : 0;
+        if (remaining == 0) {
+            break;
+        }
+        const uint32_t waitSlice = remaining < NOTIFICATION_BATCH_SETTLE_MS ? remaining : NOTIFICATION_BATCH_SETTLE_MS;
+        if (xSemaphoreTake(notificationLatch, pdMS_TO_TICKS(waitSlice)) == pdTRUE) {
+            lastNotificationAt = millis();
+            continue;
+        }
+        if ((millis() - lastNotificationAt) >= NOTIFICATION_BATCH_SETTLE_MS) {
+            break;
+        }
+    }
+
+    copyNotificationHistory(chunksOut, timesOut);
+    return !chunksOut.empty();
+}
+
 void copyNotificationHistory(std::vector<ByteVector>& chunksOut, std::vector<uint32_t>& timesOut) {
     chunksOut.clear();
     timesOut.clear();
@@ -232,16 +289,107 @@ void copyNotificationHistory(std::vector<ByteVector>& chunksOut, std::vector<uin
     xSemaphoreGive(notifyDataMutex);
 }
 
-void clearStoredSessionKey() {
-    storedSessionKey.clear();
-    storedSessionSource = "";
-    storedSessionSetAtMs = 0;
+SavedMachine* findSavedMachineBySerial(const String& serial);
+
+ProtocolSessionEntry* findProtocolSessionBySerial(const String& serial) {
+    if (serial.isEmpty()) {
+        return nullptr;
+    }
+    for (auto& session : protocolSessions) {
+        if (session.serial.equalsIgnoreCase(serial)) {
+            return &session;
+        }
+    }
+    return nullptr;
 }
 
-void setStoredSessionKey(const ByteVector& sessionKey, const String& source) {
-    storedSessionKey = sessionKey;
-    storedSessionSource = source;
-    storedSessionSetAtMs = millis();
+ProtocolSessionEntry* findProtocolSessionByAddress(const String& address) {
+    if (address.isEmpty()) {
+        return nullptr;
+    }
+    for (auto& session : protocolSessions) {
+        if (session.address.equalsIgnoreCase(address)) {
+            return &session;
+        }
+    }
+    return nullptr;
+}
+
+void selectAddressTarget(const String& address, uint8_t addressType) {
+    selectedMachineSerial = "";
+    selectedAddress = address;
+    selectedAddressType = addressType;
+}
+
+void selectMachineTarget(const SavedMachine& machine) {
+    selectedMachineSerial = machine.serial;
+    selectedAddress = machine.address;
+    selectedAddressType = machine.addressType;
+}
+
+void clearStoredSessionKey(const String& serial = "", const String& address = "") {
+    String targetSerial = serial;
+    String targetAddress = address;
+    if (targetSerial.isEmpty() && targetAddress.isEmpty()) {
+        targetSerial = selectedMachineSerial;
+        targetAddress = selectedAddress;
+    }
+    if (targetAddress.isEmpty() && !targetSerial.isEmpty()) {
+        SavedMachine* machine = findSavedMachineBySerial(targetSerial);
+        if (machine != nullptr) {
+            targetAddress = machine->address;
+        }
+    }
+
+    if (targetSerial.isEmpty() && targetAddress.isEmpty()) {
+        protocolSessions.clear();
+        return;
+    }
+
+    protocolSessions.erase(
+        std::remove_if(protocolSessions.begin(),
+                       protocolSessions.end(),
+                       [&](const ProtocolSessionEntry& session) {
+                           if (!targetSerial.isEmpty() && session.serial.equalsIgnoreCase(targetSerial)) {
+                               return true;
+                           }
+                           return !targetAddress.isEmpty() && session.address.equalsIgnoreCase(targetAddress);
+                       }),
+        protocolSessions.end());
+}
+
+void setStoredSessionKey(const ByteVector& sessionKey,
+                         const String& source,
+                         const String& serial = "",
+                         const String& address = "",
+                         uint8_t addressType = BLE_ADDR_PUBLIC) {
+    String targetSerial = serial;
+    String targetAddress = address;
+    uint8_t targetAddressType = addressType;
+
+    if (targetSerial.isEmpty()) {
+        targetSerial = selectedMachineSerial;
+    }
+    if (targetAddress.isEmpty()) {
+        targetAddress = selectedAddress;
+        targetAddressType = selectedAddressType;
+    }
+
+    ProtocolSessionEntry* session = !targetSerial.isEmpty() ? findProtocolSessionBySerial(targetSerial) : nullptr;
+    if (session == nullptr && !targetAddress.isEmpty()) {
+        session = findProtocolSessionByAddress(targetAddress);
+    }
+    if (session == nullptr) {
+        protocolSessions.push_back({});
+        session = &protocolSessions.back();
+    }
+
+    session->serial = targetSerial;
+    session->address = targetAddress;
+    session->addressType = targetAddressType;
+    session->sessionKey = sessionKey;
+    session->source = source;
+    session->setAtMs = millis();
 }
 
 ScanRecord* findScannedDevice(const String& address) {
@@ -318,9 +466,117 @@ void suppressIdleScans(uint32_t durationMs = ACTIVE_SCAN_SUPPRESS_MS) {
     scanSuppressedUntilMs = millis() + durationMs;
 }
 
+void clearScanScratch() {
+    if (scanDataMutex != nullptr && xSemaphoreTake(scanDataMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        scanScratchDevices.clear();
+        xSemaphoreGive(scanDataMutex);
+    }
+}
+
+void copyScanScratchToPublished() {
+    if (scanDataMutex != nullptr && xSemaphoreTake(scanDataMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        scannedDevices = scanScratchDevices;
+        xSemaphoreGive(scanDataMutex);
+    }
+}
+
+void configureBleScan(NimBLEScan& scan) {
+    scan.stop();
+    scan.clearResults();
+    scan.setScanCallbacks(scanCallbacksPtr, false);
+    scan.setActiveScan(true);
+    scan.setInterval(100);
+    scan.setWindow(100);
+    scan.setDuplicateFilter(0);
+    scan.setMaxResults(0);
+}
+
+void publishScanResults(uint32_t startedAtMs, bool updateIdleTimestamp, const String& label) {
+    copyScanScratchToPublished();
+    lastScanAtMs = millis();
+    lastScanResultCount = scannedDevices.size();
+    if (updateIdleTimestamp) {
+        lastIdleScanAtMs = lastScanAtMs;
+    }
+    refreshAllSavedMachinePresence();
+    addLog("scan",
+           label + ", devices=" + scannedDevices.size() + ", elapsedMs=" + (millis() - startedAtMs) +
+               ", reason=" + lastScanReason);
+}
+
+void cancelIdleScan() {
+    if (!idleScanInProgress) {
+        return;
+    }
+    idleScanInProgress = false;
+    NimBLEScan* scan = NimBLEDevice::getScan();
+    if (scan != nullptr && scan->isScanning()) {
+        scan->stop();
+        delay(50);
+    }
+    clearScanScratch();
+    addLog("scan", "Cancelled idle BLE scan");
+}
+
+bool startIdleScanAsync() {
+    if (idleScanInProgress || blockingScanInProgress) {
+        return false;
+    }
+    NimBLEScan* scan = NimBLEDevice::getScan();
+    if (scan == nullptr) {
+        addLog("scan", "BLE scan object is unavailable");
+        return false;
+    }
+    if (scan->isScanning()) {
+        return false;
+    }
+
+    clearScanScratch();
+    configureBleScan(*scan);
+
+    addLog("scan", "Starting idle BLE scan");
+    lastScanReason = 0;
+    idleScanStartedAtMs = millis();
+    idleScanInProgress = true;
+    if (!scan->start(SCAN_MS, false, false)) {
+        idleScanInProgress = false;
+        lastScanReason = -1;
+        lastScanAtMs = millis();
+        addLog("scan", "Failed to start idle BLE scan");
+        return false;
+    }
+
+    return true;
+}
+
+void finalizeIdleScanIfReady() {
+    if (!idleScanInProgress) {
+        return;
+    }
+    NimBLEScan* scan = NimBLEDevice::getScan();
+    if (scan != nullptr && scan->isScanning()) {
+        return;
+    }
+
+    idleScanInProgress = false;
+    publishScanResults(idleScanStartedAtMs, true, "Completed idle BLE scan");
+}
+
 SavedMachine* findSavedMachineBySerial(const String& serial) {
     for (auto& machine : savedMachines) {
         if (machine.serial.equalsIgnoreCase(serial)) {
+            return &machine;
+        }
+    }
+    return nullptr;
+}
+
+SavedMachine* findSavedMachineByAddress(const String& address) {
+    if (address.isEmpty()) {
+        return nullptr;
+    }
+    for (auto& machine : savedMachines) {
+        if (machine.address.equalsIgnoreCase(address)) {
             return &machine;
         }
     }
@@ -444,10 +700,64 @@ bool selectSavedMachine(const SavedMachine& machine, String& error) {
         error = "saved machine has no known BLE address";
         return false;
     }
-    selectedAddress = machine.address;
-    selectedAddressType = machine.addressType;
+    selectMachineTarget(machine);
     suppressIdleScans();
     return true;
+}
+
+const ProtocolSessionEntry* resolveStoredSessionEntry(const String& serial, const String& address) {
+    String targetSerial = serial;
+    String targetAddress = address;
+    if (targetSerial.isEmpty() && targetAddress.isEmpty()) {
+        targetSerial = selectedMachineSerial;
+        targetAddress = selectedAddress;
+    }
+
+    if (!targetSerial.isEmpty()) {
+        const ProtocolSessionEntry* bySerial = findProtocolSessionBySerial(targetSerial);
+        if (bySerial != nullptr) {
+            return bySerial;
+        }
+        SavedMachine* machine = findSavedMachineBySerial(targetSerial);
+        if (machine != nullptr) {
+            targetAddress = machine->address;
+        }
+    }
+
+    if (!targetAddress.isEmpty()) {
+        return findProtocolSessionByAddress(targetAddress);
+    }
+    return nullptr;
+}
+
+const ByteVector* resolveStoredSessionIfAvailable(const String& serial, const String& address) {
+    const ProtocolSessionEntry* session = resolveStoredSessionEntry(serial, address);
+    if (session != nullptr && session->sessionKey.size() == 2) {
+        return &session->sessionKey;
+    }
+    return nullptr;
+}
+
+void appendProtocolSessionJson(JsonObject target, const ProtocolSessionEntry* session) {
+    target["hasSession"] = session != nullptr && session->sessionKey.size() == 2;
+    target["sessionHex"] = session != nullptr && session->sessionKey.size() == 2 ? hexEncode(session->sessionKey) : "";
+    target["source"] = session != nullptr ? session->source : "";
+    target["setAtMs"] = session != nullptr ? session->setAtMs : 0;
+    target["serial"] = session != nullptr ? session->serial : "";
+    target["address"] = session != nullptr ? session->address : "";
+}
+
+void syncProtocolSessionTarget(const SavedMachine& machine) {
+    ProtocolSessionEntry* session = findProtocolSessionBySerial(machine.serial);
+    if (session == nullptr) {
+        session = findProtocolSessionByAddress(machine.address);
+    }
+    if (session == nullptr) {
+        return;
+    }
+    session->serial = machine.serial;
+    session->address = machine.address;
+    session->addressType = machine.addressType;
 }
 
 void appendSavedMachineJson(JsonObject target, const SavedMachine& machine) {
@@ -548,6 +858,8 @@ void connectWifi() {
 
 bool resolveSessionKeyForRequest(const String& sessionHex,
                                  bool useStoredSession,
+                                 const String& serial,
+                                 const String& address,
                                  ByteVector& sessionKeyOut,
                                  const ByteVector*& sessionKeyPtrOut,
                                  String& sessionHexUsedOut,
@@ -569,13 +881,14 @@ bool resolveSessionKeyForRequest(const String& sessionHex,
         return true;
     }
 
-    if (storedSessionKey.size() != 2) {
-        error = "stored session key is not available";
+    const ByteVector* storedSession = resolveStoredSessionIfAvailable(serial, address);
+    if (storedSession == nullptr) {
+        error = "protocol session key is not available for this target";
         return false;
     }
 
-    sessionKeyPtrOut = &storedSessionKey;
-    sessionHexUsedOut = hexEncode(storedSessionKey);
+    sessionKeyPtrOut = storedSession;
+    sessionHexUsedOut = hexEncode(*storedSession);
     return true;
 }
 
@@ -618,7 +931,7 @@ bool sendPreparedFramePacket(const char* command,
                              std::vector<ByteVector>& chunksOut,
                              std::vector<uint32_t>& timesOut,
                              String& error);
-const ByteVector* resolveStoredSessionIfAvailable();
+const ByteVector* resolveStoredSessionIfAvailable(const String& serial = "", const String& address = "");
 NimBLERemoteService* resolveRemoteServiceByUuid(const String& serviceUuid, String& error);
 NimBLERemoteCharacteristic* resolveRemoteCharacteristicByUuid(const String& serviceUuid,
                                                               const String& characteristicUuid,
@@ -726,26 +1039,15 @@ bool sendPreparedFramePacket(const char* command,
     }
 
     if (waitMs > 0) {
-        const uint32_t deadline = millis() + waitMs;
-        while (millis() < deadline) {
-            delay(10);
+        if (!waitForNotificationBatch(waitMs, chunksOut, timesOut)) {
+            error = "timed out waiting for notification";
+            return false;
         }
-    }
-
-    copyNotificationHistory(chunksOut, timesOut);
-    if (waitMs > 0 && chunksOut.empty()) {
-        error = "timed out waiting for notification";
-        return false;
+    } else {
+        copyNotificationHistory(chunksOut, timesOut);
     }
 
     return true;
-}
-
-const ByteVector* resolveStoredSessionIfAvailable() {
-    if (storedSessionKey.size() == 2) {
-        return &storedSessionKey;
-    }
-    return nullptr;
 }
 
 void appendFrameScenarioResult(JsonObject result,
@@ -1138,24 +1440,27 @@ bool runStatsFlowProbe(uint32_t waitMs,
     response["sessionHexUsed"] = sessionKey != nullptr ? hexEncode(*sessionKey) : "";
 
     const nivona::ModelInfo modelInfo = nivona::detectModelInfo(toNivonaDetails(cachedDetails));
-    response["supported"] = modelInfo.supportsStats;
+    std::vector<const nivona::RegisterProbe*> metrics;
+    nivona::selectStatsDescriptors(modelInfo, metrics);
+    response["supported"] = !metrics.empty();
     response["modelFamily"] = modelInfo.familyKey;
 
-    bool overallOk = modelInfo.supportsStats;
+    bool overallOk = !metrics.empty();
+    bool anyMetricOk = false;
     JsonObject groupedValues = response.createNestedObject("values");
-    for (size_t probeIndex = 0; probeIndex < nivona::STATS_8000_PROBE_COUNT; ++probeIndex) {
-        const auto& metric = nivona::STATS_8000_PROBES[probeIndex];
+    for (const auto* metric : metrics) {
         JsonObject result = scenarios.createNestedObject();
-        result["name"] = metric.name;
-        result["registerId"] = metric.id;
+        result["name"] = metric->name;
+        result["title"] = metric->title != nullptr ? metric->title : metric->name;
+        result["registerId"] = metric->id;
         result["ok"] = false;
 
-        if (!modelInfo.supportsStats) {
+        if (metrics.empty()) {
             result["error"] = "statistics are not supported for this machine family";
             continue;
         }
 
-        ByteVector payload = buildRegisterPayload(metric.id);
+        ByteVector payload = buildRegisterPayload(metric->id);
         ByteVector requestPacket;
         std::vector<ByteVector> chunks;
         std::vector<uint32_t> times;
@@ -1217,10 +1522,13 @@ bool runStatsFlowProbe(uint32_t waitMs,
             result["rawValue"] = value;
             result["echoedRegisterId"] = echoedRegisterId;
             result["ok"] = true;
+            anyMetricOk = true;
 
-            JsonObject groupedMetric = groupedValues.createNestedObject(metric.name);
-            groupedMetric["title"] = metric.name;
-            groupedMetric["registerId"] = metric.id;
+            JsonObject groupedMetric = groupedValues.createNestedObject(metric->name);
+            groupedMetric["title"] = metric->title != nullptr ? metric->title : metric->name;
+            groupedMetric["section"] = metric->section != nullptr ? metric->section : "maintenance";
+            groupedMetric["unit"] = metric->unit != nullptr ? metric->unit : "count";
+            groupedMetric["registerId"] = metric->id;
             groupedMetric["rawValue"] = value;
         } else {
             result["valueParseStatus"] = decodeError;
@@ -1228,8 +1536,9 @@ bool runStatsFlowProbe(uint32_t waitMs,
         }
     }
 
-    response["ok"] = overallOk;
-    return overallOk;
+    response["ok"] = anyMetricOk;
+    response["partial"] = anyMetricOk && !overallOk;
+    return anyMetricOk;
 }
 
 bool runSettingsFlowProbe(uint32_t waitMs,
@@ -1356,15 +1665,7 @@ bool runSettingsFlowProbe(uint32_t waitMs,
                                   chunks,
                                   times,
                                   startedAt);
-        uint16_t echoedRegisterId = 0;
-        int32_t rawValue = 0;
-        String valueError;
-        if (nivona::decodeHrNumericResponse(chunks, encrypt, echoedRegisterId, rawValue, valueError)) {
-            result["echoedRegisterId"] = echoedRegisterId;
-            result["rawValue"] = rawValue;
-        } else {
-            result["valueParseStatus"] = valueError;
-        }
+        nivona::appendDecodedSettingResult(result, *probe, chunks, encrypt);
 
         if (String(result["valueParseStatus"] | "") == "decoded") {
             JsonObject valueItem = values.createNestedObject(probe->name);
@@ -1612,7 +1913,7 @@ bool sendPreparedFramePacket(const char* command,
                              std::vector<ByteVector>& chunksOut,
                              std::vector<uint32_t>& timesOut,
                              String& error);
-const ByteVector* resolveStoredSessionIfAvailable();
+const ByteVector* resolveStoredSessionIfAvailable(const String& serial, const String& address);
 bool runWorkerSessionProbe(uint32_t waitMs,
                            bool pairFirst,
                            bool reconnectAfterPair,
@@ -1693,11 +1994,16 @@ class BridgeScanCallbacks : public NimBLEScanCallbacks {
     }
 
     void onScanEnd(const NimBLEScanResults&, int reason) override {
+        if (!idleScanInProgress && !blockingScanInProgress) {
+            return;
+        }
         lastScanReason = reason;
         lastScanAtMs   = millis();
         addLog("scan", String("Scan ended, reason=") + reason);
     }
 } scanCallbacks;
+
+NimBLEScanCallbacks* scanCallbacksPtr = &scanCallbacks;
 
 bool ensureClient(String& error) {
     if (!NimBLEDevice::isInitialized() && !initializeBleStack(error)) {
@@ -1777,6 +2083,8 @@ bool connectToSelectedDevice(String& error) {
         return false;
     }
 
+    cancelIdleScan();
+
     if (selectedAddress.isEmpty()) {
         error = "no device selected";
         return false;
@@ -1832,6 +2140,15 @@ bool pairWithDevice(String& error, bool reconnectAfterPair, uint32_t reconnectDe
         return false;
     }
 
+    NimBLEConnInfo info = client->getConnInfo();
+    if (info.isEncrypted()) {
+        pairingStatus = info.isBonded() ? "bonded" : "encrypted";
+        addLog("pair",
+               String("Reusing encrypted connection bonded=") +
+                   (info.isBonded() ? String("yes") : String("no")));
+        return true;
+    }
+
     pairingStatus = "pairing";
     if (!client->secureConnection()) {
         error = "secureConnection failed";
@@ -1839,7 +2156,7 @@ bool pairWithDevice(String& error, bool reconnectAfterPair, uint32_t reconnectDe
         return false;
     }
 
-    NimBLEConnInfo info = client->getConnInfo();
+    info = client->getConnInfo();
     if (!info.isEncrypted()) {
         error = "connection is not encrypted after pairing";
         pairingStatus = "pairing-failed";
@@ -2533,6 +2850,7 @@ void updateSavedMachineFromCachedDetails(SavedMachine& machine) {
     }
     populateSavedMachine(machine, machine.alias, machine.address, machine.addressType, cachedDetails);
     refreshSavedMachinePresence(machine);
+    syncProtocolSessionTarget(machine);
     persistSavedMachines();
 }
 
@@ -2540,6 +2858,7 @@ bool beginMachineProtocolSession(SavedMachine& machine, String& error) {
     if (!selectSavedMachine(machine, error)) {
         return false;
     }
+    clearStoredSessionKey(machine.serial, machine.address);
     if (!pairWithDevice(error, true, DEFAULT_RECONNECT_DELAY_MS)) {
         return false;
     }
@@ -2554,6 +2873,9 @@ bool beginMachineProtocolSession(SavedMachine& machine, String& error) {
 }
 
 bool ensureMachineHuSession(uint32_t waitMs, String& error) {
+    if (resolveStoredSessionIfAvailable() != nullptr) {
+        return true;
+    }
     DynamicJsonDocument scratch(4096);
     JsonArray scenarios = scratch.createNestedArray("scenarios");
     return establishHuSessionForProbe(waitMs, "machine_hu_internal", "machine-hu", scenarios, error);
@@ -2747,26 +3069,24 @@ bool parseMachineRoute(String& serialOut, String& sectionOut, String& tailOut) {
 }
 
 void performScan() {
-    scannedDevices.clear();
-    if (scanDataMutex != nullptr && xSemaphoreTake(scanDataMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-        scanScratchDevices.clear();
-        xSemaphoreGive(scanDataMutex);
-    }
+    cancelIdleScan();
+    clearScanScratch();
 
     NimBLEScan* scan = NimBLEDevice::getScan();
-    scan->stop();
-    scan->clearResults();
-    scan->setScanCallbacks(&scanCallbacks, false);
-    scan->setActiveScan(true);
-    scan->setInterval(100);
-    scan->setWindow(100);
-    scan->setDuplicateFilter(0);
-    scan->setMaxResults(0);
+    if (scan == nullptr) {
+        addLog("scan", "BLE scan object is unavailable");
+        lastScanReason = -1;
+        lastScanAtMs = millis();
+        return;
+    }
+    configureBleScan(*scan);
 
     addLog("scan", "Starting BLE scan");
     lastScanReason = 0;
     const uint32_t startedAt = millis();
+    blockingScanInProgress = true;
     if (!scan->start(SCAN_MS, false, false)) {
+        blockingScanInProgress = false;
         addLog("scan", "Failed to start BLE scan");
         lastScanReason = -1;
         lastScanAtMs   = millis();
@@ -2782,18 +3102,8 @@ void performScan() {
     }
     delay(150);
 
-    if (scanDataMutex != nullptr && xSemaphoreTake(scanDataMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-        scannedDevices = scanScratchDevices;
-        xSemaphoreGive(scanDataMutex);
-    }
-
-    lastScanAtMs = millis();
-    lastScanResultCount = scannedDevices.size();
-    lastIdleScanAtMs = lastScanAtMs;
-    refreshAllSavedMachinePresence();
-    addLog("scan",
-           String("Completed BLE scan, devices=") + scannedDevices.size() + ", elapsedMs=" + (millis() - startedAt) +
-               ", reason=" + lastScanReason);
+    publishScanResults(startedAt, true, "Completed BLE scan");
+    blockingScanInProgress = false;
 }
 
 void appendStatus(JsonDocument& doc) {
@@ -2816,10 +3126,7 @@ void appendStatus(JsonDocument& doc) {
     doc["lastHuRequestHex"] = lastHuRequestHex;
     doc["lastHuResponseHex"] = lastHuResponseHex;
     doc["lastHuParseStatus"] = lastHuParseStatus;
-    doc["hasStoredSessionKey"] = storedSessionKey.size() == 2;
-    doc["storedSessionKeyHex"] = storedSessionKey.size() == 2 ? hexEncode(storedSessionKey) : "";
-    doc["storedSessionSource"] = storedSessionSource;
-    doc["storedSessionSetAtMs"] = storedSessionSetAtMs;
+    doc["protocolSessionCount"] = protocolSessions.size();
 
     size_t supportedCount = 0;
     for (const auto& record : scannedDevices) {
@@ -2834,6 +3141,8 @@ void appendStatus(JsonDocument& doc) {
     doc["lastScanReason"]      = lastScanReason;
     doc["lastScanResultCount"] = lastScanResultCount;
     doc["lastScanAtMs"]     = lastScanAtMs;
+    doc["scanInProgress"]   = idleScanInProgress || blockingScanInProgress;
+    doc["idleScanInProgress"] = idleScanInProgress;
 
     if (client != nullptr) {
         doc["clientCreated"] = true;
@@ -2916,13 +3225,13 @@ bool normalizeBleAddress(String& address) {
 }
 
 bool probeMachineAddress(const String& address, SavedMachine& machineOut, String& error, const uint8_t* addressTypeOverride = nullptr) {
-    selectedAddress = address;
-    selectedAddressType = addressTypeOverride != nullptr ? *addressTypeOverride : BLE_ADDR_PUBLIC;
+    uint8_t targetAddressType = addressTypeOverride != nullptr ? *addressTypeOverride : BLE_ADDR_PUBLIC;
     if (addressTypeOverride == nullptr) {
         if (ScanRecord* record = findScannedDevice(address); record != nullptr) {
-            selectedAddressType = record->addressType;
+            targetAddressType = record->addressType;
         }
     }
+    selectAddressTarget(address, targetAddressType);
     suppressIdleScans();
     if (!pairWithDevice(error, true, DEFAULT_RECONNECT_DELAY_MS)) {
         return false;
@@ -3205,6 +3514,7 @@ void handleMachinesCreate() {
         existing->lastSeenRssi = preview.lastSeenRssi;
     }
 
+    syncProtocolSessionTarget(*existing);
     persistSavedMachines();
 
     DynamicJsonDocument response(4096);
@@ -3261,6 +3571,7 @@ void handleMachinesManualCreate() {
         *existing = manualMachine;
     }
 
+    syncProtocolSessionTarget(*existing);
     persistSavedMachines();
 
     DynamicJsonDocument response(4096);
@@ -3273,11 +3584,13 @@ void handleMachinesManualCreate() {
 
 void handleMachinesReset() {
     savedMachines.clear();
+    clearStoredSessionKey();
     machinePreferences.remove(PREFS_MACHINE_STORE);
     machinePreferences.putUInt(PREFS_MACHINE_SCHEMA, 1);
     DynamicJsonDocument doc(1024);
     doc["ok"] = true;
     doc["count"] = 0;
+    appendStatus(doc);
     sendJson(doc);
 }
 
@@ -3327,6 +3640,8 @@ void handleMachineSummary(const String& serial) {
     status["message"] = processStatus.message;
     status["progress"] = processStatus.progress;
     status["error"] = processError;
+    JsonObject protocolSession = response.createNestedObject("protocolSession");
+    appendProtocolSessionJson(protocolSession, resolveStoredSessionEntry(machine->serial, machine->address));
     appendStatus(response);
     sendJson(response);
 }
@@ -3547,7 +3862,9 @@ void handleMachineStats(const String& serial) {
         return;
     }
     const nivona::ModelInfo modelInfo = nivona::detectModelInfo(toNivonaDetails(*machine));
-    if (!modelInfo.supportsStats) {
+    std::vector<const nivona::RegisterProbe*> metrics;
+    nivona::selectStatsDescriptors(modelInfo, metrics);
+    if (metrics.empty()) {
         DynamicJsonDocument response(4096);
         response["ok"] = true;
         response["supported"] = false;
@@ -3716,10 +4033,12 @@ void handleMachineSettingsPost(const String& serial) {
 void handleMachineDelete(const String& serial) {
     for (auto it = savedMachines.begin(); it != savedMachines.end(); ++it) {
         if (it->serial.equalsIgnoreCase(serial)) {
+            clearStoredSessionKey(it->serial, it->address);
             savedMachines.erase(it);
             persistSavedMachines();
             DynamicJsonDocument response(512);
             response["ok"] = true;
+            appendStatus(response);
             sendJson(response);
             return;
         }
@@ -3844,11 +4163,12 @@ void handleConnect() {
     if (parseJsonBody(request, error)) {
         const String address = request["address"] | "";
         if (!address.isEmpty()) {
-            selectedAddress = address;
+            uint8_t targetAddressType = BLE_ADDR_PUBLIC;
             ScanRecord* record = findScannedDevice(address);
             if (record != nullptr) {
-                selectedAddressType = record->addressType;
+                targetAddressType = record->addressType;
             }
+            selectAddressTarget(address, targetAddressType);
         }
     }
 
@@ -3888,11 +4208,12 @@ void handlePair() {
     if (parseJsonBody(request, error)) {
         const String address = request["address"] | "";
         if (!address.isEmpty()) {
-            selectedAddress = address;
+            uint8_t targetAddressType = BLE_ADDR_PUBLIC;
             ScanRecord* record = findScannedDevice(address);
             if (record != nullptr) {
-                selectedAddressType = record->addressType;
+                targetAddressType = record->addressType;
             }
+            selectAddressTarget(address, targetAddressType);
         }
     }
 
@@ -4009,9 +4330,40 @@ void handleSession() {
     const bool clear = request["clear"] | false;
     const String sessionHex = request["sessionHex"] | "";
     const String source = request["source"] | "manual";
+    const String serial = request["serial"] | "";
+    String address = request["address"] | "";
+    uint8_t addressType = BLE_ADDR_PUBLIC;
+    const JsonVariantConst addressTypeValue = request["addressType"];
+    if (!addressTypeValue.isNull() && !parseAddressTypeRequest(addressTypeValue, addressType)) {
+        sendError(400, "addressType must be public, random, 0, or 1");
+        return;
+    }
+    if (!address.isEmpty() && !normalizeBleAddress(address)) {
+        sendError(400, "address must be a BLE MAC like C8:B4:17:D8:A3:8C");
+        return;
+    }
+
+    if (!serial.isEmpty()) {
+        SavedMachine* machine = findSavedMachineBySerial(serial);
+        if (machine == nullptr) {
+            sendError(404, "saved machine not found");
+            return;
+        }
+        selectMachineTarget(*machine);
+        if (address.isEmpty()) {
+            address = machine->address;
+            addressType = machine->addressType;
+        }
+    } else if (!address.isEmpty()) {
+        if (SavedMachine* machine = findSavedMachineByAddress(address); machine != nullptr) {
+            selectMachineTarget(*machine);
+        } else {
+            selectAddressTarget(address, addressType);
+        }
+    }
 
     if (clear) {
-        clearStoredSessionKey();
+        clearStoredSessionKey(serial, address);
     } else {
         ByteVector sessionKey;
         if (!parseSessionHexString(sessionHex, sessionKey, error)) {
@@ -4022,11 +4374,13 @@ void handleSession() {
             sendError(400, "sessionHex is required unless clear=true");
             return;
         }
-        setStoredSessionKey(sessionKey, source);
+        setStoredSessionKey(sessionKey, source, serial, address, addressType);
     }
 
     DynamicJsonDocument response(4096);
     response["ok"] = true;
+    JsonObject protocolSession = response.createNestedObject("protocolSession");
+    appendProtocolSessionJson(protocolSession, resolveStoredSessionEntry(serial, address));
     appendStatus(response);
     sendJson(response);
 }
@@ -4039,12 +4393,32 @@ void handleSendFrame() {
         return;
     }
 
-    const String address = request["address"] | "";
-    if (!address.isEmpty()) {
-        selectedAddress = address;
+    const String serial = request["serial"] | "";
+    String address = request["address"] | "";
+    if (!address.isEmpty() && !normalizeBleAddress(address)) {
+        sendError(400, "address must be a BLE MAC like C8:B4:17:D8:A3:8C");
+        return;
+    }
+    if (!serial.isEmpty()) {
+        SavedMachine* machine = findSavedMachineBySerial(serial);
+        if (machine == nullptr) {
+            sendError(404, "saved machine not found");
+            return;
+        }
+        selectMachineTarget(*machine);
+        if (address.isEmpty()) {
+            address = machine->address;
+        }
+    } else if (!address.isEmpty()) {
+        uint8_t targetAddressType = BLE_ADDR_PUBLIC;
         ScanRecord* record = findScannedDevice(address);
         if (record != nullptr) {
-            selectedAddressType = record->addressType;
+            targetAddressType = record->addressType;
+        }
+        if (SavedMachine* machine = findSavedMachineByAddress(address); machine != nullptr) {
+            selectMachineTarget(*machine);
+        } else {
+            selectAddressTarget(address, targetAddressType);
         }
     }
     if (selectedAddress.isEmpty()) {
@@ -4082,6 +4456,8 @@ void handleSendFrame() {
     String sessionHexUsed;
     if (!resolveSessionKeyForRequest(request["sessionHex"] | "",
                                      useStoredSession,
+                                     serial,
+                                     address,
                                      sessionKeyOverride,
                                      sessionKey,
                                      sessionHexUsed,
@@ -4091,7 +4467,7 @@ void handleSendFrame() {
     }
 
     if (rememberSession && sessionKey != nullptr) {
-        setStoredSessionKey(*sessionKey, "manual-send-frame");
+        setStoredSessionKey(*sessionKey, "manual-send-frame", serial, address, selectedAddressType);
     }
 
     if (pairFirst) {
@@ -4150,12 +4526,32 @@ void handleAppProbe() {
         return;
     }
 
-    const String address = request["address"] | "";
-    if (!address.isEmpty()) {
-        selectedAddress = address;
+    const String serial = request["serial"] | "";
+    String address = request["address"] | "";
+    if (!address.isEmpty() && !normalizeBleAddress(address)) {
+        sendError(400, "address must be a BLE MAC like C8:B4:17:D8:A3:8C");
+        return;
+    }
+    if (!serial.isEmpty()) {
+        SavedMachine* machine = findSavedMachineBySerial(serial);
+        if (machine == nullptr) {
+            sendError(404, "saved machine not found");
+            return;
+        }
+        selectMachineTarget(*machine);
+        if (address.isEmpty()) {
+            address = machine->address;
+        }
+    } else if (!address.isEmpty()) {
+        uint8_t targetAddressType = BLE_ADDR_PUBLIC;
         ScanRecord* record = findScannedDevice(address);
         if (record != nullptr) {
-            selectedAddressType = record->addressType;
+            targetAddressType = record->addressType;
+        }
+        if (SavedMachine* machine = findSavedMachineByAddress(address); machine != nullptr) {
+            selectMachineTarget(*machine);
+        } else {
+            selectAddressTarget(address, targetAddressType);
         }
     }
     if (selectedAddress.isEmpty()) {
@@ -4182,6 +4578,8 @@ void handleAppProbe() {
     String sessionHexUsed;
     if (!resolveSessionKeyForRequest(request["sessionHex"] | "",
                                      useStoredSession,
+                                     serial,
+                                     address,
                                      sessionKeyOverride,
                                      sessionKey,
                                      sessionHexUsed,
@@ -4191,7 +4589,7 @@ void handleAppProbe() {
     }
 
     if (rememberSession && sessionKey != nullptr) {
-        setStoredSessionKey(*sessionKey, "manual-app-probe");
+        setStoredSessionKey(*sessionKey, "manual-app-probe", serial, address, selectedAddressType);
     }
 
     DynamicJsonDocument response(24576);
@@ -4234,11 +4632,12 @@ void handleVerify() {
     if (parseJsonBody(request, error)) {
         const String address = request["address"] | "";
         if (!address.isEmpty()) {
-            selectedAddress = address;
+            uint8_t targetAddressType = BLE_ADDR_PUBLIC;
             ScanRecord* record = findScannedDevice(address);
             if (record != nullptr) {
-                selectedAddressType = record->addressType;
+                targetAddressType = record->addressType;
             }
+            selectAddressTarget(address, targetAddressType);
         }
         waitMs    = request["waitMs"] | waitMs;
         pairFirst = request["pair"] | pairFirst;
@@ -4280,11 +4679,12 @@ void handleStatsProbe() {
     if (parseJsonBody(request, error)) {
         const String address = request["address"] | "";
         if (!address.isEmpty()) {
-            selectedAddress = address;
+            uint8_t targetAddressType = BLE_ADDR_PUBLIC;
             ScanRecord* record = findScannedDevice(address);
             if (record != nullptr) {
-                selectedAddressType = record->addressType;
+                targetAddressType = record->addressType;
             }
+            selectAddressTarget(address, targetAddressType);
         }
         pairFirst = request["pair"].isNull() ? pairFirst : request["pair"].as<bool>();
         reconnectAfterPair = request["reconnectAfterPair"].isNull() ? reconnectAfterPair : request["reconnectAfterPair"].as<bool>();
@@ -4333,11 +4733,12 @@ void handleSettingsProbe() {
     if (parseJsonBody(request, error)) {
         const String address = request["address"] | "";
         if (!address.isEmpty()) {
-            selectedAddress = address;
+            uint8_t targetAddressType = BLE_ADDR_PUBLIC;
             ScanRecord* record = findScannedDevice(address);
             if (record != nullptr) {
-                selectedAddressType = record->addressType;
+                targetAddressType = record->addressType;
             }
+            selectAddressTarget(address, targetAddressType);
         }
         pairFirst = request["pair"].isNull() ? pairFirst : request["pair"].as<bool>();
         reconnectAfterPair = request["reconnectAfterPair"].isNull() ? reconnectAfterPair : request["reconnectAfterPair"].as<bool>();
@@ -4387,11 +4788,12 @@ void handleWorkerProbe() {
     if (parseJsonBody(request, error)) {
         const String address = request["address"] | "";
         if (!address.isEmpty()) {
-            selectedAddress = address;
+            uint8_t targetAddressType = BLE_ADDR_PUBLIC;
             ScanRecord* record = findScannedDevice(address);
             if (record != nullptr) {
-                selectedAddressType = record->addressType;
+                targetAddressType = record->addressType;
             }
+            selectAddressTarget(address, targetAddressType);
         }
         pairFirst = request["pair"].isNull() ? pairFirst : request["pair"].as<bool>();
         reconnectAfterPair = request["reconnectAfterPair"].isNull() ? reconnectAfterPair : request["reconnectAfterPair"].as<bool>();
@@ -4432,11 +4834,12 @@ void handleGattServices() {
     if (parseJsonBody(request, error)) {
         const String address = request["address"] | "";
         if (!address.isEmpty()) {
-            selectedAddress = address;
+            uint8_t targetAddressType = BLE_ADDR_PUBLIC;
             ScanRecord* record = findScannedDevice(address);
             if (record != nullptr) {
-                selectedAddressType = record->addressType;
+                targetAddressType = record->addressType;
             }
+            selectAddressTarget(address, targetAddressType);
         }
     }
 
@@ -4465,11 +4868,12 @@ void handleGattRead() {
 
     const String address = request["address"] | "";
     if (!address.isEmpty()) {
-        selectedAddress = address;
+        uint8_t targetAddressType = BLE_ADDR_PUBLIC;
         ScanRecord* record = findScannedDevice(address);
         if (record != nullptr) {
-            selectedAddressType = record->addressType;
+            targetAddressType = record->addressType;
         }
+        selectAddressTarget(address, targetAddressType);
     }
 
     if (!connectToSelectedDevice(error)) {
@@ -4520,11 +4924,12 @@ void handleGattWrite() {
 
     const String address = request["address"] | "";
     if (!address.isEmpty()) {
-        selectedAddress = address;
+        uint8_t targetAddressType = BLE_ADDR_PUBLIC;
         ScanRecord* record = findScannedDevice(address);
         if (record != nullptr) {
-            selectedAddressType = record->addressType;
+            targetAddressType = record->addressType;
         }
+        selectAddressTarget(address, targetAddressType);
     }
 
     if (!connectToSelectedDevice(error)) {
@@ -4862,9 +5267,11 @@ void setup() {
 
 void loop() {
     server.handleClient();
+    finalizeIdleScanIfReady();
     if ((client == nullptr || !client->isConnected()) && millis() >= scanSuppressedUntilMs &&
+        !idleScanInProgress && !blockingScanInProgress &&
         (millis() - lastIdleScanAtMs) >= IDLE_SCAN_INTERVAL_MS) {
-        performScan();
+        startIdleScanAsync();
     }
     delay(2);
 }
