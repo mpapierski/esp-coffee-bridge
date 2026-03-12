@@ -717,6 +717,9 @@ static const char kPage[] PROGMEM = R"HTML(
     }
     if (parts[0] === "machine" && parts[1]) {
       const serial = decodeURIComponent(parts[1]);
+      if (parts[2] === "standard" && parts[3]) {
+        return { name: "standard-recipe-detail", serial, selector: parts[3] };
+      }
       if (parts[2] === "recipe" && parts[3]) {
         return { name: "recipe-detail", serial, slot: parts[3] };
       }
@@ -731,6 +734,10 @@ static const char kPage[] PROGMEM = R"HTML(
 
   function machineRecipeHref(serial, slot) {
     return `#/machine/${encodeURIComponent(serial)}/recipe/${slot}`;
+  }
+
+  function machineStandardRecipeHref(serial, selector) {
+    return `#/machine/${encodeURIComponent(serial)}/standard/${selector}`;
   }
 
   function isRouteActive(test) {
@@ -851,6 +858,17 @@ static const char kPage[] PROGMEM = R"HTML(
     return cache.recipeDetails[slot];
   }
 
+  async function loadStandardRecipeDetail(serial, selector, force = false) {
+    const cache = getMachineCache(serial);
+    cache.standardRecipeDetails = cache.standardRecipeDetails || {};
+    if (!force && cache.standardRecipeDetails[selector]) {
+      return cache.standardRecipeDetails[selector];
+    }
+    const suffix = force ? "?refresh=1" : "";
+    cache.standardRecipeDetails[selector] = await api(`/api/machines/${encodeURIComponent(serial)}/recipes/${selector}${suffix}`);
+    return cache.standardRecipeDetails[selector];
+  }
+
   async function loadMachineStats(serial, force = false) {
     const cache = getMachineCache(serial);
     if (!force && cache.stats) {
@@ -882,6 +900,13 @@ static const char kPage[] PROGMEM = R"HTML(
     }
     const name = String(device.name || "").toLowerCase();
     return /nivona|nicr|eugster|coffee|cafe/.test(name);
+  }
+
+  function formatStatusCode(label, code) {
+    if (label && label.length) {
+      return `${label} (${code ?? "-"})`;
+    }
+    return `${code ?? "-"}`;
   }
 
   function renderSidebar() {
@@ -1145,7 +1170,8 @@ static const char kPage[] PROGMEM = R"HTML(
         </div>
         <div class="value-list">
           <div class="value-item"><span>Live status</span><span>${escapeHtml(liveStatus.summary || "unavailable")}</span></div>
-          <div class="value-item"><span>Message / process</span><span>${escapeHtml(`${liveStatus.message ?? "-"} · ${liveStatus.process ?? "-"} / ${liveStatus.subProcess ?? "-"}`)}</span></div>
+          <div class="value-item"><span>Process</span><span>${escapeHtml(formatStatusCode(liveStatus.processLabel, liveStatus.process))}</span></div>
+          <div class="value-item"><span>Machine message</span><span>${escapeHtml(formatStatusCode(liveStatus.messageLabel, liveStatus.message))}</span></div>
           <div class="value-item"><span>Progress</span><span>${percent ? `${percent}%` : "idle"}</span></div>
         </div>
         <div class="progress"><span style="width:${percent}%"></span></div>
@@ -1175,7 +1201,8 @@ static const char kPage[] PROGMEM = R"HTML(
                 <span>${escapeHtml(recipe.name)}</span>
               </div>
               <div class="row">
-                <button data-action="brew-standard" data-serial="${escapeHtml(machine.serial)}" data-selector="${escapeHtml(String(recipe.selector))}">Make coffee</button>
+                <button data-action="brew-standard" data-serial="${escapeHtml(machine.serial)}" data-selector="${escapeHtml(String(recipe.selector))}">Quick brew</button>
+                <a class="button-link secondary" href="${machineStandardRecipeHref(machine.serial, recipe.selector)}">Customize</a>
               </div>
             </article>
           `).join("")}
@@ -1243,8 +1270,12 @@ static const char kPage[] PROGMEM = R"HTML(
     `;
   }
 
-  function recipeEditableFields(recipe) {
+  function recipeEditableFields(recipe, options = {}) {
     const fields = [];
+    const includeName = options.includeName !== false;
+    const includeIcon = options.includeIcon !== false;
+    const maxStrengthBeans = Math.max(1, Math.min(5, Number(recipe.maxStrengthBeans || 5)));
+    const availableProfileOptions = PROFILE_OPTIONS.filter((option) => option.value <= Number(recipe.maxProfileCode ?? 4));
     const pushSelect = (name, title, options, current) => {
       if (recipe[name] === undefined) {
         return;
@@ -1270,13 +1301,15 @@ static const char kPage[] PROGMEM = R"HTML(
       `);
     };
 
-    fields.push(`
-      <label class="label">Name
-        <input type="text" name="name" value="${escapeHtml(recipe.name || "")}">
-      </label>
-    `);
+    if (includeName) {
+      fields.push(`
+        <label class="label">Name
+          <input type="text" name="name" value="${escapeHtml(recipe.name || "")}">
+        </label>
+      `);
+    }
 
-    if (recipe.icon !== undefined) {
+    if (includeIcon && recipe.icon !== undefined) {
       fields.push(`
         <label class="label">Icon
           <input type="number" step="1" min="0" name="icon" value="${escapeHtml(String(recipe.icon))}">
@@ -1288,7 +1321,7 @@ static const char kPage[] PROGMEM = R"HTML(
       fields.push(`
         <label class="label">Strength
           <select name="strengthBeans">
-            ${[1, 2, 3, 4, 5].map((count) => `
+            ${Array.from({ length: maxStrengthBeans }, (_, index) => index + 1).map((count) => `
               <option value="${count}" ${Number(recipe.strengthBeans || (recipe.strength + 1)) === count ? "selected" : ""}>${count} beans</option>
             `).join("")}
           </select>
@@ -1296,7 +1329,7 @@ static const char kPage[] PROGMEM = R"HTML(
       `);
     }
 
-    pushSelect("profile", "Profile", PROFILE_OPTIONS, recipe.profile);
+    pushSelect("profile", "Profile", availableProfileOptions, recipe.profile);
     pushSelect("temperature", "Temperature", TEMPERATURE_OPTIONS, recipe.temperature);
     pushSelect("coffeeTemperature", "Coffee temperature", TEMPERATURE_OPTIONS, recipe.coffeeTemperature);
     pushSelect("waterTemperature", "Water temperature", TEMPERATURE_OPTIONS, recipe.waterTemperature);
@@ -1347,6 +1380,57 @@ static const char kPage[] PROGMEM = R"HTML(
               </div>
               <div class="row" style="margin-top:14px;">
                 <button type="submit">Save recipe</button>
+              </div>
+            </form>
+          </div>
+        </div>
+        <details style="margin-top:16px;">
+          <summary>Raw recipe JSON</summary>
+          <pre>${escapeHtml(pretty(recipe))}</pre>
+        </details>
+      </section>
+    `;
+  }
+
+  function renderStandardRecipeDetail(machine, data, selector) {
+    const recipe = data?.recipe;
+    if (!recipe) {
+      return `<section class="panel"><div class="empty">Standard recipe ${escapeHtml(String(selector))} could not be loaded.</div></section>`;
+    }
+    const sourceLabel = data?.source === "cache" ? "flash cache" : "live machine";
+
+    return `
+      <section class="panel">
+        <div class="row" style="justify-content:space-between;">
+          <div>
+            <h2 class="section-title" style="margin:0;">${escapeHtml(recipe.title || recipe.name || `Recipe ${selector}`)}</h2>
+            <div class="muted">Standard recipe values are cached on the bridge. Brew overrides are temporary and do not rewrite the saved standard recipe.</div>
+          </div>
+          <div class="row">
+            <button data-action="refresh-standard-recipe" data-serial="${escapeHtml(machine.serial)}" data-selector="${escapeHtml(String(selector))}">Refresh from machine</button>
+            <a class="button-link secondary" href="${machineHref(machine.serial, "recipes")}">Back to coffee recipes</a>
+          </div>
+        </div>
+        <div class="grid two" style="margin-top:16px;">
+          <div class="panel" style="margin:0;padding:18px;">
+            <div class="value-list">
+              <div class="value-item"><span>Name</span><span>${escapeHtml(recipe.title || recipe.name || "-")}</span></div>
+              <div class="value-item"><span>Selector</span><span>${escapeHtml(String(recipe.selector ?? selector))}</span></div>
+              <div class="value-item"><span>Source</span><span>${escapeHtml(sourceLabel)}</span></div>
+              <div class="value-item"><span>Strength</span><span>${escapeHtml(recipe.strengthBeans ? `${recipe.strengthBeans} beans` : "-")}</span></div>
+              <div class="value-item"><span>Profile</span><span>${escapeHtml(recipe.profileLabel || "-")}</span></div>
+              <div class="value-item"><span>Temperature</span><span>${escapeHtml(recipe.temperatureLabel || recipe.coffeeTemperatureLabel || "-")}</span></div>
+              <div class="value-item"><span>Size</span><span>${escapeHtml(recipe.coffeeAmountMl ?? recipe.waterAmountMl ?? "-")}${recipe.coffeeAmountMl !== undefined || recipe.waterAmountMl !== undefined ? " ml" : ""}</span></div>
+            </div>
+          </div>
+          <div class="panel" style="margin:0;padding:18px;">
+            <h3 style="margin-top:0;">Temporary brew values</h3>
+            <form data-action="brew-standard-custom" data-serial="${escapeHtml(machine.serial)}" data-selector="${escapeHtml(String(selector))}">
+              <div class="field-grid">
+                ${recipeEditableFields(recipe, { includeName: false, includeIcon: false })}
+              </div>
+              <div class="row" style="margin-top:14px;">
+                <button type="submit">Make coffee with these values</button>
               </div>
             </form>
           </div>
@@ -1756,6 +1840,35 @@ static const char kPage[] PROGMEM = R"HTML(
     }
   }
 
+  async function renderStandardRecipeRoute(serial, selector) {
+    const machine = findMachine(serial);
+    if (!machine) {
+      app.innerHTML = sectionShell("Machine not found", "The requested saved machine is not present in bridge storage.", `<div class="empty"><a href="#/dashboard"><strong>Return to dashboard</strong></a></div>`);
+      return;
+    }
+
+    let summary = getMachineCache(serial).summary;
+    if (!summary) {
+      try {
+        summary = await loadMachineSummary(serial, true);
+      } catch (error) {
+        setFlash(`Live summary unavailable for ${machine.alias || machine.serial}: ${error.message}`, "error");
+      }
+    }
+
+    try {
+      const recipeData = await loadStandardRecipeDetail(serial, selector, false);
+      app.innerHTML = renderMachineHeader(machine, summary, "recipes") + renderStandardRecipeDetail(machine, recipeData, selector);
+    } catch (error) {
+      setFlash(error.message || "Recipe request failed.", "error");
+      app.innerHTML = renderMachineHeader(machine, summary, "recipes") + `
+        <section class="panel">
+          <div class="empty">The bridge could not load standard recipe ${escapeHtml(String(selector))}: ${escapeHtml(error.message || "request failed")}.</div>
+        </section>
+      `;
+    }
+  }
+
   async function renderRoute(options = {}) {
     const showLoading = options.showLoading !== false;
     renderSidebar();
@@ -1783,6 +1896,10 @@ static const char kPage[] PROGMEM = R"HTML(
       }
       if (current.name === "recipe-detail") {
         await renderRecipeRoute(current.serial, current.slot);
+        return;
+      }
+      if (current.name === "standard-recipe-detail") {
+        await renderStandardRecipeRoute(current.serial, current.selector);
         return;
       }
 
@@ -1874,6 +1991,13 @@ static const char kPage[] PROGMEM = R"HTML(
         const response = await runWithFlash("Sending brew command…", () => api(`/api/machines/${encodeURIComponent(serial)}/brew`, { json: { selector } }), "Brew command sent.");
         state.diagnostics.output = response;
         invalidateMachine(serial);
+        await renderRoute();
+      }
+
+      if (action === "refresh-standard-recipe") {
+        const serial = button.dataset.serial;
+        const selector = String(button.dataset.selector || "");
+        await runWithFlash(`Refreshing recipe ${selector}…`, () => loadStandardRecipeDetail(serial, selector, true), "Recipe values refreshed.");
         await renderRoute();
       }
 
@@ -2061,6 +2185,36 @@ static const char kPage[] PROGMEM = R"HTML(
         const cache = getMachineCache(serial);
         cache.savedRecipes = null;
         cache.recipeDetails = {};
+        await renderRoute();
+      }
+
+      if (action === "brew-standard-custom") {
+        const serial = form.dataset.serial;
+        const selector = Number(form.dataset.selector);
+        const payload = { selector };
+        Array.from(form.elements).forEach((field) => {
+          if (!field.name || field.disabled) {
+            return;
+          }
+          if (field.name === "strengthBeans") {
+            payload.strengthBeans = Number(field.value);
+            return;
+          }
+          if (field.type === "number") {
+            if (String(field.value).trim() !== "") {
+              payload[field.name] = Number(field.value);
+            }
+            return;
+          }
+          if (field.tagName === "SELECT" || field.type === "text") {
+            if (String(field.value).trim() !== "") {
+              payload[field.name] = field.tagName === "SELECT" ? Number(field.value) : field.value;
+            }
+          }
+        });
+        const response = await runWithFlash(`Brewing recipe ${selector}…`, () => api(`/api/machines/${encodeURIComponent(serial)}/brew`, { json: payload }), "Brew command sent.");
+        state.diagnostics.output = response;
+        invalidateMachine(serial);
         await renderRoute();
       }
 

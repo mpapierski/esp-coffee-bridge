@@ -85,6 +85,116 @@ void test_live_hr_response_rejects_incorrect_session_echo_expectation() {
     TEST_ASSERT_EQUAL_STRING("session key echo mismatch", error.c_str());
 }
 
+void test_hx_ready_vector_decodes_to_apk_backed_labels() {
+    std::vector<ByteVector> chunks{
+        nivona::buildPacket("HX", decodeHex("0008000000000000"), nullptr, true),
+    };
+
+    nivona::ProcessStatus status;
+    String error;
+    TEST_ASSERT_TRUE_MESSAGE(nivona::decodeHxResponse(chunks, true, status, error), error.c_str());
+    TEST_ASSERT_TRUE(status.ok);
+    TEST_ASSERT_EQUAL_INT16(8, status.process);
+    TEST_ASSERT_EQUAL_INT16(0, status.subProcess);
+    TEST_ASSERT_EQUAL_INT16(0, status.message);
+    TEST_ASSERT_EQUAL_INT16(0, status.progress);
+    TEST_ASSERT_EQUAL_STRING("ready", status.summary.c_str());
+    TEST_ASSERT_EQUAL_STRING("ready", status.processLabel.c_str());
+    TEST_ASSERT_EQUAL_STRING("none", status.messageLabel.c_str());
+}
+
+void test_unknown_hx_message_code_stays_raw_and_unlabeled() {
+    std::vector<ByteVector> chunks{
+        nivona::buildPacket("HX", decodeHex("000B0000002A0000"), nullptr, true),
+    };
+
+    nivona::ProcessStatus status;
+    String error;
+    TEST_ASSERT_TRUE_MESSAGE(nivona::decodeHxResponse(chunks, true, status, error), error.c_str());
+    TEST_ASSERT_TRUE(status.ok);
+    TEST_ASSERT_EQUAL_INT16(11, status.process);
+    TEST_ASSERT_EQUAL_INT16(42, status.message);
+    TEST_ASSERT_EQUAL_STRING("preparing drink", status.processLabel.c_str());
+    TEST_ASSERT_EQUAL_STRING("", status.messageLabel.c_str());
+}
+
+void test_family_700_standard_recipe_lookup_and_layout_match_apk_offsets() {
+    nivona::ModelInfo modelInfo;
+    modelInfo.familyKey = "700";
+
+    const nivona::StandardRecipeDescriptor* recipe = nivona::findStandardRecipeBySelector(modelInfo, 2);
+    TEST_ASSERT_NOT_NULL(recipe);
+    TEST_ASSERT_EQUAL_UINT8(2, recipe->selector);
+    TEST_ASSERT_EQUAL_STRING("lungo", recipe->name);
+    TEST_ASSERT_EQUAL_STRING("Lungo", recipe->title);
+
+    uint16_t baseRegister = 0;
+    TEST_ASSERT_TRUE(nivona::resolveStandardRecipeBaseRegister(modelInfo, recipe->selector, baseRegister));
+    TEST_ASSERT_EQUAL_UINT16(10200, baseRegister);
+
+    nivona::StandardRecipeLayout layout;
+    TEST_ASSERT_TRUE(nivona::resolveStandardRecipeLayout(modelInfo, layout));
+    TEST_ASSERT_EQUAL_STRING("700", layout.familyKey.c_str());
+    TEST_ASSERT_FALSE(layout.fluidWriteScale10);
+    TEST_ASSERT_EQUAL_UINT16(1, layout.strengthOffset);
+    TEST_ASSERT_EQUAL_UINT16(2, layout.profileOffset);
+    TEST_ASSERT_EQUAL_UINT16(3, layout.temperatureOffset);
+    TEST_ASSERT_EQUAL_UINT16(4, layout.twoCupsOffset);
+    TEST_ASSERT_EQUAL_UINT16(5, layout.coffeeAmountOffset);
+    TEST_ASSERT_EQUAL_UINT16(6, layout.waterAmountOffset);
+    TEST_ASSERT_EQUAL_UINT16(7, layout.milkAmountOffset);
+    TEST_ASSERT_EQUAL_UINT16(8, layout.milkFoamAmountOffset);
+}
+
+void test_family_900_standard_recipe_layout_tracks_split_temperatures_and_scaled_fluids() {
+    nivona::ModelInfo modelInfo;
+    modelInfo.familyKey = "900";
+    modelInfo.fluidWriteScale10 = true;
+
+    nivona::StandardRecipeLayout layout;
+    TEST_ASSERT_TRUE(nivona::resolveStandardRecipeLayout(modelInfo, layout));
+    TEST_ASSERT_EQUAL_STRING("900", layout.familyKey.c_str());
+    TEST_ASSERT_TRUE(layout.fluidWriteScale10);
+    TEST_ASSERT_EQUAL_UINT16(1, layout.strengthOffset);
+    TEST_ASSERT_EQUAL_UINT16(2, layout.profileOffset);
+    TEST_ASSERT_EQUAL_UINT16(3, layout.preparationOffset);
+    TEST_ASSERT_EQUAL_UINT16(4, layout.twoCupsOffset);
+    TEST_ASSERT_EQUAL_UINT16(5, layout.coffeeTemperatureOffset);
+    TEST_ASSERT_EQUAL_UINT16(6, layout.waterTemperatureOffset);
+    TEST_ASSERT_EQUAL_UINT16(7, layout.milkTemperatureOffset);
+    TEST_ASSERT_EQUAL_UINT16(8, layout.milkFoamTemperatureOffset);
+    TEST_ASSERT_EQUAL_UINT16(9, layout.coffeeAmountOffset);
+    TEST_ASSERT_EQUAL_UINT16(10, layout.waterAmountOffset);
+    TEST_ASSERT_EQUAL_UINT16(11, layout.milkAmountOffset);
+    TEST_ASSERT_EQUAL_UINT16(12, layout.milkFoamAmountOffset);
+    TEST_ASSERT_EQUAL_UINT16(13, layout.overallTemperatureOffset);
+}
+
+void test_standard_recipe_base_register_rejects_unknown_selector() {
+    nivona::ModelInfo modelInfo;
+    modelInfo.familyKey = "700";
+
+    TEST_ASSERT_NULL(nivona::findStandardRecipeBySelector(modelInfo, 99));
+    uint16_t baseRegister = 0;
+    TEST_ASSERT_FALSE(nivona::resolveStandardRecipeBaseRegister(modelInfo, 99, baseRegister));
+}
+
+void test_model_detection_exposes_strength_and_profile_caps() {
+    nivona::DeviceDetails basic700;
+    basic700.serial = "756573071020106-----";
+    const nivona::ModelInfo basic700Info = nivona::detectModelInfo(basic700);
+    TEST_ASSERT_EQUAL_STRING("756", basic700Info.modelCode.c_str());
+    TEST_ASSERT_EQUAL_UINT8(3, basic700Info.strengthLevelCount);
+    TEST_ASSERT_EQUAL_UINT8(3, basic700Info.maxProfileCode);
+
+    nivona::DeviceDetails advanced79x;
+    advanced79x.serial = "790000000000000-----";
+    const nivona::ModelInfo advanced79xInfo = nivona::detectModelInfo(advanced79x);
+    TEST_ASSERT_EQUAL_STRING("790", advanced79xInfo.modelCode.c_str());
+    TEST_ASSERT_EQUAL_UINT8(5, advanced79xInfo.strengthLevelCount);
+    TEST_ASSERT_EQUAL_UINT8(3, advanced79xInfo.maxProfileCode);
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -97,5 +207,11 @@ int main(int argc, char** argv) {
     RUN_TEST(test_live_hu_vector_round_trips_through_decoder_and_payload_validator);
     RUN_TEST(test_live_hr_response_decodes_without_session_echo);
     RUN_TEST(test_live_hr_response_rejects_incorrect_session_echo_expectation);
+    RUN_TEST(test_hx_ready_vector_decodes_to_apk_backed_labels);
+    RUN_TEST(test_unknown_hx_message_code_stays_raw_and_unlabeled);
+    RUN_TEST(test_family_700_standard_recipe_lookup_and_layout_match_apk_offsets);
+    RUN_TEST(test_family_900_standard_recipe_layout_tracks_split_temperatures_and_scaled_fluids);
+    RUN_TEST(test_standard_recipe_base_register_rejects_unknown_selector);
+    RUN_TEST(test_model_detection_exposes_strength_and_profile_caps);
     return UNITY_END();
 }

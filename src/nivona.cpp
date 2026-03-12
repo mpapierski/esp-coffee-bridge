@@ -264,44 +264,46 @@ struct ModelRule {
     RecipeTextEncoding textEncoding;
     bool is79xModel;
     bool hasAromaBalanceProfile;
+    uint8_t strengthLevelCount;
+    uint8_t maxProfileCode;
     bool fluidWriteScale10;
     bool supportsStats;
     uint8_t brewCommandMode;
 };
 
 const ModelRule MODEL_RULES[] = {
-    {"8101", "NICR8101", "8101", "NICR 8101", "8000", SettingsFamily::Family8000, 9, RecipeTextEncoding::Utf16Le, false, true, false, true, 0x04},
-    {"8103", "NICR8103", "8103", "NICR 8103", "8000", SettingsFamily::Family8000, 9, RecipeTextEncoding::Utf16Le, false, true, false, true, 0x04},
-    {"8107", "NICR8107", "8107", "NICR 8107", "8000", SettingsFamily::Family8000, 9, RecipeTextEncoding::Utf16Le, false, true, false, true, 0x04},
-    {"040", "NICR1040", "1040", "NICR 1040", "1040", SettingsFamily::Family1040, 18, RecipeTextEncoding::Utf16Le, false, true, false, false, 0x0B},
-    {"030", "NICR1030", "1030", "NICR 1030", "1030", SettingsFamily::Family1030, 18, RecipeTextEncoding::Utf16Le, false, true, false, false, 0x0B},
-    {"660", "Eugster660", "660", "NICR 660", "600", SettingsFamily::Family600, 1, RecipeTextEncoding::LegacySingleByte, false, true, false, false, 0x0B},
-    {"670", "Eugster670", "670", "NICR 670", "600", SettingsFamily::Family600, 5, RecipeTextEncoding::LegacySingleByte, false, true, false, false, 0x0B},
-    {"675", "Eugster675", "675", "NICR 675", "600", SettingsFamily::Family600, 5, RecipeTextEncoding::LegacySingleByte, false, true, false, false, 0x0B},
-    {"680", "Eugster680", "680", "NICR 680", "600", SettingsFamily::Family600, 5, RecipeTextEncoding::LegacySingleByte, false, true, false, false, 0x0B},
-    {"756", "Eugster756", "756", "NICR 756", "700", SettingsFamily::Family700, 1, RecipeTextEncoding::LegacySingleByte, false, true, false, true, 0x0B},
-    {"758", "Eugster758", "758", "NICR 758", "700", SettingsFamily::Family700, 1, RecipeTextEncoding::LegacySingleByte, false, false, false, true, 0x0B},
-    {"759", "Eugster759", "759", "NICR 759", "700", SettingsFamily::Family700, 1, RecipeTextEncoding::LegacySingleByte, false, true, false, true, 0x0B},
-    {"768", "Eugster768", "768", "NICR 768", "700", SettingsFamily::Family700, 1, RecipeTextEncoding::LegacySingleByte, false, true, false, true, 0x0B},
-    {"769", "Eugster769", "769", "NICR 769", "700", SettingsFamily::Family700, 1, RecipeTextEncoding::LegacySingleByte, false, true, false, true, 0x0B},
-    {"778", "Eugster778", "778", "NICR 778", "700", SettingsFamily::Family700, 1, RecipeTextEncoding::LegacySingleByte, false, true, false, true, 0x0B},
-    {"779", "Eugster779", "779", "NICR 779", "700", SettingsFamily::Family700, 1, RecipeTextEncoding::LegacySingleByte, false, true, false, true, 0x0B},
-    {"788", "Eugster788", "788", "NICR 788", "700", SettingsFamily::Family700, 5, RecipeTextEncoding::LegacySingleByte, false, true, false, true, 0x0B},
-    {"789", "Eugster789", "789", "NICR 789", "700", SettingsFamily::Family700, 5, RecipeTextEncoding::LegacySingleByte, false, true, false, true, 0x0B},
-    {"790", "Eugster790", "790", "NICR 790", "79x", SettingsFamily::Family700, 5, RecipeTextEncoding::LegacySingleByte, true, true, false, true, 0x0B},
-    {"791", "Eugster791", "791", "NICR 791", "79x", SettingsFamily::Family700, 5, RecipeTextEncoding::LegacySingleByte, true, true, false, true, 0x0B},
-    {"792", "Eugster792", "792", "NICR 792", "79x", SettingsFamily::Family700, 5, RecipeTextEncoding::LegacySingleByte, true, true, false, true, 0x0B},
-    {"793", "Eugster793", "793", "NICR 793", "79x", SettingsFamily::Family700, 5, RecipeTextEncoding::LegacySingleByte, true, true, false, true, 0x0B},
-    {"794", "Eugster794", "794", "NICR 794", "79x", SettingsFamily::Family700, 5, RecipeTextEncoding::LegacySingleByte, true, true, false, true, 0x0B},
-    {"795", "Eugster795", "795", "NICR 795", "79x", SettingsFamily::Family700, 5, RecipeTextEncoding::LegacySingleByte, true, true, false, true, 0x0B},
-    {"796", "Eugster796", "796", "NICR 796", "79x", SettingsFamily::Family700, 5, RecipeTextEncoding::LegacySingleByte, true, true, false, true, 0x0B},
-    {"797", "Eugster797", "797", "NICR 797", "79x", SettingsFamily::Family700, 5, RecipeTextEncoding::LegacySingleByte, true, true, false, true, 0x0B},
-    {"799", "Eugster799", "799", "NICR 799", "79x", SettingsFamily::Family700, 5, RecipeTextEncoding::LegacySingleByte, true, true, false, true, 0x0B},
-    {"920", "NICR920", "920", "NICR 920", "900", SettingsFamily::Family900, 9, RecipeTextEncoding::Utf16Le, false, true, true, false, 0x0B},
-    {"930", "NICR930", "930", "NICR 930", "900", SettingsFamily::Family900, 9, RecipeTextEncoding::Utf16Le, false, true, true, false, 0x0B},
-    {"960", "Eugster960", "960", "NICR 960", "900-light", SettingsFamily::Family900Light, 9, RecipeTextEncoding::Utf16Le, false, true, true, false, 0x0B},
-    {"965", "Eugster965", "965", "NICR 965", "900-light", SettingsFamily::Family900Light, 9, RecipeTextEncoding::Utf16Le, false, true, true, false, 0x0B},
-    {"970", "Eugster970", "970", "NICR 970", "900-light", SettingsFamily::Family900Light, 9, RecipeTextEncoding::Utf16Le, false, true, true, false, 0x0B},
+    {"8101", "NICR8101", "8101", "NICR 8101", "8000", SettingsFamily::Family8000, 9, RecipeTextEncoding::Utf16Le, false, true, 5, 4, false, true, 0x04},
+    {"8103", "NICR8103", "8103", "NICR 8103", "8000", SettingsFamily::Family8000, 9, RecipeTextEncoding::Utf16Le, false, true, 5, 4, false, true, 0x04},
+    {"8107", "NICR8107", "8107", "NICR 8107", "8000", SettingsFamily::Family8000, 9, RecipeTextEncoding::Utf16Le, false, true, 5, 4, false, true, 0x04},
+    {"040", "NICR1040", "1040", "NICR 1040", "1040", SettingsFamily::Family1040, 18, RecipeTextEncoding::Utf16Le, false, true, 5, 4, false, false, 0x0B},
+    {"030", "NICR1030", "1030", "NICR 1030", "1030", SettingsFamily::Family1030, 18, RecipeTextEncoding::Utf16Le, false, true, 5, 4, false, false, 0x0B},
+    {"660", "Eugster660", "660", "NICR 660", "600", SettingsFamily::Family600, 1, RecipeTextEncoding::LegacySingleByte, false, true, 3, 3, false, false, 0x0B},
+    {"670", "Eugster670", "670", "NICR 670", "600", SettingsFamily::Family600, 5, RecipeTextEncoding::LegacySingleByte, false, true, 3, 3, false, false, 0x0B},
+    {"675", "Eugster675", "675", "NICR 675", "600", SettingsFamily::Family600, 5, RecipeTextEncoding::LegacySingleByte, false, true, 3, 3, false, false, 0x0B},
+    {"680", "Eugster680", "680", "NICR 680", "600", SettingsFamily::Family600, 5, RecipeTextEncoding::LegacySingleByte, false, true, 3, 3, false, false, 0x0B},
+    {"756", "Eugster756", "756", "NICR 756", "700", SettingsFamily::Family700, 1, RecipeTextEncoding::LegacySingleByte, false, true, 3, 3, false, true, 0x0B},
+    {"758", "Eugster758", "758", "NICR 758", "700", SettingsFamily::Family700, 1, RecipeTextEncoding::LegacySingleByte, false, false, 3, 3, false, true, 0x0B},
+    {"759", "Eugster759", "759", "NICR 759", "700", SettingsFamily::Family700, 1, RecipeTextEncoding::LegacySingleByte, false, true, 3, 3, false, true, 0x0B},
+    {"768", "Eugster768", "768", "NICR 768", "700", SettingsFamily::Family700, 1, RecipeTextEncoding::LegacySingleByte, false, true, 3, 3, false, true, 0x0B},
+    {"769", "Eugster769", "769", "NICR 769", "700", SettingsFamily::Family700, 1, RecipeTextEncoding::LegacySingleByte, false, true, 3, 3, false, true, 0x0B},
+    {"778", "Eugster778", "778", "NICR 778", "700", SettingsFamily::Family700, 1, RecipeTextEncoding::LegacySingleByte, false, true, 3, 3, false, true, 0x0B},
+    {"779", "Eugster779", "779", "NICR 779", "700", SettingsFamily::Family700, 1, RecipeTextEncoding::LegacySingleByte, false, true, 3, 3, false, true, 0x0B},
+    {"788", "Eugster788", "788", "NICR 788", "700", SettingsFamily::Family700, 5, RecipeTextEncoding::LegacySingleByte, false, true, 5, 3, false, true, 0x0B},
+    {"789", "Eugster789", "789", "NICR 789", "700", SettingsFamily::Family700, 5, RecipeTextEncoding::LegacySingleByte, false, true, 5, 3, false, true, 0x0B},
+    {"790", "Eugster790", "790", "NICR 790", "79x", SettingsFamily::Family700, 5, RecipeTextEncoding::LegacySingleByte, true, true, 5, 3, false, true, 0x0B},
+    {"791", "Eugster791", "791", "NICR 791", "79x", SettingsFamily::Family700, 5, RecipeTextEncoding::LegacySingleByte, true, true, 5, 3, false, true, 0x0B},
+    {"792", "Eugster792", "792", "NICR 792", "79x", SettingsFamily::Family700, 5, RecipeTextEncoding::LegacySingleByte, true, true, 5, 3, false, true, 0x0B},
+    {"793", "Eugster793", "793", "NICR 793", "79x", SettingsFamily::Family700, 5, RecipeTextEncoding::LegacySingleByte, true, true, 5, 3, false, true, 0x0B},
+    {"794", "Eugster794", "794", "NICR 794", "79x", SettingsFamily::Family700, 5, RecipeTextEncoding::LegacySingleByte, true, true, 5, 3, false, true, 0x0B},
+    {"795", "Eugster795", "795", "NICR 795", "79x", SettingsFamily::Family700, 5, RecipeTextEncoding::LegacySingleByte, true, true, 5, 3, false, true, 0x0B},
+    {"796", "Eugster796", "796", "NICR 796", "79x", SettingsFamily::Family700, 5, RecipeTextEncoding::LegacySingleByte, true, true, 5, 3, false, true, 0x0B},
+    {"797", "Eugster797", "797", "NICR 797", "79x", SettingsFamily::Family700, 5, RecipeTextEncoding::LegacySingleByte, true, true, 5, 3, false, true, 0x0B},
+    {"799", "Eugster799", "799", "NICR 799", "79x", SettingsFamily::Family700, 5, RecipeTextEncoding::LegacySingleByte, true, true, 5, 3, false, true, 0x0B},
+    {"920", "NICR920", "920", "NICR 920", "900", SettingsFamily::Family900, 9, RecipeTextEncoding::Utf16Le, false, true, 5, 3, true, false, 0x0B},
+    {"930", "NICR930", "930", "NICR 930", "900", SettingsFamily::Family900, 9, RecipeTextEncoding::Utf16Le, false, true, 5, 3, true, false, 0x0B},
+    {"960", "Eugster960", "960", "NICR 960", "900-light", SettingsFamily::Family900Light, 9, RecipeTextEncoding::Utf16Le, false, true, 5, 3, true, false, 0x0B},
+    {"965", "Eugster965", "965", "NICR 965", "900-light", SettingsFamily::Family900Light, 9, RecipeTextEncoding::Utf16Le, false, true, 5, 3, true, false, 0x0B},
+    {"970", "Eugster970", "970", "NICR 970", "900-light", SettingsFamily::Family900Light, 9, RecipeTextEncoding::Utf16Le, false, true, 5, 3, true, false, 0x0B},
 };
 
 bool containsModelToken(const String& haystack, const char* token) {
@@ -318,6 +320,8 @@ void applyModelRule(ModelInfo& out, const ModelRule& rule) {
     out.recipeTextEncoding = rule.textEncoding;
     out.is79xModel = rule.is79xModel;
     out.hasAromaBalanceProfile = rule.hasAromaBalanceProfile;
+    out.strengthLevelCount = rule.strengthLevelCount;
+    out.maxProfileCode = rule.maxProfileCode;
     out.fluidWriteScale10 = rule.fluidWriteScale10;
     out.supportsSettings = rule.settingsFamily != SettingsFamily::Unknown;
     out.supportsStats = rule.supportsStats;
@@ -1056,6 +1060,93 @@ void appendDecodedSettingResult(JsonObject result,
     result["valueLabel"] = label != nullptr ? label : "";
 }
 
+const char* describeProcessCode(int16_t process) {
+    switch (process) {
+        case 3:
+        case 8:
+            return "ready";
+        case 4:
+        case 11:
+            return "preparing drink";
+        default:
+            return nullptr;
+    }
+}
+
+const char* describeSubProcessCode(int16_t process, int16_t subProcess) {
+    (void)process;
+    (void)subProcess;
+    return nullptr;
+}
+
+const char* describeMessageCode(int16_t message) {
+    switch (message) {
+        case 0:
+            return "none";
+        case 1:
+            return "brewing unit removed";
+        case 2:
+            return "trays missing";
+        case 3:
+            return "empty trays";
+        case 4:
+            return "fill up water";
+        case 5:
+            return "close powder shaft";
+        case 6:
+            return "fill coffee beans";
+        case 11:
+            return "move cup to frother and open valve";
+        case 20:
+            return "flush required";
+        default:
+            return nullptr;
+    }
+}
+
+void annotateProcessStatus(ProcessStatus& status) {
+    const char* processLabel = describeProcessCode(status.process);
+    const char* subProcessLabel = describeSubProcessCode(status.process, status.subProcess);
+    const char* messageLabel = describeMessageCode(status.message);
+    status.processLabel = processLabel != nullptr ? processLabel : "";
+    status.subProcessLabel = subProcessLabel != nullptr ? subProcessLabel : "";
+    status.messageLabel = messageLabel != nullptr ? messageLabel : "";
+
+    if (!status.ok) {
+        return;
+    }
+
+    if ((status.process == 3 || status.process == 8) && status.message == 0) {
+        status.summary = "ready";
+        return;
+    }
+    if (status.process == 4 || status.process == 11) {
+        status.summary = "preparing";
+        return;
+    }
+    if (status.message == 20) {
+        status.summary = "flush required";
+        return;
+    }
+    if (status.message >= 1 && status.message <= 6) {
+        status.summary = "attention";
+        return;
+    }
+    if (status.process == 0 && status.subProcess == 0 && status.message == 0 && status.progress == 0) {
+        status.summary = "idle";
+        return;
+    }
+    if (status.progress > 0) {
+        status.summary = "working";
+        return;
+    }
+    if (status.message != 0) {
+        status.summary = "attention";
+        return;
+    }
+    status.summary = "active";
+}
+
 bool decodeHxResponse(const std::vector<ByteVector>& chunks, bool encrypted, ProcessStatus& statusOut, String& error) {
     statusOut = ProcessStatus{};
     ByteVector joined = joinChunks(chunks);
@@ -1079,13 +1170,7 @@ bool decodeHxResponse(const std::vector<ByteVector>& chunks, bool encrypted, Pro
     statusOut.subProcess = readInt16(2);
     statusOut.message = readInt16(4);
     statusOut.progress = readInt16(6);
-    if (statusOut.process == 0 && statusOut.subProcess == 0 && statusOut.message == 0 && statusOut.progress == 0) {
-        statusOut.summary = "idle";
-    } else if (statusOut.progress > 0) {
-        statusOut.summary = "working";
-    } else {
-        statusOut.summary = "active";
-    }
+    annotateProcessStatus(statusOut);
     return true;
 }
 
@@ -1119,6 +1204,86 @@ void selectStandardRecipes(const ModelInfo& modelInfo,
     for (size_t i = 0; i < count; ++i) {
         selectedOut.push_back(&table[i]);
     }
+}
+
+const StandardRecipeDescriptor* findStandardRecipeBySelector(const ModelInfo& modelInfo, uint8_t selector) {
+    std::vector<const StandardRecipeDescriptor*> recipes;
+    selectStandardRecipes(modelInfo, recipes);
+    for (const auto* recipe : recipes) {
+        if (recipe != nullptr && recipe->selector == selector) {
+            return recipe;
+        }
+    }
+    return nullptr;
+}
+
+bool resolveStandardRecipeLayout(const ModelInfo& modelInfo, StandardRecipeLayout& layoutOut) {
+    layoutOut = StandardRecipeLayout{};
+    layoutOut.familyKey = modelInfo.familyKey;
+    layoutOut.fluidWriteScale10 = modelInfo.fluidWriteScale10;
+
+    if (modelInfo.familyKey == "600") {
+        layoutOut.strengthOffset = 1;
+        layoutOut.profileOffset = 2;
+        layoutOut.temperatureOffset = 3;
+        layoutOut.twoCupsOffset = 4;
+        layoutOut.coffeeAmountOffset = 5;
+        layoutOut.waterAmountOffset = 6;
+        layoutOut.milkFoamAmountOffset = 8;
+        layoutOut.preparationOffset = 9;
+        return true;
+    }
+    if (modelInfo.familyKey == "700" || modelInfo.familyKey == "79x" || modelInfo.familyKey == "8000") {
+        layoutOut.strengthOffset = 1;
+        layoutOut.profileOffset = 2;
+        layoutOut.temperatureOffset = 3;
+        layoutOut.twoCupsOffset = 4;
+        layoutOut.coffeeAmountOffset = 5;
+        layoutOut.waterAmountOffset = 6;
+        layoutOut.milkAmountOffset = 7;
+        layoutOut.milkFoamAmountOffset = 8;
+        return true;
+    }
+    if (modelInfo.familyKey == "900" || modelInfo.familyKey == "900-light") {
+        layoutOut.strengthOffset = 1;
+        layoutOut.profileOffset = 2;
+        layoutOut.preparationOffset = 3;
+        layoutOut.twoCupsOffset = 4;
+        layoutOut.coffeeTemperatureOffset = 5;
+        layoutOut.waterTemperatureOffset = 6;
+        layoutOut.milkTemperatureOffset = 7;
+        layoutOut.milkFoamTemperatureOffset = 8;
+        layoutOut.coffeeAmountOffset = 9;
+        layoutOut.waterAmountOffset = 10;
+        layoutOut.milkAmountOffset = 11;
+        layoutOut.milkFoamAmountOffset = 12;
+        layoutOut.overallTemperatureOffset = 13;
+        return true;
+    }
+    if (modelInfo.familyKey == "1030" || modelInfo.familyKey == "1040") {
+        layoutOut.strengthOffset = 1;
+        layoutOut.profileOffset = 2;
+        layoutOut.preparationOffset = 3;
+        layoutOut.twoCupsOffset = 4;
+        layoutOut.coffeeTemperatureOffset = 5;
+        layoutOut.waterTemperatureOffset = 6;
+        layoutOut.milkTemperatureOffset = 7;
+        layoutOut.milkFoamTemperatureOffset = 8;
+        layoutOut.coffeeAmountOffset = 9;
+        layoutOut.waterAmountOffset = 10;
+        layoutOut.milkAmountOffset = 11;
+        layoutOut.milkFoamAmountOffset = 12;
+        return true;
+    }
+    return false;
+}
+
+bool resolveStandardRecipeBaseRegister(const ModelInfo& modelInfo, uint8_t selector, uint16_t& baseRegisterOut) {
+    if (findStandardRecipeBySelector(modelInfo, selector) == nullptr) {
+        return false;
+    }
+    baseRegisterOut = static_cast<uint16_t>(10000 + static_cast<uint16_t>(selector) * 100);
+    return true;
 }
 
 void selectStatsDescriptors(const ModelInfo& modelInfo,

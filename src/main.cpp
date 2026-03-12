@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <ArduinoJson.h>
 #include <ESPmDNS.h>
+#include <LittleFS.h>
 #include <Preferences.h>
 #include <Update.h>
 #include <WebServer.h>
@@ -29,6 +30,9 @@ constexpr uint32_t HTTP_TIMEOUT = 10000;
 constexpr uint32_t DEFAULT_RECONNECT_DELAY_MS = 750;
 constexpr uint32_t NOTIFICATION_BATCH_SETTLE_MS = 60;
 constexpr size_t LOG_CAPACITY   = 128;
+constexpr uint16_t TEMP_RECIPE_TYPE_REGISTER = 9001;
+constexpr char STANDARD_RECIPE_CACHE_PREFIX[] = "/stdrec-";
+constexpr uint32_t STANDARD_RECIPE_CACHE_SCHEMA = 1;
 
 void rxNotifyCallback(NimBLERemoteCharacteristic* characteristic, uint8_t* data, size_t length, bool isNotify);
 
@@ -126,6 +130,7 @@ uint32_t scanSuppressedUntilMs = 0;
 bool idleScanInProgress = false;
 bool blockingScanInProgress = false;
 uint32_t idleScanStartedAtMs = 0;
+bool littleFsReady = false;
 
 NimBLEClient* client                              = nullptr;
 NimBLERemoteService* disService                   = nullptr;
@@ -431,6 +436,152 @@ bool parseJsonBody(DynamicJsonDocument& doc, String& error) {
 
 String loadPrefString(const char* key) {
     return preferences.getString(key, "");
+}
+
+nivona::DeviceDetails toNivonaDetails(const SavedMachine& machine);
+
+String cacheSafeToken(const String& value) {
+    String out;
+    out.reserve(value.length());
+    for (size_t i = 0; i < value.length(); ++i) {
+        const char ch = value.charAt(i);
+        if ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '-' || ch == '_') {
+            out += ch;
+        } else {
+            out += '_';
+        }
+    }
+    return out;
+}
+
+String standardRecipeCachePrefix(const String& serial) {
+    return String(STANDARD_RECIPE_CACHE_PREFIX) + cacheSafeToken(serial) + "-";
+}
+
+String standardRecipeCachePath(const String& serial, uint8_t selector) {
+    return standardRecipeCachePrefix(serial) + selector + ".json";
+}
+
+bool parseRefreshArg() {
+    if (!server.hasArg("refresh")) {
+        return false;
+    }
+    const String rawValue = server.arg("refresh");
+    return !(rawValue.isEmpty() || rawValue == "0" || rawValue.equalsIgnoreCase("false") || rawValue.equalsIgnoreCase("no"));
+}
+
+bool initializeLittleFs(String& error) {
+    if (littleFsReady) {
+        return true;
+    }
+    if (LittleFS.begin(true)) {
+        littleFsReady = true;
+        return true;
+    }
+    error = "failed to mount LittleFS";
+    return false;
+}
+
+void clearStandardRecipeCachesByPrefix(const String& prefix) {
+    if (!littleFsReady) {
+        return;
+    }
+    File root = LittleFS.open("/");
+    if (!root) {
+        return;
+    }
+    File entry = root.openNextFile();
+    while (entry) {
+        const String path = entry.name();
+        entry.close();
+        if (path.startsWith(prefix)) {
+            LittleFS.remove(path);
+        }
+        entry = root.openNextFile();
+    }
+}
+
+void clearStandardRecipeCachesForMachine(const String& serial) {
+    if (serial.isEmpty()) {
+        return;
+    }
+    clearStandardRecipeCachesByPrefix(standardRecipeCachePrefix(serial));
+}
+
+void clearAllStandardRecipeCaches() {
+    clearStandardRecipeCachesByPrefix(String(STANDARD_RECIPE_CACHE_PREFIX));
+}
+
+bool loadStandardRecipeCache(const SavedMachine& machine,
+                             uint8_t selector,
+                             DynamicJsonDocument& cacheDoc,
+                             String& error) {
+    if (!littleFsReady) {
+        error = "standard recipe cache is unavailable";
+        return false;
+    }
+    File cacheFile = LittleFS.open(standardRecipeCachePath(machine.serial, selector), "r");
+    if (!cacheFile) {
+        error = "standard recipe cache miss";
+        return false;
+    }
+
+    DeserializationError parseError = deserializeJson(cacheDoc, cacheFile);
+    cacheFile.close();
+    if (parseError) {
+        LittleFS.remove(standardRecipeCachePath(machine.serial, selector));
+        error = String("failed to parse standard recipe cache: ") + parseError.c_str();
+        return false;
+    }
+
+    if ((cacheDoc["schema"] | 0U) != STANDARD_RECIPE_CACHE_SCHEMA) {
+        LittleFS.remove(standardRecipeCachePath(machine.serial, selector));
+        error = "standard recipe cache schema mismatch";
+        return false;
+    }
+    const String cachedSerial = cacheDoc["serial"] | "";
+    const int cachedSelector = cacheDoc["selector"] | -1;
+    JsonObject cachedRecipe = cacheDoc["recipe"].as<JsonObject>();
+    if (!cachedSerial.equalsIgnoreCase(machine.serial) || cachedSelector != selector || cachedRecipe.isNull()) {
+        LittleFS.remove(standardRecipeCachePath(machine.serial, selector));
+        error = "standard recipe cache contents mismatch";
+        return false;
+    }
+    const nivona::ModelInfo modelInfo = nivona::detectModelInfo(toNivonaDetails(machine));
+    cachedRecipe["maxStrengthBeans"] = modelInfo.strengthLevelCount;
+    cachedRecipe["maxProfileCode"] = modelInfo.maxProfileCode;
+    return true;
+}
+
+bool persistStandardRecipeCache(const SavedMachine& machine,
+                                uint8_t selector,
+                                JsonObjectConst recipe,
+                                String& error) {
+    if (!littleFsReady) {
+        error = "standard recipe cache is unavailable";
+        return false;
+    }
+
+    DynamicJsonDocument cacheDoc(12288);
+    cacheDoc["schema"] = STANDARD_RECIPE_CACHE_SCHEMA;
+    cacheDoc["serial"] = machine.serial;
+    cacheDoc["selector"] = selector;
+    cacheDoc["familyKey"] = machine.familyKey;
+    JsonObject storedRecipe = cacheDoc.createNestedObject("recipe");
+    storedRecipe.set(recipe);
+
+    File cacheFile = LittleFS.open(standardRecipeCachePath(machine.serial, selector), "w");
+    if (!cacheFile) {
+        error = "failed to open standard recipe cache for writing";
+        return false;
+    }
+    if (serializeJson(cacheDoc, cacheFile) == 0) {
+        cacheFile.close();
+        error = "failed to write standard recipe cache";
+        return false;
+    }
+    cacheFile.close();
+    return true;
 }
 
 nivona::DeviceDetails toNivonaDetails(const DeviceDetails& details) {
@@ -781,6 +932,19 @@ void appendSavedMachineJson(JsonObject target, const SavedMachine& machine) {
     target["online"] = machine.lastSeenAtMs > 0;
 }
 
+void appendProcessStatusJson(JsonObject target, const nivona::ProcessStatus& status, const String& error) {
+    target["ok"] = status.ok;
+    target["summary"] = status.summary;
+    target["process"] = status.process;
+    target["processLabel"] = status.processLabel;
+    target["subProcess"] = status.subProcess;
+    target["subProcessLabel"] = status.subProcessLabel;
+    target["message"] = status.message;
+    target["messageLabel"] = status.messageLabel;
+    target["progress"] = status.progress;
+    target["error"] = error;
+}
+
 String recipeTypeTitle(const nivona::ModelInfo& modelInfo, int32_t selector) {
     std::vector<const nivona::StandardRecipeDescriptor*> recipes;
     nivona::selectStandardRecipes(modelInfo, recipes);
@@ -824,11 +988,100 @@ String recipeProfileLabel(int32_t rawValue) {
     }
 }
 
-float recipeAmountMlValue(const nivona::MyCoffeeLayout& layout, int32_t rawValue) {
-    if (layout.fluidWriteScale10) {
+bool parseRecipeTemperatureCode(const JsonVariantConst value, int32_t& codeOut) {
+    if (value.is<int>() || value.is<long>() || value.is<float>() || value.is<double>()) {
+        codeOut = value.as<int32_t>();
+        return true;
+    }
+    if (value.is<bool>()) {
+        codeOut = value.as<bool>() ? 1 : 0;
+        return true;
+    }
+    String text = value.as<String>();
+    text.trim();
+    text.toLowerCase();
+    if (text == "normal") {
+        codeOut = 0;
+        return true;
+    }
+    if (text == "high") {
+        codeOut = 1;
+        return true;
+    }
+    if (text == "max" || text == "hot") {
+        codeOut = 2;
+        return true;
+    }
+    if (text == "individual") {
+        codeOut = 3;
+        return true;
+    }
+    return false;
+}
+
+bool parseRecipeProfileCode(const JsonVariantConst value, int32_t& codeOut) {
+    if (value.is<int>() || value.is<long>() || value.is<float>() || value.is<double>()) {
+        codeOut = value.as<int32_t>();
+        return true;
+    }
+    String text = value.as<String>();
+    text.trim();
+    text.toLowerCase();
+    if (text == "dynamic") {
+        codeOut = 0;
+        return true;
+    }
+    if (text == "constant") {
+        codeOut = 1;
+        return true;
+    }
+    if (text == "intense") {
+        codeOut = 2;
+        return true;
+    }
+    if (text == "individual") {
+        codeOut = 3;
+        return true;
+    }
+    if (text == "quick") {
+        codeOut = 4;
+        return true;
+    }
+    return false;
+}
+
+bool parseRecipeBooleanCode(const JsonVariantConst value, int32_t& codeOut) {
+    if (value.is<bool>()) {
+        codeOut = value.as<bool>() ? 1 : 0;
+        return true;
+    }
+    if (value.is<int>() || value.is<long>() || value.is<float>() || value.is<double>()) {
+        codeOut = value.as<int32_t>();
+        return true;
+    }
+    String text = value.as<String>();
+    text.trim();
+    text.toLowerCase();
+    if (text == "on" || text == "true" || text == "yes") {
+        codeOut = 1;
+        return true;
+    }
+    if (text == "off" || text == "false" || text == "no") {
+        codeOut = 0;
+        return true;
+    }
+    return false;
+}
+
+float recipeAmountMlValue(bool fluidWriteScale10, int32_t rawValue) {
+    if (fluidWriteScale10) {
         return static_cast<float>(rawValue) / 10.0f;
     }
     return static_cast<float>(rawValue);
+}
+
+float recipeAmountMlValue(const nivona::MyCoffeeLayout& layout, int32_t rawValue) {
+    return recipeAmountMlValue(layout.fluidWriteScale10, rawValue);
 }
 
 void connectWifi() {
@@ -1033,8 +1286,27 @@ bool sendPreparedFramePacket(const char* command,
     canWriteNoResponseOut = nivonaTx->canWriteNoResponse();
     writeWithResponseOut = !canWriteNoResponseOut;
 
+    size_t maxWritePayload = 20;
+    if (client != nullptr) {
+        const uint16_t mtu = client->getMTU();
+        if (mtu > 3) {
+            maxWritePayload = mtu - 3;
+        }
+    }
+    const bool effectiveChunked = chunked || requestPacketOut.size() > maxWritePayload;
+    const size_t chunkSize = effectiveChunked ? maxWritePayload : 10;
+    const uint32_t effectiveInterChunkDelayMs =
+        effectiveChunked && interChunkDelayMs == 0 ? 10 : interChunkDelayMs;
+
     clearNotificationBuffer();
-    if (!writeRemoteCharacteristic(nivonaTx, "tx", requestPacketOut, writeWithResponseOut, chunked, 10, interChunkDelayMs, error)) {
+    if (!writeRemoteCharacteristic(nivonaTx,
+                                   "tx",
+                                   requestPacketOut,
+                                   writeWithResponseOut,
+                                   effectiveChunked,
+                                   chunkSize,
+                                   effectiveInterChunkDelayMs,
+                                   error)) {
         return false;
     }
 
@@ -3127,6 +3399,7 @@ void appendStatus(JsonDocument& doc) {
     doc["lastHuResponseHex"] = lastHuResponseHex;
     doc["lastHuParseStatus"] = lastHuParseStatus;
     doc["protocolSessionCount"] = protocolSessions.size();
+    doc["standardRecipeCacheReady"] = littleFsReady;
 
     size_t supportedCount = 0;
     for (const auto& record : scannedDevices) {
@@ -3294,6 +3567,8 @@ bool appendMyCoffeeSlot(JsonObject target, SavedMachine& machine, uint8_t slotIn
     const uint16_t baseRegister = nivona::myCoffeeSlotBase(slotIndex);
     target["slot"] = slotIndex + 1;
     target["baseRegister"] = baseRegister;
+    target["maxStrengthBeans"] = modelInfo.strengthLevelCount;
+    target["maxProfileCode"] = modelInfo.maxProfileCode;
 
     auto readOptionalNumeric = [&](const char* key,
                                    const char* label,
@@ -3412,6 +3687,320 @@ bool appendMyCoffeeSlot(JsonObject target, SavedMachine& machine, uint8_t slotIn
         return false;
     }
     return true;
+}
+
+bool appendStandardRecipe(JsonObject target, SavedMachine& machine, uint8_t selector, bool detail, String& error) {
+    const nivona::ModelInfo modelInfo = nivona::detectModelInfo(toNivonaDetails(machine));
+    const nivona::StandardRecipeDescriptor* descriptor = nivona::findStandardRecipeBySelector(modelInfo, selector);
+    if (descriptor == nullptr) {
+        error = "standard recipe selector is not supported for this machine";
+        return false;
+    }
+
+    nivona::StandardRecipeLayout layout;
+    if (!nivona::resolveStandardRecipeLayout(modelInfo, layout)) {
+        error = "standard recipe details are not supported for this machine";
+        return false;
+    }
+
+    uint16_t baseRegister = 0;
+    if (!nivona::resolveStandardRecipeBaseRegister(modelInfo, selector, baseRegister)) {
+        error = "unable to resolve the standard recipe base register";
+        return false;
+    }
+
+    target["selector"] = selector;
+    target["name"] = descriptor->name;
+    target["title"] = descriptor->title;
+    target["baseRegister"] = baseRegister;
+    target["typeSelector"] = selector;
+    target["typeName"] = descriptor->title;
+    target["maxStrengthBeans"] = modelInfo.strengthLevelCount;
+    target["maxProfileCode"] = modelInfo.maxProfileCode;
+
+    if (!detail) {
+        return true;
+    }
+
+    auto readOptionalNumeric = [&](const char* key,
+                                   const char* label,
+                                   uint16_t offset,
+                                   bool scaleMl,
+                                   const String& valueLabel) -> bool {
+        if (offset == UINT16_MAX) {
+            return true;
+        }
+        int32_t rawValue = 0;
+        if (!readMachineNumericRegister(baseRegister + offset, rawValue, error)) {
+            return false;
+        }
+        target[key] = rawValue;
+        if (scaleMl) {
+            target[String(key) + "Ml"] = recipeAmountMlValue(layout.fluidWriteScale10, rawValue);
+        }
+        if (!valueLabel.isEmpty()) {
+            target[String(key) + "Label"] = valueLabel;
+        }
+        target[String(key) + "Register"] = baseRegister + offset;
+        target[String(key) + "Title"] = label;
+        return true;
+    };
+
+    if (!readOptionalNumeric("strength", "Strength", layout.strengthOffset, false, "")) {
+        return false;
+    }
+    if (target.containsKey("strength")) {
+        target["strengthBeans"] = static_cast<int32_t>(target["strength"].as<int32_t>()) + 1;
+    }
+    if (!readOptionalNumeric("profile", "Profile", layout.profileOffset, false, "")) {
+        return false;
+    }
+    if (target.containsKey("profile")) {
+        target["profileLabel"] = recipeProfileLabel(target["profile"].as<int32_t>());
+        target["aroma"] = target["profile"].as<int32_t>();
+        target["aromaLabel"] = target["profileLabel"].as<String>();
+    }
+    if (!readOptionalNumeric("temperature", "Temperature", layout.temperatureOffset, false, "")) {
+        return false;
+    }
+    if (target.containsKey("temperature")) {
+        target["temperatureLabel"] = recipeTemperatureLabel(target["temperature"].as<int32_t>());
+    }
+    if (!readOptionalNumeric("coffeeTemperature", "Coffee temperature", layout.coffeeTemperatureOffset, false, "")) {
+        return false;
+    }
+    if (target.containsKey("coffeeTemperature")) {
+        target["coffeeTemperatureLabel"] = recipeTemperatureLabel(target["coffeeTemperature"].as<int32_t>());
+    }
+    if (!readOptionalNumeric("waterTemperature", "Water temperature", layout.waterTemperatureOffset, false, "")) {
+        return false;
+    }
+    if (target.containsKey("waterTemperature")) {
+        target["waterTemperatureLabel"] = recipeTemperatureLabel(target["waterTemperature"].as<int32_t>());
+    }
+    if (!readOptionalNumeric("milkTemperature", "Milk temperature", layout.milkTemperatureOffset, false, "")) {
+        return false;
+    }
+    if (target.containsKey("milkTemperature")) {
+        target["milkTemperatureLabel"] = recipeTemperatureLabel(target["milkTemperature"].as<int32_t>());
+    }
+    if (!readOptionalNumeric("milkFoamTemperature", "Milk foam temperature", layout.milkFoamTemperatureOffset, false, "")) {
+        return false;
+    }
+    if (target.containsKey("milkFoamTemperature")) {
+        target["milkFoamTemperatureLabel"] = recipeTemperatureLabel(target["milkFoamTemperature"].as<int32_t>());
+    }
+    if (!readOptionalNumeric("overallTemperature", "Overall temperature", layout.overallTemperatureOffset, false, "")) {
+        return false;
+    }
+    if (target.containsKey("overallTemperature")) {
+        target["overallTemperatureLabel"] = recipeTemperatureLabel(target["overallTemperature"].as<int32_t>());
+    }
+    if (!readOptionalNumeric("twoCups", "Two cups", layout.twoCupsOffset, false, "")) {
+        return false;
+    }
+    if (!readOptionalNumeric("preparation", "Preparation", layout.preparationOffset, false, "")) {
+        return false;
+    }
+    if (!readOptionalNumeric("coffeeAmount", "Coffee amount", layout.coffeeAmountOffset, true, "")) {
+        return false;
+    }
+    if (!readOptionalNumeric("waterAmount", "Water amount", layout.waterAmountOffset, true, "")) {
+        return false;
+    }
+    if (!readOptionalNumeric("milkAmount", "Milk amount", layout.milkAmountOffset, true, "")) {
+        return false;
+    }
+    if (!readOptionalNumeric("milkFoamAmount", "Milk foam amount", layout.milkFoamAmountOffset, true, "")) {
+        return false;
+    }
+    return true;
+}
+
+bool applyStandardRecipeOverrides(JsonObject recipe,
+                                  JsonVariantConst request,
+                                  const nivona::ModelInfo& modelInfo,
+                                  const nivona::StandardRecipeLayout& layout,
+                                  String& error) {
+    auto setNumericField = [&](const char* key, int32_t value) {
+        recipe[key] = value;
+    };
+    const uint8_t maxStrengthBeans = modelInfo.strengthLevelCount > 0 ? modelInfo.strengthLevelCount : 5;
+    const uint8_t maxProfileCode = modelInfo.maxProfileCode <= 4 ? modelInfo.maxProfileCode : 4;
+
+    if (request["strength"].is<int>() || request["strength"].is<long>() || request["strength"].is<float>() ||
+        request["strength"].is<double>()) {
+        const int32_t strengthCode = request["strength"].as<int32_t>();
+        if (strengthCode < 0 || strengthCode >= maxStrengthBeans) {
+            error = String("strength must be between 0 and ") + (maxStrengthBeans - 1) + " for this machine";
+            return false;
+        }
+        setNumericField("strength", strengthCode);
+        recipe["strengthBeans"] = strengthCode + 1;
+    }
+    if (request["strengthBeans"].is<int>() || request["strengthBeans"].is<long>() || request["strengthBeans"].is<float>() ||
+        request["strengthBeans"].is<double>()) {
+        const int32_t beans = request["strengthBeans"].as<int32_t>();
+        if (beans <= 0 || beans > maxStrengthBeans) {
+            error = String("strengthBeans must be between 1 and ") + maxStrengthBeans + " for this machine";
+            return false;
+        }
+        setNumericField("strength", beans - 1);
+        recipe["strengthBeans"] = beans;
+    }
+
+    int32_t code = 0;
+    if (!request["profile"].isNull()) {
+        if (!parseRecipeProfileCode(request["profile"], code)) {
+            error = "unsupported profile value";
+            return false;
+        }
+        if (code < 0 || code > maxProfileCode) {
+            error = "profile is not supported for this machine";
+            return false;
+        }
+        setNumericField("profile", code);
+        recipe["profileLabel"] = recipeProfileLabel(code);
+        recipe["aroma"] = code;
+        recipe["aromaLabel"] = recipe["profileLabel"].as<String>();
+    }
+    if (!request["aroma"].isNull()) {
+        if (!parseRecipeProfileCode(request["aroma"], code)) {
+            error = "unsupported aroma value";
+            return false;
+        }
+        if (code < 0 || code > maxProfileCode) {
+            error = "aroma/profile is not supported for this machine";
+            return false;
+        }
+        setNumericField("profile", code);
+        recipe["profileLabel"] = recipeProfileLabel(code);
+        recipe["aroma"] = code;
+        recipe["aromaLabel"] = recipe["profileLabel"].as<String>();
+    }
+
+    auto applyTemperature = [&](const char* requestKey, const char* fieldKey, const char* labelKey) -> bool {
+        if (request[requestKey].isNull()) {
+            return true;
+        }
+        if (!parseRecipeTemperatureCode(request[requestKey], code)) {
+            error = String("unsupported ") + requestKey + " value";
+            return false;
+        }
+        setNumericField(fieldKey, code);
+        recipe[labelKey] = recipeTemperatureLabel(code);
+        return true;
+    };
+
+    if (!applyTemperature("temperature", "temperature", "temperatureLabel") ||
+        !applyTemperature("coffeeTemperature", "coffeeTemperature", "coffeeTemperatureLabel") ||
+        !applyTemperature("waterTemperature", "waterTemperature", "waterTemperatureLabel") ||
+        !applyTemperature("milkTemperature", "milkTemperature", "milkTemperatureLabel") ||
+        !applyTemperature("milkFoamTemperature", "milkFoamTemperature", "milkFoamTemperatureLabel") ||
+        !applyTemperature("overallTemperature", "overallTemperature", "overallTemperatureLabel")) {
+        return false;
+    }
+
+    if (!request["preparation"].isNull()) {
+        if (!(request["preparation"].is<int>() || request["preparation"].is<long>() || request["preparation"].is<float>() ||
+              request["preparation"].is<double>())) {
+            error = "preparation must be numeric";
+            return false;
+        }
+        setNumericField("preparation", request["preparation"].as<int32_t>());
+    }
+
+    if (!request["twoCups"].isNull()) {
+        if (!parseRecipeBooleanCode(request["twoCups"], code)) {
+            error = "twoCups must be on/off, true/false, or numeric";
+            return false;
+        }
+        setNumericField("twoCups", code);
+    }
+
+    auto applyAmount = [&](const char* requestKey, const char* fieldKey) -> bool {
+        if (request[requestKey].isNull()) {
+            return true;
+        }
+        if (!(request[requestKey].is<int>() || request[requestKey].is<long>() || request[requestKey].is<float>() ||
+              request[requestKey].is<double>())) {
+            error = String(requestKey) + " must be numeric";
+            return false;
+        }
+        const float value = request[requestKey].as<float>();
+        if (value < 0.0f) {
+            error = String(requestKey) + " must be non-negative";
+            return false;
+        }
+        recipe[fieldKey] = value;
+        return true;
+    };
+
+    if (!applyAmount("coffeeAmountMl", "coffeeAmountMl") ||
+        !applyAmount("waterAmountMl", "waterAmountMl") ||
+        !applyAmount("milkAmountMl", "milkAmountMl") ||
+        !applyAmount("milkFoamAmountMl", "milkFoamAmountMl")) {
+        return false;
+    }
+
+    if (!request["sizeMl"].isNull()) {
+        if (!(request["sizeMl"].is<int>() || request["sizeMl"].is<long>() || request["sizeMl"].is<float>() ||
+              request["sizeMl"].is<double>())) {
+            error = "sizeMl must be numeric";
+            return false;
+        }
+        const float sizeMl = request["sizeMl"].as<float>();
+        if (sizeMl < 0.0f) {
+            error = "sizeMl must be non-negative";
+            return false;
+        }
+        if (layout.coffeeAmountOffset != UINT16_MAX) {
+            recipe["coffeeAmountMl"] = sizeMl;
+        } else if (layout.waterAmountOffset != UINT16_MAX) {
+            recipe["waterAmountMl"] = sizeMl;
+        }
+    }
+
+    return true;
+}
+
+bool uploadTemporaryStandardRecipe(const nivona::StandardRecipeLayout& layout,
+                                   JsonObjectConst recipe,
+                                   uint8_t selector,
+                                   String& error) {
+    auto writeOptionalNumeric = [&](const char* key, uint16_t offset, bool scaleMl) -> bool {
+        if (offset == UINT16_MAX || !recipe.containsKey(key)) {
+            return true;
+        }
+        int32_t numericValue = 0;
+        if (scaleMl) {
+            numericValue = layout.fluidWriteScale10
+                ? static_cast<int32_t>(recipe[key].as<float>() * 10.0f)
+                : static_cast<int32_t>(recipe[key].as<float>());
+        } else {
+            numericValue = recipe[key].as<int32_t>();
+        }
+        return writeMachineNumericRegister(static_cast<uint16_t>(TEMP_RECIPE_TYPE_REGISTER + offset), numericValue, error);
+    };
+
+    if (!writeOptionalNumeric("strength", layout.strengthOffset, false) ||
+        !writeOptionalNumeric("profile", layout.profileOffset, false) ||
+        !writeOptionalNumeric("temperature", layout.temperatureOffset, false) ||
+        !writeOptionalNumeric("preparation", layout.preparationOffset, false) ||
+        !writeOptionalNumeric("twoCups", layout.twoCupsOffset, false) ||
+        !writeOptionalNumeric("coffeeTemperature", layout.coffeeTemperatureOffset, false) ||
+        !writeOptionalNumeric("waterTemperature", layout.waterTemperatureOffset, false) ||
+        !writeOptionalNumeric("milkTemperature", layout.milkTemperatureOffset, false) ||
+        !writeOptionalNumeric("milkFoamTemperature", layout.milkFoamTemperatureOffset, false) ||
+        !writeOptionalNumeric("overallTemperature", layout.overallTemperatureOffset, false) ||
+        !writeOptionalNumeric("coffeeAmountMl", layout.coffeeAmountOffset, true) ||
+        !writeOptionalNumeric("waterAmountMl", layout.waterAmountOffset, true) ||
+        !writeOptionalNumeric("milkAmountMl", layout.milkAmountOffset, true) ||
+        !writeOptionalNumeric("milkFoamAmountMl", layout.milkFoamAmountOffset, true)) {
+        return false;
+    }
+
+    return writeMachineNumericRegister(TEMP_RECIPE_TYPE_REGISTER, selector, error);
 }
 
 void handleMachinesList() {
@@ -3585,6 +4174,7 @@ void handleMachinesManualCreate() {
 void handleMachinesReset() {
     savedMachines.clear();
     clearStoredSessionKey();
+    clearAllStandardRecipeCaches();
     machinePreferences.remove(PREFS_MACHINE_STORE);
     machinePreferences.putUInt(PREFS_MACHINE_SCHEMA, 1);
     DynamicJsonDocument doc(1024);
@@ -3633,13 +4223,7 @@ void handleMachineSummary(const String& serial) {
     details["ad06Hex"] = detailsSource.ad06Hex;
     details["ad06Ascii"] = detailsSource.ad06Ascii;
     JsonObject status = response.createNestedObject("status");
-    status["ok"] = processStatus.ok;
-    status["summary"] = processStatus.summary;
-    status["process"] = processStatus.process;
-    status["subProcess"] = processStatus.subProcess;
-    status["message"] = processStatus.message;
-    status["progress"] = processStatus.progress;
-    status["error"] = processError;
+    appendProcessStatusJson(status, processStatus, processError);
     JsonObject protocolSession = response.createNestedObject("protocolSession");
     appendProtocolSessionJson(protocolSession, resolveStoredSessionEntry(machine->serial, machine->address));
     appendStatus(response);
@@ -3667,6 +4251,66 @@ void handleMachineRecipes(const String& serial) {
         item["selector"] = recipe->selector;
         item["name"] = recipe->name;
         item["title"] = recipe->title;
+        uint16_t baseRegister = 0;
+        if (nivona::resolveStandardRecipeBaseRegister(modelInfo, recipe->selector, baseRegister)) {
+            item["baseRegister"] = baseRegister;
+        }
+        item["detailsSupported"] = true;
+    }
+    sendJson(response);
+}
+
+void handleMachineRecipeDetail(const String& serial, const String& selectorText) {
+    SavedMachine* machine = findSavedMachineBySerial(serial);
+    if (machine == nullptr) {
+        sendError(404, "saved machine not found");
+        return;
+    }
+
+    const int selectorValue = selectorText.toInt();
+    if (selectorValue < 0 || selectorValue > 255) {
+        sendError(400, "selector must be between 0 and 255");
+        return;
+    }
+
+    const bool forceRefresh = parseRefreshArg();
+    if (!forceRefresh) {
+        DynamicJsonDocument cachedResponse(12288);
+        String cacheError;
+        if (loadStandardRecipeCache(*machine, static_cast<uint8_t>(selectorValue), cachedResponse, cacheError)) {
+            DynamicJsonDocument response(12288);
+            response["ok"] = true;
+            response["source"] = "cache";
+            response["cached"] = true;
+            JsonObject recipe = response.createNestedObject("recipe");
+            recipe.set(cachedResponse["recipe"].as<JsonObject>());
+            sendJson(response);
+            return;
+        }
+    }
+
+    String error;
+    if (!beginMachineProtocolSession(*machine, error)) {
+        lastError = error;
+        sendError(500, error);
+        return;
+    }
+
+    DynamicJsonDocument response(12288);
+    response["ok"] = true;
+    response["source"] = "live";
+    response["cached"] = false;
+    JsonObject recipe = response.createNestedObject("recipe");
+    if (!appendStandardRecipe(recipe, *machine, static_cast<uint8_t>(selectorValue), true, error)) {
+        lastError = error;
+        sendError(500, error);
+        return;
+    }
+
+    String cacheWriteError;
+    const JsonObjectConst recipeView = recipe;
+    if (!persistStandardRecipeCache(*machine, static_cast<uint8_t>(selectorValue), recipeView, cacheWriteError)) {
+        addLog("cache", String("Standard recipe cache write skipped: ") + cacheWriteError);
     }
     sendJson(response);
 }
@@ -3678,7 +4322,7 @@ void handleMachineBrew(const String& serial) {
         return;
     }
 
-    DynamicJsonDocument request(2048);
+    DynamicJsonDocument request(4096);
     String error;
     if (!parseJsonBody(request, error)) {
         sendError(400, error);
@@ -3702,6 +4346,30 @@ void handleMachineBrew(const String& serial) {
     }
 
     const nivona::ModelInfo modelInfo = nivona::detectModelInfo(toNivonaDetails(*machine));
+    nivona::StandardRecipeLayout layout;
+    if (!nivona::resolveStandardRecipeLayout(modelInfo, layout)) {
+        sendError(400, "standard recipe overrides are not supported for this machine");
+        return;
+    }
+
+    DynamicJsonDocument recipeDoc(8192);
+    JsonObject recipe = recipeDoc.createNestedObject("recipe");
+    if (!appendStandardRecipe(recipe, *machine, static_cast<uint8_t>(selector), true, error)) {
+        lastError = error;
+        sendError(500, error);
+        return;
+    }
+    if (!applyStandardRecipeOverrides(recipe, request.as<JsonVariantConst>(), modelInfo, layout, error)) {
+        sendError(400, error);
+        return;
+    }
+    JsonObjectConst recipeView = recipe;
+    if (!uploadTemporaryStandardRecipe(layout, recipeView, static_cast<uint8_t>(selector), error)) {
+        lastError = error;
+        sendError(500, error);
+        return;
+    }
+
     const ByteVector* sessionKey = resolveStoredSessionIfAvailable();
     if (!sendMachineCommand("HE",
                             nivona::buildHeMakeCoffeePayload(modelInfo, static_cast<uint8_t>(selector)),
@@ -3720,13 +4388,11 @@ void handleMachineBrew(const String& serial) {
     DynamicJsonDocument response(4096);
     response["ok"] = true;
     response["selector"] = selector;
+    response["temporaryRecipeUploaded"] = true;
+    JsonObject recipeResponse = response.createNestedObject("recipe");
+    recipeResponse.set(recipe);
     JsonObject status = response.createNestedObject("status");
-    status["summary"] = processStatus.summary;
-    status["process"] = processStatus.process;
-    status["subProcess"] = processStatus.subProcess;
-    status["message"] = processStatus.message;
-    status["progress"] = processStatus.progress;
-    status["error"] = processError;
+    appendProcessStatusJson(status, processStatus, processError);
     appendStatus(response);
     sendJson(response);
 }
@@ -3804,6 +4470,38 @@ void handleMachineMyCoffeeDetail(const String& serial, const String& slotText, b
         if (!parseJsonBody(request, error)) {
             sendError(400, error);
             return;
+        }
+        const uint8_t maxStrengthBeans = modelInfo.strengthLevelCount > 0 ? modelInfo.strengthLevelCount : 5;
+        const uint8_t maxProfileCode = modelInfo.maxProfileCode <= 4 ? modelInfo.maxProfileCode : 4;
+        if (request.containsKey("strengthBeans")) {
+            const int32_t beans = request["strengthBeans"].as<int32_t>();
+            if (beans <= 0 || beans > maxStrengthBeans) {
+                sendError(400, String("strengthBeans must be between 1 and ") + maxStrengthBeans + " for this machine");
+                return;
+            }
+            request["strength"] = beans - 1;
+        }
+        if (request.containsKey("strength")) {
+            const int32_t strengthCode = request["strength"].as<int32_t>();
+            if (strengthCode < 0 || strengthCode >= maxStrengthBeans) {
+                sendError(400, String("strength must be between 0 and ") + (maxStrengthBeans - 1) + " for this machine");
+                return;
+            }
+        }
+        if (request.containsKey("aroma") && !request.containsKey("profile")) {
+            request["profile"] = request["aroma"];
+        }
+        if (request.containsKey("profile")) {
+            int32_t profileCode = 0;
+            if (!parseRecipeProfileCode(request["profile"], profileCode)) {
+                sendError(400, "unsupported profile value");
+                return;
+            }
+            if (profileCode < 0 || profileCode > maxProfileCode) {
+                sendError(400, "profile is not supported for this machine");
+                return;
+            }
+            request["profile"] = profileCode;
         }
         const uint16_t baseRegister = nivona::myCoffeeSlotBase(slotIndex);
         if (request.containsKey("name") && layout.nameOffset != UINT16_MAX) {
@@ -3976,12 +4674,7 @@ void handleMachineSettingsPost(const String& serial) {
         response["action"] = action;
         response["commandId"] = commandId;
         JsonObject status = response.createNestedObject("status");
-        status["summary"] = processStatus.summary;
-        status["process"] = processStatus.process;
-        status["subProcess"] = processStatus.subProcess;
-        status["message"] = processStatus.message;
-        status["progress"] = processStatus.progress;
-        status["error"] = processError;
+        appendProcessStatusJson(status, processStatus, processError);
         sendJson(response);
         return;
     }
@@ -4034,6 +4727,7 @@ void handleMachineDelete(const String& serial) {
     for (auto it = savedMachines.begin(); it != savedMachines.end(); ++it) {
         if (it->serial.equalsIgnoreCase(serial)) {
             clearStoredSessionKey(it->serial, it->address);
+            clearStandardRecipeCachesForMachine(it->serial);
             savedMachines.erase(it);
             persistSavedMachines();
             DynamicJsonDocument response(512);
@@ -4062,7 +4756,11 @@ bool dispatchMachineApiRoute() {
         return true;
     }
     if (section == "recipes" && server.method() == HTTP_GET) {
-        handleMachineRecipes(serial);
+        if (tail.isEmpty()) {
+            handleMachineRecipes(serial);
+        } else {
+            handleMachineRecipeDetail(serial, tail);
+        }
         return true;
     }
     if (section == "brew" && server.method() == HTTP_POST) {
@@ -5252,6 +5950,11 @@ void setup() {
 
     preferences.begin(PREFS_WIFI, false);
     machinePreferences.begin(PREFS_MACHINES, false);
+    if (!initializeLittleFs(lastError)) {
+        addLog("fs", String("Failed to initialize LittleFS: ") + lastError);
+    } else {
+        addLog("fs", "LittleFS ready");
+    }
     loadSavedMachines();
     connectWifi();
     setupMdns();

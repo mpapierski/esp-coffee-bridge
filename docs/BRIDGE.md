@@ -18,7 +18,37 @@ Current embedded bridge UI is now organized around remembered machines rather th
 - machine pages
   - `GET /api/machines/{serial}/summary`
   - `GET /api/machines/{serial}/recipes`
+  - `GET /api/machines/{serial}/recipes/{selector}`
+    - serves the cached standard recipe snapshot from LittleFS by default when available
+    - `?refresh=1` forces a live protocol session and rereads the current standard recipe item values from the machine
+    - successful live reads refresh the LittleFS cache
+    - current bridge UI uses this for the standard-drink "Customize" page
   - `POST /api/machines/{serial}/brew`
+    - current implementation first reads the live standard recipe, applies request overrides, uploads a temporary recipe snapshot into the machine scratch namespace, and only then sends the standard selector-based `HE` payload
+    - supported override fields:
+      - `strength`
+      - `strengthBeans`
+      - `profile`
+      - `aroma` alias for `profile`
+      - `temperature`
+      - `coffeeTemperature`
+      - `waterTemperature`
+      - `milkTemperature`
+      - `milkFoamTemperature`
+      - `overallTemperature`
+      - `preparation`
+      - `twoCups`
+      - `coffeeAmountMl`
+      - `waterAmountMl`
+      - `milkAmountMl`
+      - `milkFoamAmountMl`
+      - `sizeMl` alias
+    - recipe editors and writes are capability-gated by detected model
+      - example: `NICR 756` is capped to `3` beans and profile codes `dynamic`, `constant`, `intense`, `individual`
+    - those overrides are temporary for the started brew; they do not overwrite persistent `MyCoffee` slots
+  - standard recipe cache
+    - per-machine, per-selector JSON snapshots are stored in LittleFS
+    - cache files are cleared when a saved machine is forgotten or when the saved-machine store is reset
   - `GET /api/machines/{serial}/mycoffee`
   - `GET /api/machines/{serial}/mycoffee/{slot}`
   - `POST /api/machines/{serial}/mycoffee/{slot}`
@@ -60,6 +90,9 @@ Manual saved-machine add:
   - related summary behavior:
     - `GET /api/machines/{serial}/summary` now returns `ok: true` even if the bridge cannot connect live
     - in that case the response uses saved metadata and reports status summary `offline` or `unavailable` with the connection error text
+    - on live `HX` reads the response now includes both numeric codes and APK-backed labels for `process` and `message`
+    - example on the `756` / family `700` path: `process=8`, `processLabel=ready`, `message=0`, `messageLabel=none`
+    - unknown raw message codes remain unlabeled; for example, `message=42` has been observed live after cancel, but the APK does not map it beyond the generic fallback error text
 
 ## ESP32 Bridge Probe Coverage By Device Class
 

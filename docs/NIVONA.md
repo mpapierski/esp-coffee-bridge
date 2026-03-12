@@ -1132,6 +1132,45 @@ Response payload:
   - `message`
   - `progress`
 
+APK-backed interpretation from the Android app:
+
+- `process` is the coarse machine state used by the app when deciding whether it may start a drink
+- `message` is an overlay for blocking errors or operator prompts
+- `sub_process` and `progress` are parsed, but are not meaningfully surfaced by the Android UI in the artifacts inspected so far
+- confirmed process values used by the app:
+  - `8` = ready on the `700`-style path used by the live `756`
+  - `11` = drink preparation already in progress on the `700`-style path
+  - `3` = ready on the alternate family path
+  - `4` = drink preparation already in progress on the alternate family path
+- confirmed numeric message values productized through the localization layer:
+  - the app's `LocalizationService::IsCoffeemachineErrorMessageAvailable(error)` is literally `error <= 6`
+  - so only codes `0..6` are treated as numeric localized machine errors
+  - confirmed values:
+    - `0` = generic fallback "machine not ready" string in the app
+    - `1` = brewing unit removed
+    - `2` = trays missing
+    - `3` = empty trays
+    - `4` = fill up water
+    - `5` = close powder shaft
+    - `6` = fill coffee beans
+- confirmed message values handled as explicit brew-flow special cases, outside the numeric localization table:
+  - `11` = move cup to frother and open valve
+  - `20` = flush required
+- important nuance:
+  - locale key `App_CoffeemachineMessage_0 = Machine not ready` exists in the APK
+  - but the app also uses key `0` as a generic fallback error string when no better mapping is available
+  - so live wire value `message = 0` should be treated as “no special message” in a ready state, not automatically as “machine not ready”
+- startup and brew-loop behavior in `CustomizeCoffeeActivity::MakeCoffee()`:
+  - before starting a drink, the app reads `HX`
+  - if `process != prepareResultCode` after `HE`, the app checks `IsCoffeemachineErrorMessageAvailable(message)`
+  - when that returns false, it falls back to `App_CoffeemachineMessage_0`
+  - therefore unknown numeric message codes are not productized into their own text by the APK
+- observed unknown raw message:
+  - live bridge testing on the `756` saw `message = 42` after canceling a brew
+  - there is no `App_CoffeemachineMessage_42` locale key in any shipped locale dump
+  - because the app only treats `0..6` as localized numeric errors, `42` would fall back to the generic “machine not ready” text on Android
+  - current status: `42` remains an unknown raw machine code, plausibly cancel or abort related, but not identified by the APK itself
+
 ### `HY` confirm user input
 
 Request payload:
@@ -1178,6 +1217,33 @@ Observed payload layout for the standard `MakeCoffee` path:
 - `payload[5] = 0x01`
 - all other bytes zero
 - the optional `noOfCups` argument is ignored by the APK path
+
+Important managed-app behavior:
+
+- the Android app does not normally jump straight to `HE`
+- `CoffeeMachineService::MakeCoffee(...)` first calls a fallback path for chilled `8000` recipes
+- if that fallback does not apply, it calls `RecipeService::SendTemporaryRecipe(recipe)` and only then sends the standard `HE` payload
+- `SendTemporaryRecipe(...)`:
+  - clones the selected recipe object
+  - rebases every recipe-item command id into the machine's temporary-recipe address space using `SelectedCoffeeMachine.CommandIdTemporaryRecipeType - recipe.RecipeBaseAddress`
+  - `SelectedCoffeeMachine.CommandIdTemporaryRecipeType` is initialized to `9001` in the managed app's `CoffeeMachine` constructor
+  - for `MyCoffee`, subtracts an additional `3` from that delta
+  - appends a temporary `RecipeItemLookUp` whose selected value is the original `job_product_parameter`
+  - calls `SendRecipeToCoffeeMachine(...)`
+- `SendRecipeToCoffeeMachine(...)` then writes the recipe items one by one:
+  - lookup items
+  - fluid items
+  - name items
+  - enabled flag
+  - type
+  - icon
+- practical implication:
+  - app-started standard drinks use the current recipe-item values from the app model, not just the bare selector in `HE`
+  - drink properties like strength, volume, and temperature are therefore expected to come from the temporary-recipe upload, not from the `HE` payload itself
+  - inferred model:
+    - this is a transient scratch recipe namespace on the machine, not a saved `MyCoffee` slot
+    - the app rewrites it on each brew request and then starts the drink with `HE`
+    - it is separate from persistent `MyCoffee` storage at `20000+`
 
 Special chilled fallback path:
 
@@ -1304,6 +1370,107 @@ Recovered from `RecipeFactory`.
 - `8` chilled espresso
 - `9` chilled lungo
 - `10` chilled americano
+
+## Standard Recipe Register Model
+
+The managed app does not treat standard drinks as selector-only actions. Standard recipe content is queryable and forms a family-specific register table.
+
+Confirmed app behavior:
+
+- `RecipeService::GetRecipeItems(...)` builds item models for standard drinks as well as `MyCoffee`
+- `RecipeService::LoadRecipeWithRecipeItems(...)` reads numeric recipe-item values from the machine for those standard recipes
+- for standard drinks, the base register is:
+  - `B = 10000 + selector * 100`
+- item values are then read with `HR (B + offset)`
+
+That means the current machine-side standard recipe for a drink like `lungo` on family `700` is readable live, not just inferable from the app defaults.
+
+### Family 600 standard recipe offsets
+
+- `+1` strength
+- `+2` profile
+- `+3` temperature
+- `+4` two cups
+- `+5` coffee ml
+- `+6` water ml
+- `+8` frothy milk ml
+- `+9` preparation
+
+### Family 700 / 79x / 8000 standard recipe offsets
+
+- `+1` strength
+- `+2` profile
+- `+3` temperature
+- `+4` two cups
+- `+5` coffee ml
+- `+6` water ml
+- `+7` milk ml
+- `+8` frothy milk ml
+
+Example:
+
+- family `700` `lungo` uses selector `2`
+- base register `B = 10200`
+- current values are therefore readable from:
+  - `10201` strength
+  - `10202` profile
+  - `10203` temperature
+  - `10205` coffee ml
+
+### Family 900 / 900 Light standard recipe offsets
+
+- `+1` strength
+- `+2` profile
+- `+3` preparation
+- `+4` two cups
+- `+5` coffee temperature
+- `+6` water temperature
+- `+7` milk temperature
+- `+8` frothy milk temperature
+- `+9` coffee ml
+- `+10` water ml
+- `+11` milk ml
+- `+12` frothy milk ml
+- `+13` overall temperature
+
+Known write quirk:
+
+- displayed fluid ml values are multiplied by `10` before `HW` writes on these families
+
+### Family 1030 / 1040 standard recipe offsets
+
+- `+1` strength
+- `+2` profile
+- `+3` preparation
+- `+4` two cups
+- `+5` coffee temperature
+- `+6` water temperature
+- `+7` milk temperature
+- `+8` frothy milk temperature
+- `+9` coffee ml
+- `+10` water ml
+- `+11` milk ml
+- `+12` frothy milk ml
+
+## Temporary Standard Recipe Scratch Space
+
+The standard-drink brew flow writes a transient recipe snapshot before sending `HE`.
+
+- scratch recipe type register: `9001`
+- selector/type is written to `9001`
+- standard recipe item writes are rebased into the scratch area as:
+  - `9001 + offset`
+- for example on family `700`, a temporary `lungo` brew with overridden strength/temperature writes:
+  - `9001` selector/type
+  - `9002` strength
+  - `9003` profile
+  - `9004` temperature
+  - `9006` coffee ml
+
+Interpretation:
+
+- this scratch area is separate from persistent `MyCoffee` storage at `20000+`
+- app behavior indicates it is a transient per-brew recipe model used to carry the current standard-drink values like strength, aroma/profile, volume, and temperature
 
 ## Statistics Register IDs
 
@@ -1916,6 +2083,8 @@ ESP32 bridge live validation against the paired machine now shows a working end-
     - ASCII `756573071020106-----`
   - `HX` payload:
     - `0008000000000000`
+    - decoded: `process=8`, `sub_process=0`, `message=0`, `progress=0`
+    - app interpretation on the `700`-style path: `ready`
   - `HR 213` (`total_beverages`) payload:
     - `00D500000D05`
     - value `3333`

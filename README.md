@@ -118,6 +118,8 @@ It supports:
 - `DELETE /api/machines/{serial}`
 - `GET /api/machines/{serial}/summary`
 - `GET /api/machines/{serial}/recipes`
+- `GET /api/machines/{serial}/recipes/{selector}`
+  - add `?refresh=1` to force a live reread from the machine; otherwise the bridge may serve the LittleFS-backed cached snapshot
 - `POST /api/machines/{serial}/brew`
 - `GET /api/machines/{serial}/mycoffee`
 - `GET /api/machines/{serial}/mycoffee/{slot}`

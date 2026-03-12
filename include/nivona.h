@@ -103,6 +103,8 @@ struct ModelInfo {
     RecipeTextEncoding recipeTextEncoding{RecipeTextEncoding::LegacySingleByte};
     bool is79xModel{false};
     bool hasAromaBalanceProfile{false};
+    uint8_t strengthLevelCount{5};
+    uint8_t maxProfileCode{3};
     bool fluidWriteScale10{false};
     bool supportsSettings{false};
     bool supportsStats{false};
@@ -115,6 +117,25 @@ struct StandardRecipeDescriptor {
     uint8_t selector{0};
     const char* name{""};
     const char* title{""};
+};
+
+struct StandardRecipeLayout {
+    String familyKey;
+    bool fluidWriteScale10{false};
+    uint16_t strengthOffset{UINT16_MAX};
+    uint16_t profileOffset{UINT16_MAX};
+    uint16_t temperatureOffset{UINT16_MAX};
+    uint16_t preparationOffset{UINT16_MAX};
+    uint16_t twoCupsOffset{UINT16_MAX};
+    uint16_t coffeeAmountOffset{UINT16_MAX};
+    uint16_t waterAmountOffset{UINT16_MAX};
+    uint16_t milkAmountOffset{UINT16_MAX};
+    uint16_t milkFoamAmountOffset{UINT16_MAX};
+    uint16_t coffeeTemperatureOffset{UINT16_MAX};
+    uint16_t waterTemperatureOffset{UINT16_MAX};
+    uint16_t milkTemperatureOffset{UINT16_MAX};
+    uint16_t milkFoamTemperatureOffset{UINT16_MAX};
+    uint16_t overallTemperatureOffset{UINT16_MAX};
 };
 
 struct MyCoffeeLayout {
@@ -149,6 +170,9 @@ struct ProcessStatus {
     int16_t message{0};
     int16_t progress{0};
     String summary;
+    String processLabel;
+    String subProcessLabel;
+    String messageLabel;
 };
 
 template <typename T, size_t N>
@@ -207,10 +231,17 @@ bool decodeHrNumericResponse(const std::vector<ByteVector>& chunks,
                              uint16_t& registerIdOut,
                              int32_t& valueOut,
                              String& error);
+const char* describeProcessCode(int16_t process);
+const char* describeSubProcessCode(int16_t process, int16_t subProcess);
+const char* describeMessageCode(int16_t message);
+void annotateProcessStatus(ProcessStatus& status);
 bool decodeHxResponse(const std::vector<ByteVector>& chunks, bool encrypted, ProcessStatus& statusOut, String& error);
 
 void selectStandardRecipes(const ModelInfo& modelInfo,
                            std::vector<const StandardRecipeDescriptor*>& selectedOut);
+const StandardRecipeDescriptor* findStandardRecipeBySelector(const ModelInfo& modelInfo, uint8_t selector);
+bool resolveStandardRecipeLayout(const ModelInfo& modelInfo, StandardRecipeLayout& layoutOut);
+bool resolveStandardRecipeBaseRegister(const ModelInfo& modelInfo, uint8_t selector, uint16_t& baseRegisterOut);
 void selectStatsDescriptors(const ModelInfo& modelInfo,
                             std::vector<const RegisterProbe*>& selectedOut);
 bool resolveMyCoffeeLayout(const ModelInfo& modelInfo, MyCoffeeLayout& layoutOut);
