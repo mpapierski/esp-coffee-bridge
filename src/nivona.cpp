@@ -343,6 +343,23 @@ ByteVector joinChunks(const std::vector<ByteVector>& chunks) {
     return joined;
 }
 
+bool chunkIsWholePacketForCommand(const ByteVector& chunk, const char* expectedCommand) {
+    return chunk.size() >= 5 &&
+           chunk.front() == START_BYTE &&
+           chunk.back() == END_BYTE &&
+           chunk[1] == static_cast<uint8_t>(expectedCommand[0]) &&
+           chunk[2] == static_cast<uint8_t>(expectedCommand[1]);
+}
+
+ByteVector selectPacketForCommand(const std::vector<ByteVector>& chunks, const char* expectedCommand) {
+    for (auto it = chunks.rbegin(); it != chunks.rend(); ++it) {
+        if (chunkIsWholePacketForCommand(*it, expectedCommand)) {
+            return *it;
+        }
+    }
+    return joinChunks(chunks);
+}
+
 String decodeUtf16Le(const uint8_t* data, size_t length) {
     String out;
     out.reserve(length / 2);
@@ -1014,13 +1031,13 @@ bool decodeHrNumericResponse(const std::vector<ByteVector>& chunks,
                              String& error) {
     registerIdOut = 0;
     valueOut = 0;
-    ByteVector joined = joinChunks(chunks);
-    if (joined.empty()) {
+    ByteVector packet = selectPacketForCommand(chunks, "HR");
+    if (packet.empty()) {
         error = "no notifications";
         return false;
     }
     ByteVector decodedPayload;
-    if (!decodePacketAssumed(joined, "HR", nullptr, encrypted, decodedPayload, error)) {
+    if (!decodePacketAssumed(packet, "HR", nullptr, encrypted, decodedPayload, error)) {
         return false;
     }
     if (decodedPayload.size() != 6) {
@@ -1149,13 +1166,13 @@ void annotateProcessStatus(ProcessStatus& status) {
 
 bool decodeHxResponse(const std::vector<ByteVector>& chunks, bool encrypted, ProcessStatus& statusOut, String& error) {
     statusOut = ProcessStatus{};
-    ByteVector joined = joinChunks(chunks);
-    if (joined.empty()) {
+    ByteVector packet = selectPacketForCommand(chunks, "HX");
+    if (packet.empty()) {
         error = "no notifications";
         return false;
     }
     ByteVector decodedPayload;
-    if (!decodePacketAssumed(joined, "HX", nullptr, encrypted, decodedPayload, error)) {
+    if (!decodePacketAssumed(packet, "HX", nullptr, encrypted, decodedPayload, error)) {
         return false;
     }
     if (decodedPayload.size() != 8) {
@@ -1413,13 +1430,13 @@ bool decodeHaResponse(const std::vector<ByteVector>& chunks,
                       String& error) {
     rawNameOut = "";
     displayNameOut = "";
-    ByteVector joined = joinChunks(chunks);
-    if (joined.empty()) {
+    ByteVector packet = selectPacketForCommand(chunks, "HA");
+    if (packet.empty()) {
         error = "no notifications";
         return false;
     }
     ByteVector decodedPayload;
-    if (!decodePacketAssumed(joined, "HA", nullptr, encrypted, decodedPayload, error)) {
+    if (!decodePacketAssumed(packet, "HA", nullptr, encrypted, decodedPayload, error)) {
         return false;
     }
     if (decodedPayload.size() != 66) {

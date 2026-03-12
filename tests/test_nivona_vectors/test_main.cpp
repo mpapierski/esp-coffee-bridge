@@ -118,6 +118,21 @@ void test_unknown_hx_message_code_stays_raw_and_unlabeled() {
     TEST_ASSERT_EQUAL_STRING("", status.messageLabel.c_str());
 }
 
+void test_hx_decoder_ignores_leading_ack_frame_in_mixed_batch() {
+    std::vector<ByteVector> chunks{
+        decodeHex("5341BE45"),
+        nivona::buildPacket("HX", decodeHex("000B000000000000"), nullptr, true),
+    };
+
+    nivona::ProcessStatus status;
+    String error;
+    TEST_ASSERT_TRUE_MESSAGE(nivona::decodeHxResponse(chunks, true, status, error), error.c_str());
+    TEST_ASSERT_TRUE(status.ok);
+    TEST_ASSERT_EQUAL_INT16(11, status.process);
+    TEST_ASSERT_EQUAL_INT16(0, status.message);
+    TEST_ASSERT_EQUAL_STRING("preparing drink", status.processLabel.c_str());
+}
+
 void test_family_700_standard_recipe_lookup_and_layout_match_apk_offsets() {
     nivona::ModelInfo modelInfo;
     modelInfo.familyKey = "700";
@@ -209,6 +224,7 @@ int main(int argc, char** argv) {
     RUN_TEST(test_live_hr_response_rejects_incorrect_session_echo_expectation);
     RUN_TEST(test_hx_ready_vector_decodes_to_apk_backed_labels);
     RUN_TEST(test_unknown_hx_message_code_stays_raw_and_unlabeled);
+    RUN_TEST(test_hx_decoder_ignores_leading_ack_frame_in_mixed_batch);
     RUN_TEST(test_family_700_standard_recipe_lookup_and_layout_match_apk_offsets);
     RUN_TEST(test_family_900_standard_recipe_layout_tracks_split_temperatures_and_scaled_fluids);
     RUN_TEST(test_standard_recipe_base_register_rejects_unknown_selector);
