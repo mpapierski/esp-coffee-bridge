@@ -38,6 +38,12 @@ The intended workflow is:
 6. upload it over HTTP OTA
 7. repeat
 
+## Supported Brands And Models
+
+- Currently supported brand: `NIVONA`
+- Current model-family coverage in the bridge protocol module: `600`, `700`, `79x`, `8000`, `900`, `900 Light`, `1030`, `1040`
+- Coverage varies by family and page. See [docs/BRIDGE.md](docs/BRIDGE.md) for implemented bridge support and [docs/NIVONA.md](docs/NIVONA.md) for reverse-engineered packet and register details.
+
 ## Web App Features
 
 - `Dashboard`: lists remembered machines with alias/model/family, online or offline state, last-seen presence, and quick open or forget actions.
@@ -64,12 +70,6 @@ Adjust `upload_port` in `platformio.ini` if needed or pass it on the command lin
 ```bash
 pio run -t upload
 ```
-
-## Supported Brands And Models
-
-- Currently supported brand: `NIVONA`
-- Current model-family coverage in the bridge protocol module: `600`, `700`, `79x`, `8000`, `900`, `900 Light`, `1030`, `1040`
-- Coverage varies by family and page. See [docs/BRIDGE.md](docs/BRIDGE.md) for implemented bridge support and [docs/NIVONA.md](docs/NIVONA.md) for reverse-engineered packet and register details.
 
 ## Network / Access
 
