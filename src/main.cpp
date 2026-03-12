@@ -439,6 +439,9 @@ String loadPrefString(const char* key) {
 }
 
 nivona::DeviceDetails toNivonaDetails(const SavedMachine& machine);
+void appendStandardRecipeDiscovery(JsonObject target,
+                                   const nivona::ModelInfo& modelInfo,
+                                   const nivona::StandardRecipeLayout& layout);
 
 String cacheSafeToken(const String& value) {
     String out;
@@ -550,6 +553,10 @@ bool loadStandardRecipeCache(const SavedMachine& machine,
     const nivona::ModelInfo modelInfo = nivona::detectModelInfo(toNivonaDetails(machine));
     cachedRecipe["maxStrengthBeans"] = modelInfo.strengthLevelCount;
     cachedRecipe["maxProfileCode"] = modelInfo.maxProfileCode;
+    nivona::StandardRecipeLayout layout;
+    if (nivona::resolveStandardRecipeLayout(modelInfo, layout)) {
+        appendStandardRecipeDiscovery(cachedRecipe, modelInfo, layout);
+    }
     return true;
 }
 
@@ -562,7 +569,7 @@ bool persistStandardRecipeCache(const SavedMachine& machine,
         return false;
     }
 
-    DynamicJsonDocument cacheDoc(12288);
+    DynamicJsonDocument cacheDoc(16384);
     cacheDoc["schema"] = STANDARD_RECIPE_CACHE_SCHEMA;
     cacheDoc["serial"] = machine.serial;
     cacheDoc["selector"] = selector;
@@ -1082,6 +1089,120 @@ float recipeAmountMlValue(bool fluidWriteScale10, int32_t rawValue) {
 
 float recipeAmountMlValue(const nivona::MyCoffeeLayout& layout, int32_t rawValue) {
     return recipeAmountMlValue(layout.fluidWriteScale10, rawValue);
+}
+
+String recipeStrengthBeansLabel(int32_t beans) {
+    return beans == 1 ? "1 bean" : String(beans) + " beans";
+}
+
+void appendRecipeOption(JsonArray options, int32_t value, const String& label, const String& name = "") {
+    JsonObject option = options.createNestedObject();
+    option["value"] = value;
+    option["label"] = label;
+    if (!name.isEmpty()) {
+        option["name"] = name;
+    }
+}
+
+void appendRecipeWritableField(JsonArray fields, const char* fieldName) {
+    fields.add(fieldName);
+}
+
+void appendStandardRecipeDiscovery(JsonObject target,
+                                   const nivona::ModelInfo& modelInfo,
+                                   const nivona::StandardRecipeLayout& layout) {
+    JsonArray writableFields = target["writableFields"].is<JsonArray>()
+        ? target["writableFields"].as<JsonArray>()
+        : target.createNestedArray("writableFields");
+    writableFields.clear();
+
+    JsonObject options = target["options"].is<JsonObject>()
+        ? target["options"].as<JsonObject>()
+        : target.createNestedObject("options");
+    options.clear();
+
+    if (layout.strengthOffset != UINT16_MAX) {
+        appendRecipeWritableField(writableFields, "strength");
+        appendRecipeWritableField(writableFields, "strengthBeans");
+
+        JsonArray strengthOptions = options.createNestedArray("strength");
+        JsonArray strengthBeanOptions = options.createNestedArray("strengthBeans");
+        const uint8_t maxStrengthBeans = modelInfo.strengthLevelCount > 0 ? modelInfo.strengthLevelCount : 5;
+        for (uint8_t beans = 1; beans <= maxStrengthBeans; ++beans) {
+            const String label = recipeStrengthBeansLabel(beans);
+            appendRecipeOption(strengthOptions, static_cast<int32_t>(beans - 1), label);
+            appendRecipeOption(strengthBeanOptions, beans, label);
+        }
+    }
+
+    if (layout.profileOffset != UINT16_MAX) {
+        appendRecipeWritableField(writableFields, "profile");
+        appendRecipeWritableField(writableFields, "aroma");
+
+        JsonArray profileOptions = options.createNestedArray("profile");
+        JsonArray aromaOptions = options.createNestedArray("aroma");
+        const uint8_t maxProfileCode = modelInfo.maxProfileCode <= 4 ? modelInfo.maxProfileCode : 4;
+        for (uint8_t code = 0; code <= maxProfileCode; ++code) {
+            const String label = recipeProfileLabel(code);
+            appendRecipeOption(profileOptions, code, label, label);
+            appendRecipeOption(aromaOptions, code, label, label);
+        }
+    }
+
+    auto appendTemperatureDiscovery = [&](const char* fieldName) {
+        appendRecipeWritableField(writableFields, fieldName);
+        JsonArray tempOptions = options.createNestedArray(fieldName);
+        for (int32_t code = 0; code <= 3; ++code) {
+            const String label = recipeTemperatureLabel(code);
+            appendRecipeOption(tempOptions, code, label, label);
+        }
+    };
+
+    if (layout.temperatureOffset != UINT16_MAX) {
+        appendTemperatureDiscovery("temperature");
+    }
+    if (layout.coffeeTemperatureOffset != UINT16_MAX) {
+        appendTemperatureDiscovery("coffeeTemperature");
+    }
+    if (layout.waterTemperatureOffset != UINT16_MAX) {
+        appendTemperatureDiscovery("waterTemperature");
+    }
+    if (layout.milkTemperatureOffset != UINT16_MAX) {
+        appendTemperatureDiscovery("milkTemperature");
+    }
+    if (layout.milkFoamTemperatureOffset != UINT16_MAX) {
+        appendTemperatureDiscovery("milkFoamTemperature");
+    }
+    if (layout.overallTemperatureOffset != UINT16_MAX) {
+        appendTemperatureDiscovery("overallTemperature");
+    }
+
+    if (layout.twoCupsOffset != UINT16_MAX) {
+        appendRecipeWritableField(writableFields, "twoCups");
+        JsonArray twoCupOptions = options.createNestedArray("twoCups");
+        appendRecipeOption(twoCupOptions, 0, "off", "off");
+        appendRecipeOption(twoCupOptions, 1, "on", "on");
+    }
+
+    if (layout.preparationOffset != UINT16_MAX) {
+        appendRecipeWritableField(writableFields, "preparation");
+    }
+    if (layout.coffeeAmountOffset != UINT16_MAX) {
+        appendRecipeWritableField(writableFields, "coffeeAmountMl");
+        appendRecipeWritableField(writableFields, "sizeMl");
+    }
+    if (layout.waterAmountOffset != UINT16_MAX) {
+        appendRecipeWritableField(writableFields, "waterAmountMl");
+        if (layout.coffeeAmountOffset == UINT16_MAX) {
+            appendRecipeWritableField(writableFields, "sizeMl");
+        }
+    }
+    if (layout.milkAmountOffset != UINT16_MAX) {
+        appendRecipeWritableField(writableFields, "milkAmountMl");
+    }
+    if (layout.milkFoamAmountOffset != UINT16_MAX) {
+        appendRecipeWritableField(writableFields, "milkFoamAmountMl");
+    }
 }
 
 void connectWifi() {
@@ -3717,6 +3838,7 @@ bool appendStandardRecipe(JsonObject target, SavedMachine& machine, uint8_t sele
     target["typeName"] = descriptor->title;
     target["maxStrengthBeans"] = modelInfo.strengthLevelCount;
     target["maxProfileCode"] = modelInfo.maxProfileCode;
+    appendStandardRecipeDiscovery(target, modelInfo, layout);
 
     if (!detail) {
         return true;
@@ -4275,10 +4397,10 @@ void handleMachineRecipeDetail(const String& serial, const String& selectorText)
 
     const bool forceRefresh = parseRefreshArg();
     if (!forceRefresh) {
-        DynamicJsonDocument cachedResponse(12288);
+        DynamicJsonDocument cachedResponse(16384);
         String cacheError;
         if (loadStandardRecipeCache(*machine, static_cast<uint8_t>(selectorValue), cachedResponse, cacheError)) {
-            DynamicJsonDocument response(12288);
+            DynamicJsonDocument response(16384);
             response["ok"] = true;
             response["source"] = "cache";
             response["cached"] = true;
@@ -4296,7 +4418,7 @@ void handleMachineRecipeDetail(const String& serial, const String& selectorText)
         return;
     }
 
-    DynamicJsonDocument response(12288);
+    DynamicJsonDocument response(16384);
     response["ok"] = true;
     response["source"] = "live";
     response["cached"] = false;
@@ -4352,7 +4474,7 @@ void handleMachineBrew(const String& serial) {
         return;
     }
 
-    DynamicJsonDocument recipeDoc(8192);
+    DynamicJsonDocument recipeDoc(12288);
     JsonObject recipe = recipeDoc.createNestedObject("recipe");
     if (!appendStandardRecipe(recipe, *machine, static_cast<uint8_t>(selector), true, error)) {
         lastError = error;

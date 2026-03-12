@@ -23,6 +23,9 @@ Current embedded bridge UI is now organized around remembered machines rather th
     - `?refresh=1` forces a live protocol session and rereads the current standard recipe item values from the machine
     - successful live reads refresh the LittleFS cache
     - current bridge UI uses this for the standard-drink "Customize" page
+    - the returned `recipe` object now also carries:
+      - `writableFields`: bridge-accepted override keys for `/brew`
+      - `options`: enumerated option lists for machine-capped discrete fields such as `strength`, `strengthBeans`, `profile`, `aroma`, `temperature`, and `twoCups`
   - `POST /api/machines/{serial}/brew`
     - current implementation first reads the live standard recipe, applies request overrides, uploads a temporary recipe snapshot into the machine scratch namespace, and only then sends the standard selector-based `HE` payload
     - supported override fields:

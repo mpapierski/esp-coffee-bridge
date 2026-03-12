@@ -120,6 +120,7 @@ It supports:
 - `GET /api/machines/{serial}/recipes`
 - `GET /api/machines/{serial}/recipes/{selector}`
   - add `?refresh=1` to force a live reread from the machine; otherwise the bridge may serve the LittleFS-backed cached snapshot
+  - the `recipe` object now includes `writableFields` and enumerated `options` for machine-capped fields like `strength`, `strengthBeans`, `profile`/`aroma`, `temperature`, and `twoCups`
 - `POST /api/machines/{serial}/brew`
 - `GET /api/machines/{serial}/mycoffee`
 - `GET /api/machines/{serial}/mycoffee/{slot}`
