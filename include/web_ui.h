@@ -806,6 +806,50 @@ static const char kPage[] PROGMEM = R"HTML(
     return state.machineCache[serial];
   }
 
+  function primeSavedRecipeDetails(serial, data) {
+    const cache = getMachineCache(serial);
+    cache.recipeDetails = cache.recipeDetails || {};
+    const source = data?.source || "live";
+    const cached = !!data?.cached;
+    (data?.recipes || []).forEach((recipe) => {
+      if (!recipe || recipe.ok === false || recipe.slot === undefined) {
+        return;
+      }
+      cache.recipeDetails[String(recipe.slot)] = { ok: true, source, cached, recipe };
+    });
+  }
+
+  function mergeSavedRecipeDetail(serial, slot, data) {
+    const cache = getMachineCache(serial);
+    cache.recipeDetails = cache.recipeDetails || {};
+    cache.recipeDetails[String(slot)] = data;
+    if (!data?.recipe || !Array.isArray(cache.savedRecipes?.recipes)) {
+      return;
+    }
+    const index = cache.savedRecipes.recipes.findIndex((item) => Number(item?.slot) === Number(slot));
+    if (index >= 0) {
+      cache.savedRecipes.recipes[index] = data.recipe;
+    } else {
+      cache.savedRecipes.recipes.push(data.recipe);
+    }
+  }
+
+  function applyStandardRecipeRefresh(serial, data) {
+    const cache = getMachineCache(serial);
+    cache.standardRecipeDetails = cache.standardRecipeDetails || {};
+    (data?.recipes || []).forEach((recipe) => {
+      if (!recipe || recipe.ok === false || recipe.selector === undefined) {
+        return;
+      }
+      cache.standardRecipeDetails[String(recipe.selector)] = {
+        ok: true,
+        source: data?.source || "live",
+        cached: !!data?.cached,
+        recipe
+      };
+    });
+  }
+
   async function refreshCore() {
     const [status, machinesResponse] = await Promise.all([
       api("/api/status"),
@@ -844,7 +888,9 @@ static const char kPage[] PROGMEM = R"HTML(
     if (!force && cache.savedRecipes) {
       return cache.savedRecipes;
     }
-    cache.savedRecipes = await api(`/api/machines/${encodeURIComponent(serial)}/mycoffee`);
+    const suffix = force ? "?refresh=1" : "";
+    cache.savedRecipes = await api(`/api/machines/${encodeURIComponent(serial)}/mycoffee${suffix}`);
+    primeSavedRecipeDetails(serial, cache.savedRecipes);
     return cache.savedRecipes;
   }
 
@@ -854,7 +900,9 @@ static const char kPage[] PROGMEM = R"HTML(
     if (!force && cache.recipeDetails[slot]) {
       return cache.recipeDetails[slot];
     }
-    cache.recipeDetails[slot] = await api(`/api/machines/${encodeURIComponent(serial)}/mycoffee/${slot}`);
+    const suffix = force ? "?refresh=1" : "";
+    cache.recipeDetails[slot] = await api(`/api/machines/${encodeURIComponent(serial)}/mycoffee/${slot}${suffix}`);
+    mergeSavedRecipeDetail(serial, slot, cache.recipeDetails[slot]);
     return cache.recipeDetails[slot];
   }
 
@@ -907,6 +955,26 @@ static const char kPage[] PROGMEM = R"HTML(
       return `${label} (${code ?? "-"})`;
     }
     return `${code ?? "-"}`;
+  }
+
+  function statusSuggestsHostConfirm(status) {
+    if (!status) {
+      return false;
+    }
+    if (status.hostConfirmSuggested) {
+      return true;
+    }
+    return Number(status.message || 0) === 11 || Number(status.message || 0) === 20;
+  }
+
+  function hostConfirmTitle(status) {
+    if (Number(status?.message || 0) === 20) {
+      return "Confirm flush prompt";
+    }
+    if (Number(status?.message || 0) === 11) {
+      return "Confirm workflow prompt";
+    }
+    return "Confirm machine prompt";
   }
 
   function renderSidebar() {
@@ -1156,6 +1224,7 @@ static const char kPage[] PROGMEM = R"HTML(
   function renderMachineHeader(machine, summary, currentSection) {
     const liveStatus = summary?.status || {};
     const percent = Math.max(0, Math.min(100, Number(liveStatus.progress || 0)));
+    const canConfirm = machine.online && statusSuggestsHostConfirm(liveStatus);
     return `
       <section class="hero-card machine-hero">
         <div class="row" style="justify-content:space-between;align-items:flex-start;">
@@ -1175,6 +1244,12 @@ static const char kPage[] PROGMEM = R"HTML(
           <div class="value-item"><span>Progress</span><span>${percent ? `${percent}%` : "idle"}</span></div>
         </div>
         <div class="progress"><span style="width:${percent}%"></span></div>
+        ${canConfirm ? `
+          <div class="row" style="margin-top:14px;align-items:center;gap:12px;">
+            <button data-action="confirm-machine" data-serial="${escapeHtml(machine.serial)}">${escapeHtml(hostConfirmTitle(liveStatus))}</button>
+            <span class="muted tiny">Sends the app-style <code>HY</code> confirmation for machine-driven prompts.</span>
+          </div>
+        ` : ""}
         <div class="subnav">
           <a class="${currentSection === "recipes" ? "active" : ""}" href="${machineHref(machine.serial, "recipes")}">Coffee recipes</a>
           <a class="${currentSection === "saved" ? "active" : ""}" href="${machineHref(machine.serial, "saved")}">Saved recipes</a>
@@ -1191,7 +1266,10 @@ static const char kPage[] PROGMEM = R"HTML(
     const savedRecipes = (savedData?.recipes || []).filter((item) => item.ok !== false);
     return `
       <section class="panel">
-        <h2 class="section-title">Coffee recipes</h2>
+        <div class="row" style="justify-content:space-between;">
+          <h2 class="section-title" style="margin:0;">Coffee recipes</h2>
+          <button data-action="refresh-standard-recipes" data-serial="${escapeHtml(machine.serial)}">Refresh recipes</button>
+        </div>
         <div class="recipes-grid">
           ${recipes.map((recipe) => `
             <article class="recipe-card">
@@ -1211,7 +1289,10 @@ static const char kPage[] PROGMEM = R"HTML(
       <section class="panel">
         <div class="row" style="justify-content:space-between;">
           <h2 class="section-title" style="margin:0;">Saved recipes</h2>
-          <a class="button-link secondary" href="${machineHref(machine.serial, "saved")}">Open all saved recipes</a>
+          <div class="row">
+            <button data-action="refresh-saved-recipes" data-serial="${escapeHtml(machine.serial)}">Refresh saved recipes</button>
+            <a class="button-link secondary" href="${machineHref(machine.serial, "saved")}">Open all saved recipes</a>
+          </div>
         </div>
         ${savedRecipes.length ? `
           <div class="recipe-list">
@@ -1236,13 +1317,16 @@ static const char kPage[] PROGMEM = R"HTML(
   }
 
   function renderSavedRecipesSection(machine, data) {
-    const items = data?.recipes || [];
+    const items = (data?.recipes || []).filter((item) => item.ok !== false);
     if (!items.length) {
       return `<section class="panel"><div class="empty">No saved custom recipes were returned by the machine.</div></section>`;
     }
     return `
       <section class="panel">
-        <h2 class="section-title">Saved recipes</h2>
+        <div class="row" style="justify-content:space-between;">
+          <h2 class="section-title" style="margin:0;">Saved recipes</h2>
+          <button data-action="refresh-saved-recipes" data-serial="${escapeHtml(machine.serial)}">Refresh saved recipes</button>
+        </div>
         <div class="recipe-list">
           ${items.map((recipe) => `
             <article class="recipe-card">
@@ -1351,6 +1435,7 @@ static const char kPage[] PROGMEM = R"HTML(
     if (!recipe) {
       return `<section class="panel"><div class="empty">Recipe slot ${escapeHtml(String(slot))} could not be loaded.</div></section>`;
     }
+    const sourceLabel = data?.source === "cache" ? "flash cache" : "live machine";
 
     return `
       <section class="panel">
@@ -1359,12 +1444,16 @@ static const char kPage[] PROGMEM = R"HTML(
             <h2 class="section-title" style="margin:0;">${escapeHtml(recipe.name || `Recipe slot ${slot}`)}</h2>
             <div class="muted">Saved custom recipe details for slot ${escapeHtml(String(slot))}</div>
           </div>
-          <a class="button-link secondary" href="${machineHref(machine.serial, "saved")}">Back to saved recipes</a>
+          <div class="row">
+            <button data-action="refresh-saved-recipe" data-serial="${escapeHtml(machine.serial)}" data-slot="${escapeHtml(String(slot))}">Refresh from machine</button>
+            <a class="button-link secondary" href="${machineHref(machine.serial, "saved")}">Back to saved recipes</a>
+          </div>
         </div>
         <div class="grid two" style="margin-top:16px;">
           <div class="panel" style="margin:0;padding:18px;">
             <div class="value-list">
               <div class="value-item"><span>Name</span><span>${escapeHtml(recipe.name || "")}</span></div>
+              <div class="value-item"><span>Source</span><span>${escapeHtml(sourceLabel)}</span></div>
               <div class="value-item"><span>Icon</span><span>${escapeHtml(recipe.icon ?? "-")}</span></div>
               <div class="value-item"><span>Strength</span><span>${escapeHtml(recipe.strengthBeans ? `${recipe.strengthBeans} beans` : "-")}</span></div>
               <div class="value-item"><span>Temperature</span><span>${escapeHtml(recipe.temperatureLabel || recipe.coffeeTemperatureLabel || "-")}</span></div>
@@ -1572,6 +1661,7 @@ static const char kPage[] PROGMEM = R"HTML(
     const logs = state.diagnostics.logs ? escapeHtml(pretty(state.diagnostics.logs)) : "No logs loaded.";
     const defaults = diagnosticsDefault(machine);
     const protocolSession = summary?.protocolSession || {};
+    const liveStatus = summary?.status || {};
     const sessionAge = protocolSession.setAtMs ? formatAgo(protocolSession.setAtMs) : "";
     return `
       <section class="panel">
@@ -1601,6 +1691,22 @@ static const char kPage[] PROGMEM = R"HTML(
               <button type="submit">Set session</button>
               <button type="button" class="secondary" data-action="diag-session-clear" data-serial="${escapeHtml(machine.serial)}" data-address="${escapeHtml(machine.address)}" data-address-type="${escapeHtml(String(machine.addressType ?? 0))}">Clear</button>
             </div>
+          </form>
+        </article>
+
+        <article class="diag-block">
+          <h3>Workflow prompt confirmation</h3>
+          <p class="muted">Use when the machine is waiting for host confirmation during a workflow, such as flush required or move-cup prompts.</p>
+          <div class="value-list" style="margin-bottom:16px;">
+            <div class="value-item"><span>Suggested now</span><span>${statusSuggestsHostConfirm(liveStatus) ? "yes" : "no"}</span></div>
+            <div class="value-item"><span>Current message</span><span>${escapeHtml(formatStatusCode(liveStatus.messageLabel, liveStatus.message))}</span></div>
+          </div>
+          <form data-action="diag-confirm-prompt">
+            <input type="hidden" name="serial" value="${escapeHtml(machine.serial)}">
+            <div class="row">
+              <button type="submit">${escapeHtml(hostConfirmTitle(liveStatus))}</button>
+            </div>
+            <div class="muted tiny">Recovered app mapping: <code>HY</code> with 4 zero bytes.</div>
           </form>
         </article>
 
@@ -1994,10 +2100,41 @@ static const char kPage[] PROGMEM = R"HTML(
         await renderRoute();
       }
 
+      if (action === "confirm-machine") {
+        const serial = button.dataset.serial;
+        const response = await runWithFlash("Confirming machine prompt…", () => api(`/api/machines/${encodeURIComponent(serial)}/confirm`, {
+          method: "POST",
+          json: {}
+        }), "Machine prompt confirmed.");
+        state.diagnostics.output = response;
+        getMachineCache(serial).summary = response;
+        await renderRoute();
+      }
+
+      if (action === "refresh-standard-recipes") {
+        const serial = button.dataset.serial;
+        const response = await runWithFlash("Refreshing standard recipe cache…", () => api(`/api/machines/${encodeURIComponent(serial)}/recipes/refresh`, { method: "POST", json: {} }), "Recipe cache refreshed.");
+        applyStandardRecipeRefresh(serial, response);
+        await renderRoute();
+      }
+
       if (action === "refresh-standard-recipe") {
         const serial = button.dataset.serial;
         const selector = String(button.dataset.selector || "");
         await runWithFlash(`Refreshing recipe ${selector}…`, () => loadStandardRecipeDetail(serial, selector, true), "Recipe values refreshed.");
+        await renderRoute();
+      }
+
+      if (action === "refresh-saved-recipes") {
+        const serial = button.dataset.serial;
+        await runWithFlash("Refreshing saved recipes…", () => loadSavedRecipes(serial, true), "Saved recipes refreshed.");
+        await renderRoute();
+      }
+
+      if (action === "refresh-saved-recipe") {
+        const serial = button.dataset.serial;
+        const slot = String(button.dataset.slot || "");
+        await runWithFlash(`Refreshing saved recipe ${slot}…`, () => loadRecipeDetail(serial, slot, true), "Saved recipe refreshed.");
         await renderRoute();
       }
 
@@ -2234,6 +2371,17 @@ static const char kPage[] PROGMEM = R"HTML(
           invalidateMachine(serial);
         }
         await refreshCore();
+        await renderRoute();
+      }
+
+      if (action === "diag-confirm-prompt") {
+        const serial = String(form.elements.serial.value || "").trim();
+        const response = await runWithFlash("Confirming machine prompt…", () => api(`/api/machines/${encodeURIComponent(serial)}/confirm`, {
+          method: "POST",
+          json: {}
+        }), "Machine prompt confirmed.");
+        state.diagnostics.output = response;
+        getMachineCache(serial).summary = response;
         await renderRoute();
       }
 

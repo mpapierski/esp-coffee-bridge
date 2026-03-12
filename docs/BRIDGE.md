@@ -17,6 +17,7 @@ Current embedded bridge UI is now organized around remembered machines rather th
   - `DELETE /api/machines/{serial}`
 - machine pages
   - `GET /api/machines/{serial}/summary`
+    - the `status` object includes `hostConfirmSuggested` for APK-backed prompt states that can be acknowledged with `HY`
   - `GET /api/machines/{serial}/recipes`
   - `GET /api/machines/{serial}/recipes/{selector}`
     - serves the cached standard recipe snapshot from LittleFS by default when available
@@ -26,6 +27,8 @@ Current embedded bridge UI is now organized around remembered machines rather th
     - the returned `recipe` object now also carries:
       - `writableFields`: bridge-accepted override keys for `/brew`
       - `options`: enumerated option lists for machine-capped discrete fields such as `strength`, `strengthBeans`, `profile`, `aroma`, `temperature`, and `twoCups`
+  - `POST /api/machines/{serial}/recipes/refresh`
+    - opens one live session, rereads all supported standard drink definitions, and rewrites the per-machine standard-recipe LittleFS cache in one pass
   - `POST /api/machines/{serial}/brew`
     - current implementation first reads the live standard recipe, applies request overrides, uploads a temporary recipe snapshot into the machine scratch namespace, and only then sends the standard selector-based `HE` payload
     - supported override fields:
@@ -49,12 +52,22 @@ Current embedded bridge UI is now organized around remembered machines rather th
     - recipe editors and writes are capability-gated by detected model
       - example: `NICR 756` is capped to `3` beans and profile codes `dynamic`, `constant`, `intense`, `individual`
     - those overrides are temporary for the started brew; they do not overwrite persistent `MyCoffee` slots
+  - `POST /api/machines/{serial}/confirm`
+    - sends the APK-backed `HY` host-confirmation command with the current machine-scoped live session
+    - intended for machine-driven prompts during a workflow, such as flush-required or move-cup prompts
+    - the web UI surfaces this as a contextual `Confirm ...` action when `summary.status.hostConfirmSuggested` is true
   - standard recipe cache
     - per-machine, per-selector JSON snapshots are stored in LittleFS
     - cache files are cleared when a saved machine is forgotten or when the saved-machine store is reset
   - `GET /api/machines/{serial}/mycoffee`
+    - serves the cached saved-recipe snapshot from LittleFS by default when available
+    - `?refresh=1` forces a live reread of all saved recipe slots and refreshes the cache
+    - the bridge now stores full saved-recipe details in this cache, not just slot names
   - `GET /api/machines/{serial}/mycoffee/{slot}`
+    - serves the cached slot from the saved-recipe snapshot by default when available
+    - `?refresh=1` forces a live reread of that slot and updates the saved-recipe cache entry
   - `POST /api/machines/{serial}/mycoffee/{slot}`
+    - after a successful write, the bridge updates the cached saved-recipe snapshot for that slot
   - `GET /api/machines/{serial}/stats`
   - `GET /api/machines/{serial}/settings`
   - `POST /api/machines/{serial}/settings`
@@ -94,6 +107,7 @@ Manual saved-machine add:
     - `GET /api/machines/{serial}/summary` now returns `ok: true` even if the bridge cannot connect live
     - in that case the response uses saved metadata and reports status summary `offline` or `unavailable` with the connection error text
     - on live `HX` reads the response now includes both numeric codes and APK-backed labels for `process` and `message`
+    - when the app-backed prompt paths are detected, the response also marks `hostConfirmSuggested = true`
     - example on the `756` / family `700` path: `process=8`, `processLabel=ready`, `message=0`, `messageLabel=none`
     - unknown raw message codes remain unlabeled; for example, `message=42` has been observed live after cancel, but the APK does not map it beyond the generic fallback error text
 

@@ -1176,6 +1176,15 @@ APK-backed interpretation from the Android app:
 Request payload:
 
 - 4 zero bytes
+- app service method: `ConfirmUserInputByHost()`
+- confirmed APK usage:
+  - flush-required dialog path calls `ConfirmUserInputByHost()`
+  - brew workflow “move cup to frother and open valve” prompt also calls `ConfirmUserInputByHost()`
+- bridge support:
+  - `POST /api/machines/{serial}/confirm` now sends `HY` with the current machine-scoped session after ensuring a live protocol session
+- current safe interpretation:
+  - this is not a dedicated “start maintenance” command
+  - it is a generic host confirmation step for machine-driven workflows that are already in progress
 
 ### `HZ` cancel process
 

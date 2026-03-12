@@ -169,6 +169,7 @@ struct ProcessStatus {
     int16_t subProcess{0};
     int16_t message{0};
     int16_t progress{0};
+    bool hostConfirmSuggested{false};
     String summary;
     String processLabel;
     String subProcessLabel;
@@ -196,6 +197,7 @@ ByteVector buildRegisterPayload(uint16_t registerId);
 ByteVector buildWriteRegisterPayload(uint16_t registerId, int32_t value);
 ByteVector buildHeMakeCoffeePayload(const ModelInfo& modelInfo, uint8_t recipeSelector);
 ByteVector buildHeCommandPayload(uint16_t commandId);
+ByteVector buildHyConfirmPayload();
 ByteVector buildHdPayload(uint16_t registerId);
 bool buildHuRequest(ByteVector& seedOut, ByteVector& packetOut);
 bool decodePacketAssumed(const ByteVector& packet,

@@ -33,6 +33,8 @@ constexpr size_t LOG_CAPACITY   = 128;
 constexpr uint16_t TEMP_RECIPE_TYPE_REGISTER = 9001;
 constexpr char STANDARD_RECIPE_CACHE_PREFIX[] = "/stdrec-";
 constexpr uint32_t STANDARD_RECIPE_CACHE_SCHEMA = 1;
+constexpr char SAVED_RECIPE_CACHE_PREFIX[] = "/mycoffee-";
+constexpr uint32_t SAVED_RECIPE_CACHE_SCHEMA = 1;
 
 void rxNotifyCallback(NimBLERemoteCharacteristic* characteristic, uint8_t* data, size_t length, bool isNotify);
 
@@ -465,6 +467,10 @@ String standardRecipeCachePath(const String& serial, uint8_t selector) {
     return standardRecipeCachePrefix(serial) + selector + ".json";
 }
 
+String savedRecipeCachePath(const String& serial) {
+    return String(SAVED_RECIPE_CACHE_PREFIX) + cacheSafeToken(serial) + ".json";
+}
+
 bool parseRefreshArg() {
     if (!server.hasArg("refresh")) {
         return false;
@@ -513,6 +519,20 @@ void clearStandardRecipeCachesForMachine(const String& serial) {
 
 void clearAllStandardRecipeCaches() {
     clearStandardRecipeCachesByPrefix(String(STANDARD_RECIPE_CACHE_PREFIX));
+}
+
+void clearSavedRecipeCachesForMachine(const String& serial) {
+    if (!littleFsReady || serial.isEmpty()) {
+        return;
+    }
+    LittleFS.remove(savedRecipeCachePath(serial));
+}
+
+void clearAllSavedRecipeCaches() {
+    if (!littleFsReady) {
+        return;
+    }
+    clearStandardRecipeCachesByPrefix(String(SAVED_RECIPE_CACHE_PREFIX));
 }
 
 bool loadStandardRecipeCache(const SavedMachine& machine,
@@ -589,6 +609,114 @@ bool persistStandardRecipeCache(const SavedMachine& machine,
     }
     cacheFile.close();
     return true;
+}
+
+bool loadSavedRecipeCache(const SavedMachine& machine,
+                          DynamicJsonDocument& cacheDoc,
+                          String& error) {
+    if (!littleFsReady) {
+        error = "saved recipe cache is unavailable";
+        return false;
+    }
+
+    File cacheFile = LittleFS.open(savedRecipeCachePath(machine.serial), "r");
+    if (!cacheFile) {
+        error = "saved recipe cache miss";
+        return false;
+    }
+
+    DeserializationError parseError = deserializeJson(cacheDoc, cacheFile);
+    cacheFile.close();
+    if (parseError) {
+        LittleFS.remove(savedRecipeCachePath(machine.serial));
+        error = String("failed to parse saved recipe cache: ") + parseError.c_str();
+        return false;
+    }
+
+    if ((cacheDoc["schema"] | 0U) != SAVED_RECIPE_CACHE_SCHEMA) {
+        LittleFS.remove(savedRecipeCachePath(machine.serial));
+        error = "saved recipe cache schema mismatch";
+        return false;
+    }
+    const String cachedSerial = cacheDoc["serial"] | "";
+    JsonArray cachedRecipes = cacheDoc["recipes"].as<JsonArray>();
+    if (!cachedSerial.equalsIgnoreCase(machine.serial) || cachedRecipes.isNull()) {
+        LittleFS.remove(savedRecipeCachePath(machine.serial));
+        error = "saved recipe cache contents mismatch";
+        return false;
+    }
+    return true;
+}
+
+bool writeSavedRecipeCacheDoc(const SavedMachine& machine,
+                              DynamicJsonDocument& cacheDoc,
+                              String& error) {
+    if (!littleFsReady) {
+        error = "saved recipe cache is unavailable";
+        return false;
+    }
+
+    File cacheFile = LittleFS.open(savedRecipeCachePath(machine.serial), "w");
+    if (!cacheFile) {
+        error = "failed to open saved recipe cache for writing";
+        return false;
+    }
+    if (serializeJson(cacheDoc, cacheFile) == 0) {
+        cacheFile.close();
+        error = "failed to write saved recipe cache";
+        return false;
+    }
+    cacheFile.close();
+    return true;
+}
+
+bool persistSavedRecipeCache(const SavedMachine& machine,
+                             JsonArrayConst recipes,
+                             String& error) {
+    if (!littleFsReady) {
+        error = "saved recipe cache is unavailable";
+        return false;
+    }
+
+    DynamicJsonDocument cacheDoc(65536);
+    cacheDoc["schema"] = SAVED_RECIPE_CACHE_SCHEMA;
+    cacheDoc["serial"] = machine.serial;
+    cacheDoc["familyKey"] = machine.familyKey;
+    JsonArray storedRecipes = cacheDoc.createNestedArray("recipes");
+    storedRecipes.set(recipes);
+    return writeSavedRecipeCacheDoc(machine, cacheDoc, error);
+}
+
+bool upsertSavedRecipeCacheEntry(const SavedMachine& machine,
+                                 JsonObjectConst recipe,
+                                 String& error) {
+    const int slotNumber = recipe["slot"] | 0;
+    if (slotNumber <= 0) {
+        error = "saved recipe cache entry is missing a slot number";
+        return false;
+    }
+
+    DynamicJsonDocument cacheDoc(65536);
+    String loadError;
+    if (!loadSavedRecipeCache(machine, cacheDoc, loadError)) {
+        cacheDoc.clear();
+        cacheDoc["schema"] = SAVED_RECIPE_CACHE_SCHEMA;
+        cacheDoc["serial"] = machine.serial;
+        cacheDoc["familyKey"] = machine.familyKey;
+        cacheDoc.createNestedArray("recipes");
+    }
+
+    JsonArray recipes = cacheDoc["recipes"].as<JsonArray>();
+    for (size_t index = 0; index < recipes.size(); ++index) {
+        if ((recipes[index]["slot"] | 0) == slotNumber) {
+            recipes.remove(index);
+            break;
+        }
+    }
+
+    JsonObject storedRecipe = recipes.createNestedObject();
+    storedRecipe.set(recipe);
+    return writeSavedRecipeCacheDoc(machine, cacheDoc, error);
 }
 
 nivona::DeviceDetails toNivonaDetails(const DeviceDetails& details) {
@@ -949,6 +1077,7 @@ void appendProcessStatusJson(JsonObject target, const nivona::ProcessStatus& sta
     target["message"] = status.message;
     target["messageLabel"] = status.messageLabel;
     target["progress"] = status.progress;
+    target["hostConfirmSuggested"] = status.hostConfirmSuggested;
     target["error"] = error;
 }
 
@@ -3247,11 +3376,13 @@ void updateSavedMachineFromCachedDetails(SavedMachine& machine) {
     persistSavedMachines();
 }
 
-bool beginMachineProtocolSession(SavedMachine& machine, String& error) {
+bool beginMachineProtocolSession(SavedMachine& machine, String& error, bool clearSession = true) {
     if (!selectSavedMachine(machine, error)) {
         return false;
     }
-    clearStoredSessionKey(machine.serial, machine.address);
+    if (clearSession) {
+        clearStoredSessionKey(machine.serial, machine.address);
+    }
     if (!pairWithDevice(error, true, DEFAULT_RECONNECT_DELAY_MS)) {
         return false;
     }
@@ -4297,6 +4428,7 @@ void handleMachinesReset() {
     savedMachines.clear();
     clearStoredSessionKey();
     clearAllStandardRecipeCaches();
+    clearAllSavedRecipeCaches();
     machinePreferences.remove(PREFS_MACHINE_STORE);
     machinePreferences.putUInt(PREFS_MACHINE_SCHEMA, 1);
     DynamicJsonDocument doc(1024);
@@ -4379,6 +4511,47 @@ void handleMachineRecipes(const String& serial) {
         }
         item["detailsSupported"] = true;
     }
+    sendJson(response);
+}
+
+void handleMachineRecipesRefresh(const String& serial) {
+    SavedMachine* machine = findSavedMachineBySerial(serial);
+    if (machine == nullptr) {
+        sendError(404, "saved machine not found");
+        return;
+    }
+
+    const nivona::ModelInfo modelInfo = nivona::detectModelInfo(toNivonaDetails(*machine));
+    std::vector<const nivona::StandardRecipeDescriptor*> recipes;
+    nivona::selectStandardRecipes(modelInfo, recipes);
+
+    String error;
+    if (!beginMachineProtocolSession(*machine, error)) {
+        lastError = error;
+        sendError(500, error);
+        return;
+    }
+
+    DynamicJsonDocument response(65536);
+    response["ok"] = true;
+    response["source"] = "live";
+    response["cached"] = false;
+    JsonArray items = response.createNestedArray("recipes");
+    for (const auto* recipeDescriptor : recipes) {
+        JsonObject item = items.createNestedObject();
+        if (!appendStandardRecipe(item, *machine, recipeDescriptor->selector, true, error)) {
+            lastError = error;
+            sendError(500, error);
+            return;
+        }
+
+        const JsonObjectConst recipeView = item;
+        String cacheWriteError;
+        if (!persistStandardRecipeCache(*machine, recipeDescriptor->selector, recipeView, cacheWriteError)) {
+            addLog("cache", String("Standard recipe cache write skipped: ") + cacheWriteError);
+        }
+    }
+    response["refreshedCount"] = items.size();
     sendJson(response);
 }
 
@@ -4519,6 +4692,49 @@ void handleMachineBrew(const String& serial) {
     sendJson(response);
 }
 
+void handleMachineConfirm(const String& serial) {
+    SavedMachine* machine = findSavedMachineBySerial(serial);
+    if (machine == nullptr) {
+        sendError(404, "saved machine not found");
+        return;
+    }
+
+    String error;
+    if (!beginMachineProtocolSession(*machine, error, false)) {
+        lastError = error;
+        sendError(500, error);
+        return;
+    }
+    if (!ensureMachineHuSession(2500, error)) {
+        lastError = error;
+        sendError(500, error);
+        return;
+    }
+
+    const ByteVector* sessionKey = resolveStoredSessionIfAvailable();
+    if (!sendMachineCommand("HY", nivona::buildHyConfirmPayload(), sessionKey, true, error)) {
+        lastError = error;
+        sendError(500, error);
+        return;
+    }
+
+    nivona::ProcessStatus processStatus;
+    String processError;
+    readMachineProcessStatus(processStatus, processError);
+
+    DynamicJsonDocument response(4096);
+    response["ok"] = true;
+    response["command"] = "HY";
+    JsonObject machineJson = response.createNestedObject("machine");
+    appendSavedMachineJson(machineJson, *machine);
+    JsonObject status = response.createNestedObject("status");
+    appendProcessStatusJson(status, processStatus, processError);
+    JsonObject protocolSession = response.createNestedObject("protocolSession");
+    appendProtocolSessionJson(protocolSession, resolveStoredSessionEntry(machine->serial, machine->address));
+    appendStatus(response);
+    sendJson(response);
+}
+
 void handleMachineMyCoffeeList(const String& serial) {
     SavedMachine* machine = findSavedMachineBySerial(serial);
     if (machine == nullptr) {
@@ -4533,6 +4749,22 @@ void handleMachineMyCoffeeList(const String& serial) {
         return;
     }
 
+    const bool forceRefresh = parseRefreshArg();
+    if (!forceRefresh) {
+        DynamicJsonDocument cachedResponse(65536);
+        String cacheError;
+        if (loadSavedRecipeCache(*machine, cachedResponse, cacheError)) {
+            DynamicJsonDocument response(65536);
+            response["ok"] = true;
+            response["source"] = "cache";
+            response["cached"] = true;
+            JsonArray items = response.createNestedArray("recipes");
+            items.set(cachedResponse["recipes"].as<JsonArray>());
+            sendJson(response);
+            return;
+        }
+    }
+
     String error;
     if (!beginMachineProtocolSession(*machine, error)) {
         lastError = error;
@@ -4540,18 +4772,25 @@ void handleMachineMyCoffeeList(const String& serial) {
         return;
     }
 
-    DynamicJsonDocument response(24576);
+    DynamicJsonDocument response(65536);
     response["ok"] = true;
+    response["source"] = "live";
+    response["cached"] = false;
     JsonArray items = response.createNestedArray("recipes");
     for (uint8_t slot = 0; slot < layout.slotCount; ++slot) {
         JsonObject item = items.createNestedObject();
-        if (!appendMyCoffeeSlot(item, *machine, slot, false, error)) {
+        if (!appendMyCoffeeSlot(item, *machine, slot, true, error)) {
             item["ok"] = false;
             item["error"] = error;
             error = "";
             continue;
         }
         item["ok"] = true;
+    }
+
+    String cacheWriteError;
+    if (!persistSavedRecipeCache(*machine, items, cacheWriteError)) {
+        addLog("cache", String("Saved recipe cache write skipped: ") + cacheWriteError);
     }
     sendJson(response);
 }
@@ -4578,6 +4817,30 @@ void handleMachineMyCoffeeDetail(const String& serial, const String& slotText, b
     if (slotIndex >= layout.slotCount) {
         sendError(400, "slot is out of range");
         return;
+    }
+
+    const bool forceRefresh = !isUpdate && parseRefreshArg();
+    if (!isUpdate && !forceRefresh) {
+        DynamicJsonDocument cachedResponse(65536);
+        String cacheError;
+        if (loadSavedRecipeCache(*machine, cachedResponse, cacheError)) {
+            JsonArray cachedRecipes = cachedResponse["recipes"].as<JsonArray>();
+            for (JsonVariant recipeVariant : cachedRecipes) {
+                JsonObject cachedRecipe = recipeVariant.as<JsonObject>();
+                if ((cachedRecipe["slot"] | 0) != slotNumber || !(cachedRecipe["ok"] | true)) {
+                    continue;
+                }
+
+                DynamicJsonDocument response(16384);
+                response["ok"] = true;
+                response["source"] = "cache";
+                response["cached"] = true;
+                JsonObject item = response.createNestedObject("recipe");
+                item.set(cachedRecipe);
+                sendJson(response);
+                return;
+            }
+        }
     }
 
     String error;
@@ -4664,13 +4927,21 @@ void handleMachineMyCoffeeDetail(const String& serial, const String& slotText, b
         }
     }
 
-    DynamicJsonDocument response(12288);
+    DynamicJsonDocument response(16384);
     response["ok"] = true;
+    response["source"] = "live";
+    response["cached"] = false;
     JsonObject item = response.createNestedObject("recipe");
     if (!appendMyCoffeeSlot(item, *machine, slotIndex, true, error)) {
         lastError = error;
         sendError(500, error);
         return;
+    }
+
+    const JsonObjectConst recipeView = item;
+    String cacheWriteError;
+    if (!upsertSavedRecipeCacheEntry(*machine, recipeView, cacheWriteError)) {
+        addLog("cache", String("Saved recipe cache write skipped: ") + cacheWriteError);
     }
     sendJson(response);
 }
@@ -4850,6 +5121,7 @@ void handleMachineDelete(const String& serial) {
         if (it->serial.equalsIgnoreCase(serial)) {
             clearStoredSessionKey(it->serial, it->address);
             clearStandardRecipeCachesForMachine(it->serial);
+            clearSavedRecipeCachesForMachine(it->serial);
             savedMachines.erase(it);
             persistSavedMachines();
             DynamicJsonDocument response(512);
@@ -4877,6 +5149,10 @@ bool dispatchMachineApiRoute() {
         handleMachineSummary(serial);
         return true;
     }
+    if (section == "recipes" && server.method() == HTTP_POST && tail == "refresh") {
+        handleMachineRecipesRefresh(serial);
+        return true;
+    }
     if (section == "recipes" && server.method() == HTTP_GET) {
         if (tail.isEmpty()) {
             handleMachineRecipes(serial);
@@ -4887,6 +5163,10 @@ bool dispatchMachineApiRoute() {
     }
     if (section == "brew" && server.method() == HTTP_POST) {
         handleMachineBrew(serial);
+        return true;
+    }
+    if (section == "confirm" && server.method() == HTTP_POST) {
+        handleMachineConfirm(serial);
         return true;
     }
     if (section == "mycoffee" && server.method() == HTTP_GET && tail.isEmpty()) {

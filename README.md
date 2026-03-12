@@ -48,10 +48,10 @@ The intended workflow is:
 
 - `Dashboard`: lists remembered machines with alias/model/family, online or offline state, last-seen presence, and quick open or forget actions.
 - `Add machine flow`: scans nearby BLE devices, highlights likely supported coffee machines, probes a device before saving it, and also supports manual offline add by BLE address, serial number, and optional model.
-- `Live machine summary`: shows current status summary, process label/code, operator message label/code, and progress for the selected machine.
+- `Live machine summary`: shows current status summary, process label/code, operator message label/code, progress, and whether the APK-backed `HY` host-confirm path is currently suggested.
 - `Standard drinks`: lists the built-in drink selectors, supports quick brew, and opens a per-drink customization view.
-- `Temporary brew customization`: refreshes current standard drink values from the machine and sends temporary overrides such as strength, profile/aroma, temperature, cup mode, and amount fields without overwriting the machine's saved recipe.
-- `MyCoffee / saved recipes`: lists saved custom recipe slots, shows recipe details, and edits persisted custom recipes where the machine family supports them.
+- `Temporary brew customization`: refreshes current standard drink values from the machine, can warm the full standard-drink cache from the machine, and sends temporary overrides such as strength, profile/aroma, temperature, cup mode, and amount fields without overwriting the machine's saved recipe.
+- `MyCoffee / saved recipes`: stores saved custom recipe snapshots in LittleFS too, exposes explicit refresh buttons, shows recipe details, and edits persisted custom recipes where the machine family supports them.
 - `Statistics`: reads beverage counters, maintenance counters, and serial or firmware details.
 - `Settings`: reads supported machine settings, writes updated values, and exposes factory reset actions for settings and recipe defaults.
 - `Diagnostics`: manages cached session keys, raw characteristic reads and writes, encrypted frame send, app-style probes, settings probe, stats probe, bridge logs, and the last raw diagnostics response.
@@ -166,13 +166,20 @@ Temporary overrides issued through `/brew` only apply to the started drink. They
 - `POST /api/machines/reset`
 - `DELETE /api/machines/{serial}`
 - `GET /api/machines/{serial}/summary`
+  - `status.hostConfirmSuggested` flags app-backed workflow prompts that can be acknowledged with `POST /api/machines/{serial}/confirm`
 - `GET /api/machines/{serial}/recipes`
 - `GET /api/machines/{serial}/recipes/{selector}`
   - add `?refresh=1` to force a live reread from the machine; otherwise the bridge may serve the LittleFS-backed cached snapshot
   - the `recipe` object now includes `writableFields` and enumerated `options` for machine-capped fields like `strength`, `strengthBeans`, `profile`/`aroma`, `temperature`, and `twoCups`
+- `POST /api/machines/{serial}/recipes/refresh`
+  - warms or refreshes the cached detail snapshots for all standard drinks on that machine in one live session
 - `POST /api/machines/{serial}/brew`
+- `POST /api/machines/{serial}/confirm`
+  - sends the APK-backed `HY` host-confirmation command for the selected machine
 - `GET /api/machines/{serial}/mycoffee`
+  - add `?refresh=1` to force a live reread of all saved recipe slots; otherwise the bridge may serve the LittleFS-backed saved-recipe snapshot
 - `GET /api/machines/{serial}/mycoffee/{slot}`
+  - add `?refresh=1` to force a live reread of one saved recipe slot; otherwise the bridge may serve the cached slot from the saved-recipe snapshot
 - `POST /api/machines/{serial}/mycoffee/{slot}`
 - `GET /api/machines/{serial}/stats`
 - `GET /api/machines/{serial}/settings`

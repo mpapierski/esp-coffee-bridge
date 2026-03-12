@@ -692,6 +692,10 @@ ByteVector buildHeCommandPayload(uint16_t commandId) {
     return payload;
 }
 
+ByteVector buildHyConfirmPayload() {
+    return ByteVector(4, 0x00);
+}
+
 ByteVector buildHdPayload(uint16_t registerId) {
     return buildRegisterPayload(registerId);
 }
@@ -1125,6 +1129,7 @@ void annotateProcessStatus(ProcessStatus& status) {
     const char* processLabel = describeProcessCode(status.process);
     const char* subProcessLabel = describeSubProcessCode(status.process, status.subProcess);
     const char* messageLabel = describeMessageCode(status.message);
+    status.hostConfirmSuggested = status.message == 11 || status.message == 20;
     status.processLabel = processLabel != nullptr ? processLabel : "";
     status.subProcessLabel = subProcessLabel != nullptr ? subProcessLabel : "";
     status.messageLabel = messageLabel != nullptr ? messageLabel : "";

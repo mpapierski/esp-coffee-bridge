@@ -32,6 +32,7 @@ void test_build_packet_matches_documented_request_vectors() {
     assertHexEquals("53487000004745", nivona::buildPacket("Hp", decodeHex("0000"), nullptr, false));
     assertHexEquals("534855E580D0367981BC45", nivona::buildPacket("HU", decodeHex("FA48D17B7E6E"), nullptr, true));
     assertHexEquals("534855FA48D17B7E6EE845", nivona::buildPacket("HU", decodeHex("FA48D17B7E6E"), nullptr, false));
+    assertHexEquals("00000000", nivona::buildHyConfirmPayload());
 
     const ByteVector session = decodeHex("1234");
     assertHexEquals("5348560DFC1A45", nivona::buildPacket("HV", {}, &session, true));
@@ -116,6 +117,37 @@ void test_unknown_hx_message_code_stays_raw_and_unlabeled() {
     TEST_ASSERT_EQUAL_INT16(42, status.message);
     TEST_ASSERT_EQUAL_STRING("preparing drink", status.processLabel.c_str());
     TEST_ASSERT_EQUAL_STRING("", status.messageLabel.c_str());
+    TEST_ASSERT_FALSE(status.hostConfirmSuggested);
+}
+
+void test_hx_confirmable_messages_are_flagged_for_host_confirm() {
+    {
+        std::vector<ByteVector> chunks{
+            nivona::buildPacket("HX", decodeHex("000B0000000B0000"), nullptr, true),
+        };
+
+        nivona::ProcessStatus status;
+        String error;
+        TEST_ASSERT_TRUE_MESSAGE(nivona::decodeHxResponse(chunks, true, status, error), error.c_str());
+        TEST_ASSERT_TRUE(status.ok);
+        TEST_ASSERT_EQUAL_INT16(11, status.message);
+        TEST_ASSERT_EQUAL_STRING("move cup to frother and open valve", status.messageLabel.c_str());
+        TEST_ASSERT_TRUE(status.hostConfirmSuggested);
+    }
+
+    {
+        std::vector<ByteVector> chunks{
+            nivona::buildPacket("HX", decodeHex("0000000000140000"), nullptr, true),
+        };
+
+        nivona::ProcessStatus status;
+        String error;
+        TEST_ASSERT_TRUE_MESSAGE(nivona::decodeHxResponse(chunks, true, status, error), error.c_str());
+        TEST_ASSERT_TRUE(status.ok);
+        TEST_ASSERT_EQUAL_INT16(20, status.message);
+        TEST_ASSERT_EQUAL_STRING("flush required", status.summary.c_str());
+        TEST_ASSERT_TRUE(status.hostConfirmSuggested);
+    }
 }
 
 void test_hx_decoder_ignores_leading_ack_frame_in_mixed_batch() {
@@ -224,6 +256,7 @@ int main(int argc, char** argv) {
     RUN_TEST(test_live_hr_response_rejects_incorrect_session_echo_expectation);
     RUN_TEST(test_hx_ready_vector_decodes_to_apk_backed_labels);
     RUN_TEST(test_unknown_hx_message_code_stays_raw_and_unlabeled);
+    RUN_TEST(test_hx_confirmable_messages_are_flagged_for_host_confirm);
     RUN_TEST(test_hx_decoder_ignores_leading_ack_frame_in_mixed_batch);
     RUN_TEST(test_family_700_standard_recipe_lookup_and_layout_match_apk_offsets);
     RUN_TEST(test_family_900_standard_recipe_layout_tracks_split_temperatures_and_scaled_fluids);
