@@ -56,7 +56,7 @@ The intended workflow is:
 - `Statistics`: reads beverage counters, maintenance counters, and serial or firmware details.
 - `Settings`: reads supported machine settings, writes updated values, and exposes factory reset actions for settings and recipe defaults.
 - `Diagnostics`: manages cached session keys, raw characteristic reads and writes, encrypted frame send, app-style probes, settings probe, stats probe, bridge logs, and the last raw diagnostics response.
-- `Bridge admin`: saves Wi-Fi credentials, adjusts the brew-history cap, uploads OTA firmware, reboots the bridge, resets the remembered-machine store, and exposes raw bridge status.
+- `Bridge admin`: saves Wi-Fi credentials, adjusts the brew-history cap, downloads or restores bridge backups, uploads OTA firmware, reboots the bridge, resets the remembered-machine store, and exposes raw bridge status.
 
 ## Build
 
@@ -189,6 +189,13 @@ Temporary overrides issued through `/brew` only apply to the started drink. They
   - updates the runtime per-machine brew-history cap in bytes
   - clamps the requested value between the configured minimum and the mounted LittleFS size
   - compacts existing history files immediately if you lower the cap
+- `GET /api/backup/export`
+  - downloads an NDJSON bundle containing the current saved-machine store, the configured brew-history budget, and all persisted brew-history entries
+  - intentionally excludes Wi-Fi credentials, protocol-session cache, and LittleFS recipe caches
+- `POST /api/backup/restore`
+  - accepts a multipart upload with a backup bundle file and fully replaces the current saved-machine store and brew history from that bundle
+  - clears recipe caches and stored protocol-session cache before restoring
+  - clamps the restored brew-history budget to the mounted LittleFS size on the target bridge
 - `POST /api/machines/{serial}/confirm`
   - sends the APK-backed `HY` host-confirmation command for the selected machine
 - `GET /api/machines/{serial}/mycoffee`

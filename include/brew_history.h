@@ -52,6 +52,7 @@ void configureBudget(size_t requestedBytes, size_t upperBytes);
 size_t budgetBytes();
 size_t budgetMinBytes();
 size_t budgetUpperBytes();
+String filePath(const String& serial);
 
 bool append(const String& serial, JsonObjectConst entry, String& error);
 bool appendSerializedLines(const String& serial, const std::vector<String>& lines, String& error);

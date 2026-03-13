@@ -2158,6 +2158,36 @@ static const char kPage[] PROGMEM = R"HTML(
         </section>
 
         <section class="panel">
+          <div class="row" style="justify-content:space-between;align-items:flex-start;">
+            <div>
+              <h2 class="section-title">Backup and restore</h2>
+              <div class="muted">Backups include saved machines, the configured brew-history budget, and per-machine brew history. Wi-Fi credentials, recipe caches, and protocol-session caches are intentionally excluded.</div>
+            </div>
+          </div>
+          <div class="grid two" style="margin-top:16px;">
+            <article class="setting-row">
+              <strong>Download backup</strong>
+              <div class="muted">Exports the bridge state as an NDJSON bundle so you can archive it or restore it on another bridge.</div>
+              <div class="row">
+                <button type="button" data-action="download-backup">Download backup</button>
+              </div>
+            </article>
+            <article class="setting-row">
+              <strong>Restore backup</strong>
+              <div class="muted">Restoring replaces saved machines and brew history on this bridge. Recipe caches and stored protocol sessions are cleared before import.</div>
+              <form data-action="restore-backup">
+                <label class="label">Backup file
+                  <input type="file" name="file" accept=".ndjson,.jsonl,application/x-ndjson,application/jsonl" required>
+                </label>
+                <div class="row">
+                  <button class="warn" type="submit">Restore backup</button>
+                </div>
+              </form>
+            </article>
+          </div>
+        </section>
+
+        <section class="panel">
           <h2 class="section-title">Saved machine store</h2>
           <p class="muted">Use this if the saved-machine schema changes or you want to wipe every remembered coffee machine from controller memory.</p>
           <div class="row">
@@ -2379,6 +2409,16 @@ static const char kPage[] PROGMEM = R"HTML(
       if (action === "clear-probe") {
         state.probedMachine = null;
         await renderRoute();
+      }
+
+      if (action === "download-backup") {
+        setFlash("Starting backup download…");
+        const link = document.createElement("a");
+        link.href = "/api/backup/export";
+        link.download = "";
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
       }
 
       if (action === "forget-machine") {
@@ -2846,6 +2886,27 @@ static const char kPage[] PROGMEM = R"HTML(
           cache.history = null;
           cache.historyOffset = 0;
         });
+        await refreshCore();
+        await renderRoute();
+      }
+
+      if (action === "restore-backup") {
+        const file = form.elements.file.files && form.elements.file.files[0];
+        if (!file) {
+          throw new Error("Choose a backup file first.");
+        }
+        if (!window.confirm("Restore this backup and replace saved machines and brew history on the bridge? Recipe caches and stored protocol sessions will be cleared.")) {
+          return;
+        }
+        const body = new FormData();
+        body.append("file", file);
+        const response = await runWithFlash("Restoring bridge backup…", () => api("/api/backup/restore", {
+          method: "POST",
+          body
+        }), "Bridge backup restored.");
+        state.probedMachine = null;
+        state.machineCache = {};
+        state.diagnostics.output = response;
         await refreshCore();
         await renderRoute();
       }

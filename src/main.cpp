@@ -38,6 +38,8 @@ constexpr char STANDARD_RECIPE_CACHE_PREFIX[] = "/stdrec-";
 constexpr uint32_t STANDARD_RECIPE_CACHE_SCHEMA = 2;
 constexpr char SAVED_RECIPE_CACHE_PREFIX[] = "/mycoffee-";
 constexpr uint32_t SAVED_RECIPE_CACHE_SCHEMA = 2;
+constexpr uint32_t BACKUP_BUNDLE_SCHEMA = 1;
+constexpr char BACKUP_RESTORE_UPLOAD_PATH[] = "/restore-upload.ndjson";
 
 void rxNotifyCallback(NimBLERemoteCharacteristic* characteristic, uint8_t* data, size_t length, bool isNotify);
 
@@ -95,6 +97,14 @@ struct ProtocolSessionEntry {
     uint32_t setAtMs{0};
 };
 
+struct BackupBundleSummary {
+    size_t machineCount{0};
+    size_t historyEntryCount{0};
+    size_t requestedBudgetBytes{0};
+    std::vector<String> machineSerials;
+    std::vector<String> historySerials;
+};
+
 WebServer server(80);
 Preferences preferences;
 Preferences machinePreferences;
@@ -137,6 +147,11 @@ bool idleScanInProgress = false;
 bool blockingScanInProgress = false;
 uint32_t idleScanStartedAtMs = 0;
 bool littleFsReady = false;
+File backupRestoreUploadFile;
+String backupRestoreUploadError;
+String backupRestoreUploadFilename;
+size_t backupRestoreUploadBytes = 0;
+bool backupRestoreUploadComplete = false;
 
 NimBLEClient* client                              = nullptr;
 NimBLERemoteService* disService                   = nullptr;
@@ -596,6 +611,46 @@ void clearAllBrewHistory() {
     if (!brew_history::clearAll(error) && !error.isEmpty()) {
         addLog("history", String("Brew history reset skipped: ") + error);
     }
+}
+
+bool readTextLine(File& file, String& lineOut) {
+    while (file.available()) {
+        lineOut = file.readStringUntil('\n');
+        if (lineOut.endsWith("\r")) {
+            lineOut.remove(lineOut.length() - 1);
+        }
+        if (!lineOut.isEmpty()) {
+            return true;
+        }
+    }
+    lineOut = "";
+    return false;
+}
+
+void resetBackupRestoreUploadState(bool removeFile = true) {
+    if (backupRestoreUploadFile) {
+        backupRestoreUploadFile.close();
+    }
+    backupRestoreUploadError = "";
+    backupRestoreUploadFilename = "";
+    backupRestoreUploadBytes = 0;
+    backupRestoreUploadComplete = false;
+    if (removeFile && littleFsReady && LittleFS.exists(BACKUP_RESTORE_UPLOAD_PATH)) {
+        LittleFS.remove(BACKUP_RESTORE_UPLOAD_PATH);
+    }
+}
+
+String backupDownloadFilename() {
+    String suffix = "unsynced";
+    const bridge_time::StatusSnapshot timeStatus = bridge_time::snapshot();
+    if (timeStatus.synced) {
+        suffix = timeStatus.iso8601Utc;
+        suffix.replace(":", "");
+        suffix.replace("-", "");
+    }
+    suffix.replace("T", "-");
+    suffix.replace("Z", "Z");
+    return String(APP_NAME) + "-backup-" + suffix + ".ndjson";
 }
 
 bool loadStandardRecipeCache(const SavedMachine& machine,
@@ -1128,6 +1183,24 @@ void appendSavedMachineJson(JsonObject target, const SavedMachine& machine) {
     target["lastSeenAtMs"] = machine.lastSeenAtMs;
     target["savedAtMs"] = machine.savedAtMs;
     target["online"] = machine.lastSeenAtMs > 0;
+}
+
+void appendBackupMachineJson(JsonObject target, const SavedMachine& machine) {
+    target["serial"] = machine.serial;
+    target["alias"] = machine.alias;
+    target["address"] = machine.address;
+    target["addressType"] = machine.addressType;
+    target["manufacturer"] = machine.manufacturer;
+    target["model"] = machine.model;
+    target["modelCode"] = machine.modelCode;
+    target["modelName"] = machine.modelName;
+    target["familyKey"] = machine.familyKey;
+    target["hardwareRevision"] = machine.hardwareRevision;
+    target["firmwareRevision"] = machine.firmwareRevision;
+    target["softwareRevision"] = machine.softwareRevision;
+    target["ad06Hex"] = machine.ad06Hex;
+    target["ad06Ascii"] = machine.ad06Ascii;
+    target["savedAtMs"] = machine.savedAtMs;
 }
 
 void appendProcessStatusJson(JsonObject target, const nivona::ProcessStatus& status, const String& error) {
@@ -3898,6 +3971,337 @@ bool buildManualSavedMachine(const String& alias,
     return true;
 }
 
+bool containsSerial(const std::vector<String>& serials, const String& serial) {
+    for (const String& candidate : serials) {
+        if (candidate.equalsIgnoreCase(serial)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool parseBackupMachineRecord(JsonObjectConst record, SavedMachine& machineOut, String& error) {
+    error = "";
+    machineOut = SavedMachine{};
+
+    const JsonObjectConst machine = record["machine"].as<JsonObjectConst>();
+    if (machine.isNull()) {
+        error = "machine record requires a machine object";
+        return false;
+    }
+
+    machineOut.serial = machine["serial"] | "";
+    machineOut.serial.trim();
+    if (machineOut.serial.isEmpty()) {
+        error = "machine serial is required";
+        return false;
+    }
+
+    machineOut.alias = machine["alias"] | "";
+    machineOut.alias.trim();
+    machineOut.address = machine["address"] | "";
+    if (!normalizeBleAddress(machineOut.address)) {
+        error = "machine address must be a BLE MAC like C8:B4:17:D8:A3:8C";
+        return false;
+    }
+
+    if (!parseAddressTypeRequest(machine["addressType"], machineOut.addressType)) {
+        error = "machine addressType must be public, random, 0, or 1";
+        return false;
+    }
+
+    machineOut.manufacturer = machine["manufacturer"] | "NIVONA";
+    machineOut.model = machine["model"] | "";
+    machineOut.modelCode = machine["modelCode"] | "";
+    machineOut.modelName = machine["modelName"] | "";
+    machineOut.familyKey = machine["familyKey"] | "";
+    machineOut.hardwareRevision = machine["hardwareRevision"] | "";
+    machineOut.firmwareRevision = machine["firmwareRevision"] | "";
+    machineOut.softwareRevision = machine["softwareRevision"] | "";
+    machineOut.ad06Hex = machine["ad06Hex"] | "";
+    machineOut.ad06Ascii = machine["ad06Ascii"] | "";
+    machineOut.savedAtMs = machine["savedAtMs"] | 0U;
+
+    if (machineOut.familyKey.isEmpty() || machineOut.modelCode.isEmpty() || machineOut.modelName.isEmpty()) {
+        SavedMachine derived;
+        String derivedError;
+        if (!buildManualSavedMachine(machineOut.alias,
+                                     machineOut.address,
+                                     machineOut.addressType,
+                                     machineOut.serial,
+                                     machineOut.model,
+                                     derived,
+                                     derivedError)) {
+            error = String("machine family metadata is incomplete: ") + derivedError;
+            return false;
+        }
+        if (machineOut.alias.isEmpty()) {
+            machineOut.alias = derived.alias;
+        }
+        if (machineOut.manufacturer.isEmpty()) {
+            machineOut.manufacturer = derived.manufacturer;
+        }
+        if (machineOut.model.isEmpty()) {
+            machineOut.model = derived.model;
+        }
+        if (machineOut.modelCode.isEmpty()) {
+            machineOut.modelCode = derived.modelCode;
+        }
+        if (machineOut.modelName.isEmpty()) {
+            machineOut.modelName = derived.modelName;
+        }
+        if (machineOut.familyKey.isEmpty()) {
+            machineOut.familyKey = derived.familyKey;
+        }
+    }
+
+    machineOut.lastSeenAtMs = 0;
+    machineOut.lastSeenRssi = 0;
+    if (machineOut.savedAtMs == 0) {
+        machineOut.savedAtMs = millis();
+    }
+    return true;
+}
+
+bool validateBackupBundle(const String& path, BackupBundleSummary& summaryOut, String& error) {
+    error = "";
+    summaryOut = BackupBundleSummary{};
+
+    File file = LittleFS.open(path, "r");
+    if (!file) {
+        error = "failed to open backup bundle";
+        return false;
+    }
+
+    bool sawMeta = false;
+    size_t lineNumber = 0;
+    String line;
+    while (readTextLine(file, line)) {
+        lineNumber++;
+        DynamicJsonDocument recordDoc(8192);
+        const DeserializationError parseError = deserializeJson(recordDoc, line);
+        if (parseError) {
+            file.close();
+            error = String("backup line ") + lineNumber + ": invalid json: " + parseError.c_str();
+            return false;
+        }
+
+        const JsonObjectConst record = recordDoc.as<JsonObjectConst>();
+        const String kind = record["kind"] | "";
+        if (kind == "meta") {
+            if (sawMeta) {
+                file.close();
+                error = String("backup line ") + lineNumber + ": duplicate meta record";
+                return false;
+            }
+            const uint32_t schema = record["schema"] | 0U;
+            if (schema != BACKUP_BUNDLE_SCHEMA) {
+                file.close();
+                error = String("backup line ") + lineNumber + ": unsupported backup schema";
+                return false;
+            }
+            const uint32_t budgetBytes = record["historyBudgetBytes"] | 0U;
+            if (budgetBytes == 0U) {
+                file.close();
+                error = String("backup line ") + lineNumber + ": historyBudgetBytes is required";
+                return false;
+            }
+            summaryOut.requestedBudgetBytes = budgetBytes;
+            sawMeta = true;
+            continue;
+        }
+
+        if (kind == "machine") {
+            SavedMachine machine;
+            String machineError;
+            if (!parseBackupMachineRecord(record, machine, machineError)) {
+                file.close();
+                error = String("backup line ") + lineNumber + ": " + machineError;
+                return false;
+            }
+            if (containsSerial(summaryOut.machineSerials, machine.serial)) {
+                file.close();
+                error = String("backup line ") + lineNumber + ": duplicate machine serial";
+                return false;
+            }
+            summaryOut.machineSerials.push_back(machine.serial);
+            summaryOut.machineCount++;
+            continue;
+        }
+
+        if (kind == "history") {
+            String serial = record["serial"] | "";
+            serial.trim();
+            if (serial.isEmpty()) {
+                file.close();
+                error = String("backup line ") + lineNumber + ": history serial is required";
+                return false;
+            }
+
+            std::vector<String> importedLines;
+            size_t importedCount = 0;
+            String importError;
+            if (!brew_history::buildImportedLines(record["entry"], importedLines, importedCount, importError)) {
+                file.close();
+                error = String("backup line ") + lineNumber + ": " + importError;
+                return false;
+            }
+            if (!containsSerial(summaryOut.historySerials, serial)) {
+                summaryOut.historySerials.push_back(serial);
+            }
+            summaryOut.historyEntryCount += importedCount;
+            continue;
+        }
+
+        file.close();
+        error = String("backup line ") + lineNumber + ": unsupported record kind";
+        return false;
+    }
+    file.close();
+
+    if (!sawMeta) {
+        error = "backup bundle is missing the meta record";
+        return false;
+    }
+
+    for (const String& serial : summaryOut.historySerials) {
+        if (!containsSerial(summaryOut.machineSerials, serial)) {
+            error = String("backup history references an unknown machine serial: ") + serial;
+            return false;
+        }
+    }
+    return true;
+}
+
+bool loadBackupMachinesFromBundle(const String& path, std::vector<SavedMachine>& machinesOut, String& error) {
+    error = "";
+    machinesOut.clear();
+
+    File file = LittleFS.open(path, "r");
+    if (!file) {
+        error = "failed to reopen backup bundle";
+        return false;
+    }
+
+    size_t lineNumber = 0;
+    String line;
+    while (readTextLine(file, line)) {
+        lineNumber++;
+        DynamicJsonDocument recordDoc(8192);
+        const DeserializationError parseError = deserializeJson(recordDoc, line);
+        if (parseError) {
+            file.close();
+            error = String("backup line ") + lineNumber + ": invalid json: " + parseError.c_str();
+            return false;
+        }
+        const JsonObjectConst record = recordDoc.as<JsonObjectConst>();
+        const String kind = record["kind"] | "";
+        if (kind != "machine") {
+            continue;
+        }
+
+        SavedMachine machine;
+        String machineError;
+        if (!parseBackupMachineRecord(record, machine, machineError)) {
+            file.close();
+            error = String("backup line ") + lineNumber + ": " + machineError;
+            return false;
+        }
+        machinesOut.push_back(machine);
+    }
+    file.close();
+    return true;
+}
+
+bool restoreBackupHistoryFromBundle(const String& path, size_t& restoredEntryCount, String& error) {
+    error = "";
+    restoredEntryCount = 0;
+
+    File file = LittleFS.open(path, "r");
+    if (!file) {
+        error = "failed to reopen backup bundle";
+        return false;
+    }
+
+    size_t lineNumber = 0;
+    String line;
+    while (readTextLine(file, line)) {
+        lineNumber++;
+        DynamicJsonDocument recordDoc(8192);
+        const DeserializationError parseError = deserializeJson(recordDoc, line);
+        if (parseError) {
+            file.close();
+            error = String("backup line ") + lineNumber + ": invalid json: " + parseError.c_str();
+            return false;
+        }
+
+        const JsonObjectConst record = recordDoc.as<JsonObjectConst>();
+        const String kind = record["kind"] | "";
+        if (kind != "history") {
+            continue;
+        }
+
+        String serial = record["serial"] | "";
+        serial.trim();
+        std::vector<String> importedLines;
+        size_t importedCount = 0;
+        String importError;
+        if (!brew_history::buildImportedLines(record["entry"], importedLines, importedCount, importError)) {
+            file.close();
+            error = String("backup line ") + lineNumber + ": " + importError;
+            return false;
+        }
+        if (!brew_history::appendSerializedLines(serial, importedLines, importError)) {
+            file.close();
+            error = String("backup line ") + lineNumber + ": " + importError;
+            return false;
+        }
+        restoredEntryCount += importedCount;
+    }
+    file.close();
+    return true;
+}
+
+bool applyBackupBundle(const String& path,
+                       const BackupBundleSummary& summary,
+                       size_t& appliedBudgetBytes,
+                       size_t& restoredMachineCount,
+                       size_t& restoredHistoryEntryCount,
+                       String& error) {
+    error = "";
+    appliedBudgetBytes = brew_history::clampBudgetBytes(summary.requestedBudgetBytes, LittleFS.totalBytes());
+    restoredMachineCount = 0;
+    restoredHistoryEntryCount = 0;
+
+    savedMachines.clear();
+    clearStoredSessionKey();
+    selectedMachineSerial = "";
+    selectedAddress = "";
+    selectedAddressType = BLE_ADDR_PUBLIC;
+    cachedDetails = DeviceDetails{};
+
+    clearAllStandardRecipeCaches();
+    clearAllSavedRecipeCaches();
+    clearAllBrewHistory();
+
+    brew_history::configureBudget(appliedBudgetBytes, LittleFS.totalBytes());
+    preferences.putUInt(PREFS_HISTORY_MAX_BYTES, static_cast<uint32_t>(appliedBudgetBytes));
+
+    std::vector<SavedMachine> restoredMachines;
+    if (!loadBackupMachinesFromBundle(path, restoredMachines, error)) {
+        return false;
+    }
+    savedMachines = restoredMachines;
+    refreshAllSavedMachinePresence();
+    persistSavedMachines();
+    restoredMachineCount = savedMachines.size();
+
+    if (!restoreBackupHistoryFromBundle(path, restoredHistoryEntryCount, error)) {
+        return false;
+    }
+    return true;
+}
+
 bool appendMyCoffeeSlot(JsonObject target, SavedMachine& machine, uint8_t slotIndex, bool detail, String& error) {
     const nivona::ModelInfo modelInfo = nivona::detectModelInfo(toNivonaDetails(machine));
     nivona::MyCoffeeLayout layout;
@@ -5549,6 +5953,218 @@ void handleHistoryConfigSave() {
     sendJson(response);
 }
 
+void handleBackupExport() {
+    server.sendHeader("Cache-Control", "no-store");
+    server.sendHeader("Access-Control-Allow-Origin", "*");
+    server.sendHeader("Content-Disposition", String("attachment; filename=\"") + backupDownloadFilename() + "\"");
+    server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+    server.send(200, "application/x-ndjson", "");
+
+    DynamicJsonDocument metaDoc(2048);
+    metaDoc["kind"] = "meta";
+    metaDoc["schema"] = BACKUP_BUNDLE_SCHEMA;
+    metaDoc["appName"] = APP_NAME;
+    metaDoc["appVersion"] = APP_VERSION;
+    metaDoc["buildTime"] = APP_BUILD_TIME;
+    metaDoc["historyBudgetBytes"] = brew_history::budgetBytes();
+    metaDoc["savedMachineCount"] = savedMachines.size();
+    metaDoc["littleFsReady"] = littleFsReady;
+    metaDoc["exportedAtMs"] = millis();
+    const bridge_time::StatusSnapshot timeStatus = bridge_time::snapshot();
+    metaDoc["timeSynced"] = timeStatus.synced;
+    if (timeStatus.synced) {
+        metaDoc["exportedAtUnix"] = static_cast<int64_t>(timeStatus.unixTime);
+        metaDoc["exportedAtIsoUtc"] = timeStatus.iso8601Utc;
+    }
+    JsonObject includes = metaDoc.createNestedObject("includes");
+    includes["savedMachines"] = true;
+    includes["historyBudget"] = true;
+    includes["brewHistory"] = littleFsReady;
+    includes["wifi"] = false;
+    includes["protocolSessions"] = false;
+    includes["standardRecipeCaches"] = false;
+    includes["savedRecipeCaches"] = false;
+
+    String line;
+    serializeJson(metaDoc, line);
+    server.sendContent(line + "\n");
+
+    for (const SavedMachine& machine : savedMachines) {
+        DynamicJsonDocument machineDoc(1024);
+        machineDoc["kind"] = "machine";
+        JsonObject item = machineDoc.createNestedObject("machine");
+        appendBackupMachineJson(item, machine);
+        line = "";
+        serializeJson(machineDoc, line);
+        server.sendContent(line + "\n");
+
+        if (!littleFsReady) {
+            continue;
+        }
+
+        File historyFile = LittleFS.open(brew_history::filePath(machine.serial), "r");
+        if (!historyFile) {
+            continue;
+        }
+
+        String historyLine;
+        while (readTextLine(historyFile, historyLine)) {
+            DynamicJsonDocument historyDoc(256);
+            historyDoc["kind"] = "history";
+            historyDoc["serial"] = machine.serial;
+            String historyPrefix;
+            serializeJson(historyDoc, historyPrefix);
+            if (historyPrefix.endsWith("}")) {
+                historyPrefix.remove(historyPrefix.length() - 1);
+            }
+            server.sendContent(historyPrefix);
+            server.sendContent(",\"entry\":");
+            server.sendContent(historyLine);
+            server.sendContent("}\n");
+        }
+        historyFile.close();
+    }
+
+    server.sendContent("");
+}
+
+void handleBackupRestoreFinished() {
+    const String uploadedFilename = backupRestoreUploadFilename;
+    const size_t uploadedBytes = backupRestoreUploadBytes;
+    const bool uploadComplete = backupRestoreUploadComplete;
+    const String uploadError = backupRestoreUploadError;
+
+    resetBackupRestoreUploadState(false);
+
+    if (!littleFsReady) {
+        lastError = "LittleFS is unavailable";
+        sendError(503, lastError);
+        return;
+    }
+    if (!uploadError.isEmpty()) {
+        lastError = uploadError;
+        if (LittleFS.exists(BACKUP_RESTORE_UPLOAD_PATH)) {
+            LittleFS.remove(BACKUP_RESTORE_UPLOAD_PATH);
+        }
+        sendError(500, uploadError);
+        return;
+    }
+    if (!uploadComplete || uploadedBytes == 0) {
+        if (LittleFS.exists(BACKUP_RESTORE_UPLOAD_PATH)) {
+            LittleFS.remove(BACKUP_RESTORE_UPLOAD_PATH);
+        }
+        sendError(400, "backup upload did not complete");
+        return;
+    }
+
+    BackupBundleSummary summary;
+    String error;
+    if (!validateBackupBundle(BACKUP_RESTORE_UPLOAD_PATH, summary, error)) {
+        if (LittleFS.exists(BACKUP_RESTORE_UPLOAD_PATH)) {
+            LittleFS.remove(BACKUP_RESTORE_UPLOAD_PATH);
+        }
+        sendError(400, error);
+        return;
+    }
+
+    size_t appliedBudgetBytes = 0;
+    size_t restoredMachineCount = 0;
+    size_t restoredHistoryEntryCount = 0;
+    if (!applyBackupBundle(BACKUP_RESTORE_UPLOAD_PATH,
+                           summary,
+                           appliedBudgetBytes,
+                           restoredMachineCount,
+                           restoredHistoryEntryCount,
+                           error)) {
+        lastError = error;
+        if (LittleFS.exists(BACKUP_RESTORE_UPLOAD_PATH)) {
+            LittleFS.remove(BACKUP_RESTORE_UPLOAD_PATH);
+        }
+        sendError(500, error);
+        return;
+    }
+
+    if (LittleFS.exists(BACKUP_RESTORE_UPLOAD_PATH)) {
+        LittleFS.remove(BACKUP_RESTORE_UPLOAD_PATH);
+    }
+
+    DynamicJsonDocument response(4096);
+    response["ok"] = true;
+    response["backupSchema"] = BACKUP_BUNDLE_SCHEMA;
+    response["filename"] = uploadedFilename;
+    response["uploadBytes"] = uploadedBytes;
+    response["requestedBudgetBytes"] = summary.requestedBudgetBytes;
+    response["appliedBudgetBytes"] = appliedBudgetBytes;
+    response["restoredMachineCount"] = restoredMachineCount;
+    response["restoredHistoryEntryCount"] = restoredHistoryEntryCount;
+    appendStatus(response);
+    sendJson(response);
+}
+
+void handleBackupRestoreUpload() {
+    HTTPUpload& upload = server.upload();
+    if (upload.status == UPLOAD_FILE_START) {
+        resetBackupRestoreUploadState();
+        backupRestoreUploadFilename = upload.filename;
+        if (!littleFsReady) {
+            backupRestoreUploadError = "LittleFS is unavailable";
+            return;
+        }
+        addLog("backup", String("Starting backup restore upload: ") + upload.filename);
+        backupRestoreUploadFile = LittleFS.open(BACKUP_RESTORE_UPLOAD_PATH, "w");
+        if (!backupRestoreUploadFile) {
+            backupRestoreUploadError = "failed to open backup restore staging file";
+        }
+        return;
+    }
+
+    if (upload.status == UPLOAD_FILE_WRITE) {
+        if (!backupRestoreUploadError.isEmpty()) {
+            return;
+        }
+        if (!backupRestoreUploadFile) {
+            backupRestoreUploadError = "backup restore staging file is unavailable";
+            return;
+        }
+        const size_t written = backupRestoreUploadFile.write(upload.buf, upload.currentSize);
+        if (written != upload.currentSize) {
+            backupRestoreUploadError = "failed to write backup restore upload";
+            backupRestoreUploadFile.close();
+            LittleFS.remove(BACKUP_RESTORE_UPLOAD_PATH);
+            return;
+        }
+        backupRestoreUploadBytes += written;
+        return;
+    }
+
+    if (upload.status == UPLOAD_FILE_END) {
+        if (backupRestoreUploadFile) {
+            backupRestoreUploadFile.close();
+        }
+        if (!backupRestoreUploadError.isEmpty()) {
+            return;
+        }
+        if (backupRestoreUploadBytes == 0) {
+            backupRestoreUploadError = "backup upload is empty";
+            LittleFS.remove(BACKUP_RESTORE_UPLOAD_PATH);
+            return;
+        }
+        backupRestoreUploadComplete = true;
+        addLog("backup", String("Backup restore upload received, bytes=") + backupRestoreUploadBytes);
+        return;
+    }
+
+    if (upload.status == UPLOAD_FILE_ABORTED) {
+        if (backupRestoreUploadFile) {
+            backupRestoreUploadFile.close();
+        }
+        LittleFS.remove(BACKUP_RESTORE_UPLOAD_PATH);
+        backupRestoreUploadComplete = false;
+        backupRestoreUploadError = "backup upload aborted";
+        addLog("backup", "Backup restore upload aborted");
+    }
+}
+
 void handleConnect() {
     DynamicJsonDocument request(1024);
     String error;
@@ -6590,6 +7206,8 @@ void registerRoutes() {
     server.on("/api/machines/probe", HTTP_POST, handleMachineProbe);
     server.on("/api/machines/reset", HTTP_POST, handleMachinesReset);
 
+    server.on("/api/backup/export", HTTP_GET, handleBackupExport);
+    server.on("/api/backup/restore", HTTP_POST, handleBackupRestoreFinished, handleBackupRestoreUpload);
     server.on("/api/wifi/save", HTTP_POST, handleWifiSave);
     server.on("/api/history/config", HTTP_POST, handleHistoryConfigSave);
     server.on("/api/scan", HTTP_POST, handleScan);

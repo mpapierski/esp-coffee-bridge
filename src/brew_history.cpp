@@ -190,6 +190,10 @@ size_t budgetUpperBytes() {
     return gBudgetUpperBytes;
 }
 
+String filePath(const String& serial) {
+    return historyPath(serial);
+}
+
 bool append(const String& serial, JsonObjectConst entry, String& error) {
     String line;
     if (!serializeEntry(entry, line, error)) {
