@@ -624,6 +624,7 @@ static const char kPage[] PROGMEM = R"HTML(
 
   const PROTOCOL_API = "/api/protocol";
   const HISTORY_PAGE_SIZE = 20;
+  const STATS_HISTORY_PAGE_SIZE = 20;
 
   const state = {
     flash: { message: "Loading bridge status…", kind: "" },
@@ -942,6 +943,19 @@ static const char kPage[] PROGMEM = R"HTML(
     }
     cache.stats = await api(`/api/machines/${encodeURIComponent(serial)}/stats`);
     return cache.stats;
+  }
+
+  async function loadMachineStatsHistory(serial, force = false, offsetOverride = null) {
+    const cache = getMachineCache(serial);
+    const offset = Math.max(0, Number(offsetOverride ?? cache.statsHistoryOffset ?? 0));
+    if (!force && cache.statsHistory && Number(cache.statsHistory.offset || 0) === offset &&
+        Number(cache.statsHistory.limit || STATS_HISTORY_PAGE_SIZE) === STATS_HISTORY_PAGE_SIZE) {
+      return cache.statsHistory;
+    }
+    cache.statsHistoryOffset = offset;
+    cache.statsHistory = await api(`/api/machines/${encodeURIComponent(serial)}/stats/history?limit=${STATS_HISTORY_PAGE_SIZE}&offset=${offset}`);
+    cache.statsHistoryOffset = Number(cache.statsHistory?.offset || 0);
+    return cache.statsHistory;
   }
 
   async function loadMachineSettings(serial, force = false) {
@@ -1564,7 +1578,7 @@ static const char kPage[] PROGMEM = R"HTML(
     `;
   }
 
-  function renderStatsSection(data) {
+  function renderStatsSection(machine, data, history) {
     if (!data?.supported) {
       return `<section class="panel"><div class="empty">Statistics are not currently implemented for this machine family in the bridge firmware.</div></section>`;
     }
@@ -1572,6 +1586,8 @@ static const char kPage[] PROGMEM = R"HTML(
     const values = Object.values(data.values || {});
     const beverages = values.filter((item) => item.section === "beverages");
     const maintenance = values.filter((item) => item.section === "maintenance");
+    const metricMeta = data?.values || {};
+    const historyEntries = history?.entries || [];
     const renderMetricGroup = (title, items) => `
       <section class="panel">
         <h2 class="section-title">${escapeHtml(title)}</h2>
@@ -1588,9 +1604,94 @@ static const char kPage[] PROGMEM = R"HTML(
       </section>
     `;
 
+    const renderStatsHistoryMetric = (entry, key) => {
+      const item = metricMeta[key] || {};
+      const title = item.title || key.replace(/_/g, " ");
+      const unit = item.unit && item.unit !== "count" && item.unit !== "flag" ? ` ${item.unit}` : "";
+      const value = entry?.values?.[key];
+      const delta = entry?.delta?.[key];
+      const deltaText = hasNumericValue(delta) ? `${Number(delta) >= 0 ? "+" : ""}${Number(delta)}` : "";
+      return `
+        <div class="value-item">
+          <span>${escapeHtml(title)}</span>
+          <span>${escapeHtml(String(value ?? "-"))}${escapeHtml(unit)}${deltaText ? ` (${escapeHtml(deltaText)})` : ""}</span>
+        </div>
+      `;
+    };
+
+    const renderStatsHistory = () => {
+      const total = Math.max(0, Number(history?.count || 0));
+      const offset = Math.max(0, Number(history?.offset || 0));
+      const returned = Math.max(0, Number(history?.returned || historyEntries.length));
+      const rangeStart = returned ? offset + 1 : 0;
+      const rangeEnd = returned ? offset + returned : 0;
+      return `
+        <section class="panel">
+          <div class="row" style="justify-content:space-between;align-items:flex-start;">
+            <div>
+              <h2 class="section-title" style="margin:0;">Counter history</h2>
+              <div class="muted">The bridge stores a snapshot when live counters change. This captures local machine use even when a coffee was started from the front panel.</div>
+            </div>
+            <div class="row">
+              <span class="badge">${escapeHtml(String(history?.count ?? 0))} stored</span>
+              <span class="badge">${escapeHtml(String(history?.fileBytes ?? 0))} / ${escapeHtml(String(history?.maxBytes ?? 0))} bytes</span>
+              <button class="secondary" data-action="refresh-machine-stats" data-serial="${escapeHtml(machine.serial)}">Refresh stats</button>
+              <button class="warn" data-action="clear-stats-history" data-serial="${escapeHtml(machine.serial)}">Clear history</button>
+            </div>
+          </div>
+          <div class="row" style="margin-top:14px;justify-content:space-between;">
+            <div class="muted">
+              ${returned ? `Showing newest ${escapeHtml(String(rangeStart))}-${escapeHtml(String(rangeEnd))} of ${escapeHtml(String(total))}.` : "No counter snapshots stored yet."}
+            </div>
+            <div class="row">
+              <button class="secondary" data-action="stats-history-prev-page" data-serial="${escapeHtml(machine.serial)}" data-offset="${escapeHtml(String(history?.prevOffset ?? 0))}" ${history?.hasNewer ? "" : "disabled"}>Newer</button>
+              <button class="secondary" data-action="stats-history-next-page" data-serial="${escapeHtml(machine.serial)}" data-offset="${escapeHtml(String(history?.nextOffset ?? 0))}" ${history?.hasOlder ? "" : "disabled"}>Older</button>
+            </div>
+          </div>
+          ${historyEntries.length ? `
+            <div class="recipe-list" style="margin-top:16px;">
+              ${historyEntries.map((entry) => {
+                const changedKeys = Array.isArray(entry?.changedKeys) && entry.changedKeys.length
+                  ? entry.changedKeys
+                  : (entry?.baseline ? ["total_beverages", "beverages_via_app"].filter((key) => entry?.values?.[key] !== undefined) : Object.keys(entry?.delta || {}));
+                const summary = entry?.baseline
+                  ? "Initial counter baseline"
+                  : `${Number(entry?.changedCount || changedKeys.length || 0)} metrics changed${hasNumericValue(entry?.totalDelta) ? ` · total beverages ${Number(entry.totalDelta) >= 0 ? "+" : ""}${Number(entry.totalDelta)}` : ""}`;
+                return `
+                  <article class="recipe-card">
+                    <div class="row" style="justify-content:space-between;align-items:flex-start;">
+                      <div>
+                        <h3>${escapeHtml(summary)}</h3>
+                        <div class="meta">
+                          <span>${escapeHtml(formatHistoryTimestamp(entry))}</span>
+                          <span>${escapeHtml(entry.source || "stats")}</span>
+                        </div>
+                      </div>
+                      <div class="badge-row">
+                        ${entry?.baseline ? '<span class="badge">baseline</span>' : ""}
+                        ${hasNumericValue(entry?.totalDelta) ? `<span class="badge">${escapeHtml(`${Number(entry.totalDelta) >= 0 ? "+" : ""}${Number(entry.totalDelta)} total`)}</span>` : ""}
+                      </div>
+                    </div>
+                    <div class="value-list">
+                      ${changedKeys.length ? changedKeys.map((key) => renderStatsHistoryMetric(entry, key)).join("") : '<div class="value-item"><span>Metrics</span><span>No changes captured</span></div>'}
+                    </div>
+                    <details>
+                      <summary>Raw counter snapshot</summary>
+                      <pre>${escapeHtml(pretty(entry))}</pre>
+                    </details>
+                  </article>
+                `;
+              }).join("")}
+            </div>
+          ` : '<div class="empty" style="margin-top:16px;">No counter snapshots stored yet.</div>'}
+        </section>
+      `;
+    };
+
     return `
       ${renderMetricGroup("Ordered beverages", beverages)}
       ${renderMetricGroup("Maintenance", maintenance)}
+      ${renderStatsHistory()}
       <section class="panel">
         <h2 class="section-title">Serial and details</h2>
         <div class="value-list">
@@ -2232,7 +2333,9 @@ static const char kPage[] PROGMEM = R"HTML(
       } else if (section === "history") {
         body = renderHistorySection(machine, await loadMachineHistory(serial, false));
       } else if (section === "stats") {
-        body = renderStatsSection(await loadMachineStats(serial, false));
+        const statsData = await loadMachineStats(serial, false);
+        const statsHistory = await loadMachineStatsHistory(serial, false);
+        body = renderStatsSection(machine, statsData, statsHistory);
       } else if (section === "settings") {
         body = renderSettingsSection(machine, await loadMachineSettings(serial, false));
       } else if (section === "diagnostics") {
@@ -2529,6 +2632,35 @@ static const char kPage[] PROGMEM = R"HTML(
         const serial = button.dataset.serial;
         const offset = Number(button.dataset.offset || 0);
         await loadMachineHistory(serial, false, offset);
+        await renderRoute();
+      }
+
+      if (action === "refresh-machine-stats") {
+        const serial = button.dataset.serial;
+        const cache = getMachineCache(serial);
+        await runWithFlash("Refreshing machine statistics…", async () => {
+          await loadMachineStats(serial, true);
+          await loadMachineStatsHistory(serial, true, Number(cache.statsHistoryOffset || 0));
+        }, "Machine statistics refreshed.");
+        await renderRoute();
+      }
+
+      if (action === "clear-stats-history") {
+        const serial = button.dataset.serial;
+        if (!window.confirm(`Clear counter history for ${serial}?`)) {
+          return;
+        }
+        await runWithFlash("Clearing counter history…", () => api(`/api/machines/${encodeURIComponent(serial)}/stats/history/clear`, { method: "POST", json: {} }), "Counter history cleared.");
+        const cache = getMachineCache(serial);
+        cache.statsHistory = null;
+        cache.statsHistoryOffset = 0;
+        await renderRoute();
+      }
+
+      if (action === "stats-history-prev-page" || action === "stats-history-next-page") {
+        const serial = button.dataset.serial;
+        const offset = Number(button.dataset.offset || 0);
+        await loadMachineStatsHistory(serial, false, offset);
         await renderRoute();
       }
 

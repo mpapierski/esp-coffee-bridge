@@ -52,6 +52,7 @@ The intended workflow is:
 - `Standard drinks`: lists the built-in drink selectors, supports quick brew, and opens a per-drink customization view.
 - `Temporary brew customization`: refreshes current standard drink values from the machine, can warm the full standard-drink cache from the machine, and sends temporary overrides such as strength, aroma, temperature, cup mode, and amount fields without overwriting the machine's saved recipe.
 - `Brew history`: stores a bounded per-machine history in LittleFS with the final applied recipe snapshot, a stable recipe fingerprint, optional source or actor metadata, UTC timestamps when NTP is available, and a runtime-adjustable cap from the system page.
+- `Counter history`: stores a separate bounded per-machine timeline of beverage and maintenance counters, snapshots only when live values change, and captures local machine use started from the front panel.
 - `MyCoffee / saved recipes`: stores saved custom recipe snapshots in LittleFS too, exposes explicit refresh buttons, shows recipe details, and edits persisted custom recipes where the machine family supports them.
 - `Statistics`: reads beverage counters, maintenance counters, and serial or firmware details.
 - `Settings`: reads supported machine settings, writes updated values, and exposes factory reset actions for settings and recipe defaults.
@@ -190,10 +191,10 @@ Temporary overrides issued through `/brew` only apply to the started drink. They
   - clamps the requested value between the configured minimum and the mounted LittleFS size
   - compacts existing history files immediately if you lower the cap
 - `GET /api/backup/export`
-  - downloads an NDJSON bundle containing the current saved-machine store, the configured brew-history budget, and all persisted brew-history entries
+  - downloads an NDJSON bundle containing the current saved-machine store, the configured brew-history budget, all persisted brew-history entries, and all persisted counter-history snapshots
   - intentionally excludes Wi-Fi credentials, protocol-session cache, and LittleFS recipe caches
 - `POST /api/backup/restore`
-  - accepts a multipart upload with a backup bundle file and fully replaces the current saved-machine store and brew history from that bundle
+  - accepts a multipart upload with a backup bundle file and fully replaces the current saved-machine store, brew history, and counter history from that bundle
   - clears recipe caches and stored protocol-session cache before restoring
   - clamps the restored brew-history budget to the mounted LittleFS size on the target bridge
 - `POST /api/machines/{serial}/confirm`
@@ -204,6 +205,10 @@ Temporary overrides issued through `/brew` only apply to the started drink. They
   - add `?refresh=1` to force a live reread of one saved recipe slot; otherwise the bridge may serve the cached slot from the saved-recipe snapshot
 - `POST /api/machines/{serial}/mycoffee/{slot}`
 - `GET /api/machines/{serial}/stats`
+- `GET /api/machines/{serial}/stats/history`
+  - returns the newest stored counter snapshots first
+  - optional `?limit=20&offset=40` style query supports pagination from newest to oldest
+- `POST /api/machines/{serial}/stats/history/clear`
 - `GET /api/machines/{serial}/settings`
 - `POST /api/machines/{serial}/settings`
 

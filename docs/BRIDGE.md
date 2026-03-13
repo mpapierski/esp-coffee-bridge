@@ -73,14 +73,18 @@ Current embedded bridge UI is now organized around remembered machines rather th
     - clamps the cap between the configured minimum and the mounted LittleFS size
     - compacts existing history files immediately if the new cap is lower than the current file size
   - `GET /api/backup/export`
-    - streams an NDJSON backup bundle with saved machines, the configured brew-history budget, and all persisted brew-history entries
+    - streams an NDJSON backup bundle with saved machines, the configured brew-history budget, all persisted brew-history entries, and all persisted counter-history snapshots
     - excludes Wi-Fi credentials, protocol-session cache, and LittleFS recipe caches
   - `POST /api/backup/restore`
     - accepts a multipart upload containing a backup bundle file
-    - validates the bundle before applying it, then replaces the saved-machine store and brew history from that bundle
+    - validates the bundle before applying it, then replaces the saved-machine store, brew history, and counter history from that bundle
     - clears recipe caches and stored protocol-session cache before restore
     - clamps the restored brew-history budget to the target bridge's mounted LittleFS size
   - `POST /api/machines/{serial}/history/clear`
+  - `GET /api/machines/{serial}/stats/history`
+    - returns the newest stored counter snapshots first
+    - snapshots are appended only when live values change, so the log reflects machine activity over time instead of repeating identical polls
+  - `POST /api/machines/{serial}/stats/history/clear`
   - `POST /api/machines/{serial}/confirm`
     - sends the APK-backed `HY` host-confirmation command with the current machine-scoped live session
     - intended for machine-driven prompts during a workflow, such as flush-required or move-cup prompts

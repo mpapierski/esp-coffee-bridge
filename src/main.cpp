@@ -17,6 +17,7 @@
 #include "brew_history.h"
 #include "bridge_time.h"
 #include "nivona.h"
+#include "stats_history.h"
 #include "web_ui.h"
 
 namespace {
@@ -33,6 +34,7 @@ constexpr uint32_t DEFAULT_RECONNECT_DELAY_MS = 750;
 constexpr uint32_t NOTIFICATION_BATCH_SETTLE_MS = 60;
 constexpr size_t LOG_CAPACITY   = 128;
 constexpr size_t BREW_HISTORY_PRECHECK_RESERVE_BYTES = 448;
+constexpr uint32_t STATS_HISTORY_POLL_INTERVAL_MS = 60 * 1000;
 constexpr uint16_t TEMP_RECIPE_TYPE_REGISTER = 9001;
 constexpr char STANDARD_RECIPE_CACHE_PREFIX[] = "/stdrec-";
 constexpr uint32_t STANDARD_RECIPE_CACHE_SCHEMA = 2;
@@ -100,9 +102,11 @@ struct ProtocolSessionEntry {
 struct BackupBundleSummary {
     size_t machineCount{0};
     size_t historyEntryCount{0};
+    size_t statsHistoryEntryCount{0};
     size_t requestedBudgetBytes{0};
     std::vector<String> machineSerials;
     std::vector<String> historySerials;
+    std::vector<String> statsHistorySerials;
 };
 
 WebServer server(80);
@@ -147,6 +151,8 @@ bool idleScanInProgress = false;
 bool blockingScanInProgress = false;
 uint32_t idleScanStartedAtMs = 0;
 bool littleFsReady = false;
+uint32_t lastStatsHistoryPollAtMs = 0;
+size_t statsHistoryPollCursor = 0;
 File backupRestoreUploadFile;
 String backupRestoreUploadError;
 String backupRestoreUploadFilename;
@@ -610,6 +616,26 @@ void clearAllBrewHistory() {
     String error;
     if (!brew_history::clearAll(error) && !error.isEmpty()) {
         addLog("history", String("Brew history reset skipped: ") + error);
+    }
+}
+
+void clearStatsHistoryForMachine(const String& serial) {
+    if (!littleFsReady || serial.isEmpty()) {
+        return;
+    }
+    String error;
+    if (!stats_history::clear(serial, error) && !error.isEmpty()) {
+        addLog("stats-history", String("Stats history clear skipped: ") + error);
+    }
+}
+
+void clearAllStatsHistory() {
+    if (!littleFsReady) {
+        return;
+    }
+    String error;
+    if (!stats_history::clearAll(error) && !error.isEmpty()) {
+        addLog("stats-history", String("Stats history reset skipped: ") + error);
     }
 }
 
@@ -4153,6 +4179,28 @@ bool validateBackupBundle(const String& path, BackupBundleSummary& summaryOut, S
             continue;
         }
 
+        if (kind == "stats_history") {
+            String serial = record["serial"] | "";
+            serial.trim();
+            if (serial.isEmpty()) {
+                file.close();
+                error = String("backup line ") + lineNumber + ": stats history serial is required";
+                return false;
+            }
+            const JsonObjectConst entry = record["entry"].as<JsonObjectConst>();
+            String entryError;
+            if (entry.isNull() || !stats_history::validateEntry(entry, entryError)) {
+                file.close();
+                error = String("backup line ") + lineNumber + ": " + (entryError.isEmpty() ? String("invalid stats history entry") : entryError);
+                return false;
+            }
+            if (!containsSerial(summaryOut.statsHistorySerials, serial)) {
+                summaryOut.statsHistorySerials.push_back(serial);
+            }
+            summaryOut.statsHistoryEntryCount++;
+            continue;
+        }
+
         file.close();
         error = String("backup line ") + lineNumber + ": unsupported record kind";
         return false;
@@ -4167,6 +4215,12 @@ bool validateBackupBundle(const String& path, BackupBundleSummary& summaryOut, S
     for (const String& serial : summaryOut.historySerials) {
         if (!containsSerial(summaryOut.machineSerials, serial)) {
             error = String("backup history references an unknown machine serial: ") + serial;
+            return false;
+        }
+    }
+    for (const String& serial : summaryOut.statsHistorySerials) {
+        if (!containsSerial(summaryOut.machineSerials, serial)) {
+            error = String("backup stats history references an unknown machine serial: ") + serial;
             return false;
         }
     }
@@ -4262,16 +4316,61 @@ bool restoreBackupHistoryFromBundle(const String& path, size_t& restoredEntryCou
     return true;
 }
 
+bool restoreStatsHistoryFromBundle(const String& path, size_t& restoredEntryCount, String& error) {
+    error = "";
+    restoredEntryCount = 0;
+
+    File file = LittleFS.open(path, "r");
+    if (!file) {
+        error = "failed to reopen backup bundle";
+        return false;
+    }
+
+    size_t lineNumber = 0;
+    String line;
+    while (readTextLine(file, line)) {
+        lineNumber++;
+        DynamicJsonDocument recordDoc(8192);
+        const DeserializationError parseError = deserializeJson(recordDoc, line);
+        if (parseError) {
+            file.close();
+            error = String("backup line ") + lineNumber + ": invalid json: " + parseError.c_str();
+            return false;
+        }
+
+        const JsonObjectConst record = recordDoc.as<JsonObjectConst>();
+        const String kind = record["kind"] | "";
+        if (kind != "stats_history") {
+            continue;
+        }
+
+        String serial = record["serial"] | "";
+        serial.trim();
+        const JsonObjectConst entry = record["entry"].as<JsonObjectConst>();
+        String entryError;
+        if (!stats_history::append(serial, entry, entryError)) {
+            file.close();
+            error = String("backup line ") + lineNumber + ": " + entryError;
+            return false;
+        }
+        restoredEntryCount++;
+    }
+    file.close();
+    return true;
+}
+
 bool applyBackupBundle(const String& path,
                        const BackupBundleSummary& summary,
                        size_t& appliedBudgetBytes,
                        size_t& restoredMachineCount,
                        size_t& restoredHistoryEntryCount,
+                       size_t& restoredStatsHistoryEntryCount,
                        String& error) {
     error = "";
     appliedBudgetBytes = brew_history::clampBudgetBytes(summary.requestedBudgetBytes, LittleFS.totalBytes());
     restoredMachineCount = 0;
     restoredHistoryEntryCount = 0;
+    restoredStatsHistoryEntryCount = 0;
 
     savedMachines.clear();
     clearStoredSessionKey();
@@ -4283,6 +4382,7 @@ bool applyBackupBundle(const String& path,
     clearAllStandardRecipeCaches();
     clearAllSavedRecipeCaches();
     clearAllBrewHistory();
+    clearAllStatsHistory();
 
     brew_history::configureBudget(appliedBudgetBytes, LittleFS.totalBytes());
     preferences.putUInt(PREFS_HISTORY_MAX_BYTES, static_cast<uint32_t>(appliedBudgetBytes));
@@ -4297,6 +4397,9 @@ bool applyBackupBundle(const String& path,
     restoredMachineCount = savedMachines.size();
 
     if (!restoreBackupHistoryFromBundle(path, restoredHistoryEntryCount, error)) {
+        return false;
+    }
+    if (!restoreStatsHistoryFromBundle(path, restoredStatsHistoryEntryCount, error)) {
         return false;
     }
     return true;
@@ -5016,6 +5119,7 @@ void handleMachinesReset() {
     clearAllStandardRecipeCaches();
     clearAllSavedRecipeCaches();
     clearAllBrewHistory();
+    clearAllStatsHistory();
     machinePreferences.remove(PREFS_MACHINE_STORE);
     machinePreferences.putUInt(PREFS_MACHINE_SCHEMA, 1);
     DynamicJsonDocument doc(1024);
@@ -5591,6 +5695,107 @@ void handleMachineMyCoffeeDetail(const String& serial, const String& slotText, b
     sendJson(response);
 }
 
+bool appendStatsHistorySnapshot(DynamicJsonDocument& response,
+                                const String& serial,
+                                const String& source,
+                                String& error) {
+    if (!littleFsReady) {
+        return true;
+    }
+
+    const JsonObjectConst values = response["values"].as<JsonObjectConst>();
+    if (values.isNull() || values.size() == 0) {
+        return true;
+    }
+
+    stats_history::AppendResult appendResult;
+    if (!stats_history::recordSnapshotIfChanged(serial,
+                                                values,
+                                                bridge_time::snapshot(),
+                                                millis(),
+                                                source,
+                                                appendResult,
+                                                error)) {
+        return false;
+    }
+
+    JsonObject statsHistory = response.createNestedObject("statsHistory");
+    statsHistory["appended"] = appendResult.appended;
+    statsHistory["baseline"] = appendResult.baseline;
+    statsHistory["changedCount"] = appendResult.changedMetricCount;
+    if (appendResult.hasTotalDelta) {
+        statsHistory["totalDelta"] = appendResult.totalDelta;
+    }
+    return true;
+}
+
+void pollStatsHistoryIfDue() {
+    if (!littleFsReady || savedMachines.empty()) {
+        return;
+    }
+    if ((millis() - lastStatsHistoryPollAtMs) < STATS_HISTORY_POLL_INTERVAL_MS) {
+        return;
+    }
+    if ((client != nullptr && client->isConnected()) || idleScanInProgress || blockingScanInProgress) {
+        return;
+    }
+
+    lastStatsHistoryPollAtMs = millis();
+    const size_t machineCount = savedMachines.size();
+    if (machineCount == 0) {
+        return;
+    }
+
+    for (size_t attempt = 0; attempt < machineCount; ++attempt) {
+        if (statsHistoryPollCursor >= savedMachines.size()) {
+            statsHistoryPollCursor = 0;
+        }
+        SavedMachine& machine = savedMachines[statsHistoryPollCursor];
+        statsHistoryPollCursor = savedMachines.empty() ? 0 : ((statsHistoryPollCursor + 1) % savedMachines.size());
+
+        if (machine.lastSeenAtMs == 0) {
+            continue;
+        }
+
+        const nivona::ModelInfo modelInfo = nivona::detectModelInfo(toNivonaDetails(machine));
+        std::vector<const nivona::RegisterProbe*> metrics;
+        nivona::selectStatsDescriptors(modelInfo, metrics);
+        if (metrics.empty()) {
+            continue;
+        }
+
+        String error;
+        if (!selectSavedMachine(machine, error)) {
+            addLog("stats-history", String("Background poll skipped for ") + machine.serial + ": " + error);
+            continue;
+        }
+
+        DynamicJsonDocument response(32768);
+        if (!runStatsFlowProbe(3000, true, true, DEFAULT_RECONNECT_DELAY_MS, "notify", true, response, error)) {
+            addLog("stats-history", String("Background poll failed for ") + machine.serial + ": " + error);
+            String disconnectError;
+            disconnectFromDevice(disconnectError);
+            return;
+        }
+
+        updateSavedMachineFromCachedDetails(machine);
+        String snapshotError;
+        if (!appendStatsHistorySnapshot(response, machine.serial, "background", snapshotError)) {
+            addLog("stats-history", String("Snapshot write failed for ") + machine.serial + ": " + snapshotError);
+        } else if (response["statsHistory"]["appended"] | false) {
+            const int32_t totalDelta = response["statsHistory"]["totalDelta"] | 0;
+            addLog("stats-history",
+                   String("Stored counter snapshot for ") + machine.serial +
+                       ", changed=" + String(response["statsHistory"]["changedCount"] | 0) +
+                       ", totalDelta=" + totalDelta);
+        }
+
+        String disconnectError;
+        disconnectFromDevice(disconnectError);
+        return;
+    }
+}
+
 void handleMachineStats(const String& serial) {
     SavedMachine* machine = findSavedMachineBySerial(serial);
     if (machine == nullptr) {
@@ -5623,7 +5828,82 @@ void handleMachineStats(const String& serial) {
         sendJson(response, 500);
         return;
     }
+    updateSavedMachineFromCachedDetails(*machine);
+    String snapshotError;
+    if (!appendStatsHistorySnapshot(response, machine->serial, "api-stats", snapshotError)) {
+        response["statsHistoryError"] = snapshotError;
+        addLog("stats-history", String("Stats history append skipped: ") + snapshotError);
+    }
     response["supported"] = true;
+    sendJson(response);
+}
+
+void handleMachineStatsHistory(const String& serial) {
+    SavedMachine* machine = findSavedMachineBySerial(serial);
+    if (machine == nullptr) {
+        sendError(404, "saved machine not found");
+        return;
+    }
+    if (!littleFsReady) {
+        lastError = "LittleFS is unavailable";
+        sendError(503, lastError);
+        return;
+    }
+
+    const int limitArg = server.hasArg("limit") ? server.arg("limit").toInt() : 20;
+    const int offsetArg = server.hasArg("offset") ? server.arg("offset").toInt() : 0;
+    const size_t limit = static_cast<size_t>(std::max(1, std::min(limitArg, 100)));
+    const size_t offset = static_cast<size_t>(std::max(0, offsetArg));
+
+    DynamicJsonDocument response(24576);
+    response["ok"] = true;
+    response["serial"] = machine->serial;
+    JsonArray entries = response.createNestedArray("entries");
+    stats_history::Stats stats;
+    stats_history::Page page;
+    String error;
+    if (!stats_history::loadPage(machine->serial, offset, limit, entries, stats, page, error)) {
+        lastError = error;
+        sendError(500, error);
+        return;
+    }
+
+    response["count"] = stats.entryCount;
+    response["offset"] = page.offset;
+    response["limit"] = page.limit;
+    response["returned"] = page.returned;
+    response["hasOlder"] = page.hasOlder;
+    response["hasNewer"] = page.hasNewer;
+    response["nextOffset"] = page.nextOffset;
+    response["prevOffset"] = page.prevOffset;
+    response["fileBytes"] = stats.fileBytes;
+    response["maxBytes"] = stats.maxBytes;
+    response["skippedEntries"] = stats.skippedEntries;
+    sendJson(response);
+}
+
+void handleMachineStatsHistoryClear(const String& serial) {
+    SavedMachine* machine = findSavedMachineBySerial(serial);
+    if (machine == nullptr) {
+        sendError(404, "saved machine not found");
+        return;
+    }
+    if (!littleFsReady) {
+        lastError = "LittleFS is unavailable";
+        sendError(503, lastError);
+        return;
+    }
+
+    String error;
+    if (!stats_history::clear(machine->serial, error)) {
+        lastError = error;
+        sendError(500, error);
+        return;
+    }
+
+    DynamicJsonDocument response(1024);
+    response["ok"] = true;
+    response["serial"] = machine->serial;
     sendJson(response);
 }
 
@@ -5768,6 +6048,7 @@ void handleMachineDelete(const String& serial) {
             clearStandardRecipeCachesForMachine(it->serial);
             clearSavedRecipeCachesForMachine(it->serial);
             clearBrewHistoryForMachine(it->serial);
+            clearStatsHistoryForMachine(it->serial);
             savedMachines.erase(it);
             persistSavedMachines();
             DynamicJsonDocument response(512);
@@ -5821,6 +6102,14 @@ bool dispatchMachineApiRoute() {
     }
     if (section == "history" && server.method() == HTTP_POST && tail == "import") {
         handleMachineHistoryImport(serial);
+        return true;
+    }
+    if (section == "stats" && server.method() == HTTP_GET && tail == "history") {
+        handleMachineStatsHistory(serial);
+        return true;
+    }
+    if (section == "stats" && server.method() == HTTP_POST && tail == "history/clear") {
+        handleMachineStatsHistoryClear(serial);
         return true;
     }
     if (section == "confirm" && server.method() == HTTP_POST) {
@@ -5980,6 +6269,7 @@ void handleBackupExport() {
     includes["savedMachines"] = true;
     includes["historyBudget"] = true;
     includes["brewHistory"] = littleFsReady;
+    includes["statsHistory"] = littleFsReady;
     includes["wifi"] = false;
     includes["protocolSessions"] = false;
     includes["standardRecipeCaches"] = false;
@@ -6003,26 +6293,46 @@ void handleBackupExport() {
         }
 
         File historyFile = LittleFS.open(brew_history::filePath(machine.serial), "r");
-        if (!historyFile) {
+        if (historyFile) {
+            String historyLine;
+            while (readTextLine(historyFile, historyLine)) {
+                DynamicJsonDocument historyDoc(256);
+                historyDoc["kind"] = "history";
+                historyDoc["serial"] = machine.serial;
+                String historyPrefix;
+                serializeJson(historyDoc, historyPrefix);
+                if (historyPrefix.endsWith("}")) {
+                    historyPrefix.remove(historyPrefix.length() - 1);
+                }
+                server.sendContent(historyPrefix);
+                server.sendContent(",\"entry\":");
+                server.sendContent(historyLine);
+                server.sendContent("}\n");
+            }
+            historyFile.close();
+        }
+
+        File statsHistoryFile = LittleFS.open(stats_history::filePath(machine.serial), "r");
+        if (!statsHistoryFile) {
             continue;
         }
 
-        String historyLine;
-        while (readTextLine(historyFile, historyLine)) {
-            DynamicJsonDocument historyDoc(256);
-            historyDoc["kind"] = "history";
-            historyDoc["serial"] = machine.serial;
-            String historyPrefix;
-            serializeJson(historyDoc, historyPrefix);
-            if (historyPrefix.endsWith("}")) {
-                historyPrefix.remove(historyPrefix.length() - 1);
+        String statsHistoryLine;
+        while (readTextLine(statsHistoryFile, statsHistoryLine)) {
+            DynamicJsonDocument statsHistoryDoc(256);
+            statsHistoryDoc["kind"] = "stats_history";
+            statsHistoryDoc["serial"] = machine.serial;
+            String statsHistoryPrefix;
+            serializeJson(statsHistoryDoc, statsHistoryPrefix);
+            if (statsHistoryPrefix.endsWith("}")) {
+                statsHistoryPrefix.remove(statsHistoryPrefix.length() - 1);
             }
-            server.sendContent(historyPrefix);
+            server.sendContent(statsHistoryPrefix);
             server.sendContent(",\"entry\":");
-            server.sendContent(historyLine);
+            server.sendContent(statsHistoryLine);
             server.sendContent("}\n");
         }
-        historyFile.close();
+        statsHistoryFile.close();
     }
 
     server.sendContent("");
@@ -6070,11 +6380,13 @@ void handleBackupRestoreFinished() {
     size_t appliedBudgetBytes = 0;
     size_t restoredMachineCount = 0;
     size_t restoredHistoryEntryCount = 0;
+    size_t restoredStatsHistoryEntryCount = 0;
     if (!applyBackupBundle(BACKUP_RESTORE_UPLOAD_PATH,
                            summary,
                            appliedBudgetBytes,
                            restoredMachineCount,
                            restoredHistoryEntryCount,
+                           restoredStatsHistoryEntryCount,
                            error)) {
         lastError = error;
         if (LittleFS.exists(BACKUP_RESTORE_UPLOAD_PATH)) {
@@ -6097,6 +6409,7 @@ void handleBackupRestoreFinished() {
     response["appliedBudgetBytes"] = appliedBudgetBytes;
     response["restoredMachineCount"] = restoredMachineCount;
     response["restoredHistoryEntryCount"] = restoredHistoryEntryCount;
+    response["restoredStatsHistoryEntryCount"] = restoredStatsHistoryEntryCount;
     appendStatus(response);
     sendJson(response);
 }
@@ -7293,6 +7606,7 @@ void loop() {
     server.handleClient();
     bridge_time::tick(WiFi.status() == WL_CONNECTED, millis(), addTimeLog);
     finalizeIdleScanIfReady();
+    pollStatsHistoryIfDue();
     if ((client == nullptr || !client->isConnected()) && millis() >= scanSuppressedUntilMs &&
         !idleScanInProgress && !blockingScanInProgress &&
         (millis() - lastIdleScanAtMs) >= IDLE_SCAN_INTERVAL_MS) {
