@@ -14,6 +14,7 @@
 #include <string>
 #include <vector>
 
+#include "bridge_time.h"
 #include "nivona.h"
 #include "web_ui.h"
 
@@ -188,6 +189,10 @@ void addLog(const String& source, const String& message) {
 
 void addHexLog(const String& source, const uint8_t* data, size_t length) {
     addLog(source, hexEncode(data, length));
+}
+
+void addTimeLog(const String& message) {
+    addLog("time", message);
 }
 
 void clearRemoteHandles() {
@@ -1354,6 +1359,8 @@ void connectWifi() {
     } else {
         addLog("wifi", String("Failed to connect to ") + wifiStaSsid + ", AP remains active");
     }
+
+    bridge_time::tick(WiFi.status() == WL_CONNECTED, millis(), addTimeLog);
 }
 
 bool resolveSessionKeyForRequest(const String& sessionHex,
@@ -3628,6 +3635,8 @@ void performScan() {
 }
 
 void appendStatus(JsonDocument& doc) {
+    const bridge_time::StatusSnapshot timeStatus = bridge_time::snapshot();
+
     doc["appName"]       = APP_NAME;
     doc["appVersion"]    = APP_VERSION;
     doc["buildTime"]     = APP_BUILD_TIME;
@@ -3649,6 +3658,12 @@ void appendStatus(JsonDocument& doc) {
     doc["lastHuParseStatus"] = lastHuParseStatus;
     doc["protocolSessionCount"] = protocolSessions.size();
     doc["standardRecipeCacheReady"] = littleFsReady;
+    doc["timeConfigured"] = timeStatus.configured;
+    doc["timeSynced"] = timeStatus.synced;
+    doc["timeLastAttemptMs"] = timeStatus.lastAttemptMs;
+    doc["timeLastSuccessMs"] = timeStatus.lastSuccessMs;
+    doc["timeUnix"] = static_cast<int64_t>(timeStatus.unixTime);
+    doc["timeIsoUtc"] = timeStatus.iso8601Utc;
 
     size_t supportedCount = 0;
     for (const auto& record : scannedDevices) {
@@ -6329,6 +6344,7 @@ void setup() {
 
     preferences.begin(PREFS_WIFI, false);
     machinePreferences.begin(PREFS_MACHINES, false);
+    bridge_time::begin();
     if (!initializeLittleFs(lastError)) {
         addLog("fs", String("Failed to initialize LittleFS: ") + lastError);
     } else {
@@ -6349,6 +6365,7 @@ void setup() {
 
 void loop() {
     server.handleClient();
+    bridge_time::tick(WiFi.status() == WL_CONNECTED, millis(), addTimeLog);
     finalizeIdleScanIfReady();
     if ((client == nullptr || !client->isConnected()) && millis() >= scanSuppressedUntilMs &&
         !idleScanInProgress && !blockingScanInProgress &&
