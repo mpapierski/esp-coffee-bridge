@@ -32,9 +32,9 @@ constexpr uint32_t NOTIFICATION_BATCH_SETTLE_MS = 60;
 constexpr size_t LOG_CAPACITY   = 128;
 constexpr uint16_t TEMP_RECIPE_TYPE_REGISTER = 9001;
 constexpr char STANDARD_RECIPE_CACHE_PREFIX[] = "/stdrec-";
-constexpr uint32_t STANDARD_RECIPE_CACHE_SCHEMA = 1;
+constexpr uint32_t STANDARD_RECIPE_CACHE_SCHEMA = 2;
 constexpr char SAVED_RECIPE_CACHE_PREFIX[] = "/mycoffee-";
-constexpr uint32_t SAVED_RECIPE_CACHE_SCHEMA = 1;
+constexpr uint32_t SAVED_RECIPE_CACHE_SCHEMA = 2;
 
 void rxNotifyCallback(NimBLERemoteCharacteristic* characteristic, uint8_t* data, size_t length, bool isNotify);
 
@@ -1265,15 +1265,12 @@ void appendStandardRecipeDiscovery(JsonObject target,
     }
 
     if (layout.profileOffset != UINT16_MAX) {
-        appendRecipeWritableField(writableFields, "profile");
         appendRecipeWritableField(writableFields, "aroma");
 
-        JsonArray profileOptions = options.createNestedArray("profile");
         JsonArray aromaOptions = options.createNestedArray("aroma");
         const uint8_t maxProfileCode = modelInfo.maxProfileCode <= 4 ? modelInfo.maxProfileCode : 4;
         for (uint8_t code = 0; code <= maxProfileCode; ++code) {
             const String label = recipeProfileLabel(code);
-            appendRecipeOption(profileOptions, code, label, label);
             appendRecipeOption(aromaOptions, code, label, label);
         }
     }
@@ -3887,11 +3884,11 @@ bool appendMyCoffeeSlot(JsonObject target, SavedMachine& machine, uint8_t slotIn
     if (target.containsKey("strength")) {
         target["strengthBeans"] = static_cast<int32_t>(target["strength"].as<int32_t>()) + 1;
     }
-    if (!readOptionalNumeric("profile", "Profile", layout.profileOffset, false, "")) {
+    if (!readOptionalNumeric("aroma", "Aroma", layout.profileOffset, false, "")) {
         return false;
     }
-    if (target.containsKey("profile")) {
-        target["profileLabel"] = recipeProfileLabel(target["profile"].as<int32_t>());
+    if (target.containsKey("aroma")) {
+        target["aromaLabel"] = recipeProfileLabel(target["aroma"].as<int32_t>());
     }
     if (!readOptionalNumeric("temperature", "Temperature", layout.temperatureOffset, false, "")) {
         return false;
@@ -4005,13 +4002,11 @@ bool appendStandardRecipe(JsonObject target, SavedMachine& machine, uint8_t sele
     if (target.containsKey("strength")) {
         target["strengthBeans"] = static_cast<int32_t>(target["strength"].as<int32_t>()) + 1;
     }
-    if (!readOptionalNumeric("profile", "Profile", layout.profileOffset, false, "")) {
+    if (!readOptionalNumeric("aroma", "Aroma", layout.profileOffset, false, "")) {
         return false;
     }
-    if (target.containsKey("profile")) {
-        target["profileLabel"] = recipeProfileLabel(target["profile"].as<int32_t>());
-        target["aroma"] = target["profile"].as<int32_t>();
-        target["aromaLabel"] = target["profileLabel"].as<String>();
+    if (target.containsKey("aroma")) {
+        target["aromaLabel"] = recipeProfileLabel(target["aroma"].as<int32_t>());
     }
     if (!readOptionalNumeric("temperature", "Temperature", layout.temperatureOffset, false, "")) {
         return false;
@@ -4103,33 +4098,18 @@ bool applyStandardRecipeOverrides(JsonObject recipe,
     }
 
     int32_t code = 0;
-    if (!request["profile"].isNull()) {
-        if (!parseRecipeProfileCode(request["profile"], code)) {
-            error = "unsupported profile value";
-            return false;
-        }
-        if (code < 0 || code > maxProfileCode) {
-            error = "profile is not supported for this machine";
-            return false;
-        }
-        setNumericField("profile", code);
-        recipe["profileLabel"] = recipeProfileLabel(code);
-        recipe["aroma"] = code;
-        recipe["aromaLabel"] = recipe["profileLabel"].as<String>();
-    }
     if (!request["aroma"].isNull()) {
         if (!parseRecipeProfileCode(request["aroma"], code)) {
             error = "unsupported aroma value";
             return false;
         }
         if (code < 0 || code > maxProfileCode) {
-            error = "aroma/profile is not supported for this machine";
+            error = "aroma is not supported for this machine";
             return false;
         }
-        setNumericField("profile", code);
-        recipe["profileLabel"] = recipeProfileLabel(code);
+        setNumericField("aroma", code);
         recipe["aroma"] = code;
-        recipe["aromaLabel"] = recipe["profileLabel"].as<String>();
+        recipe["aromaLabel"] = recipeProfileLabel(code);
     }
 
     auto applyTemperature = [&](const char* requestKey, const char* fieldKey, const char* labelKey) -> bool {
@@ -4237,7 +4217,7 @@ bool uploadTemporaryStandardRecipe(const nivona::StandardRecipeLayout& layout,
     };
 
     if (!writeOptionalNumeric("strength", layout.strengthOffset, false) ||
-        !writeOptionalNumeric("profile", layout.profileOffset, false) ||
+        !writeOptionalNumeric("aroma", layout.profileOffset, false) ||
         !writeOptionalNumeric("temperature", layout.temperatureOffset, false) ||
         !writeOptionalNumeric("preparation", layout.preparationOffset, false) ||
         !writeOptionalNumeric("twoCups", layout.twoCupsOffset, false) ||
@@ -4873,20 +4853,17 @@ void handleMachineMyCoffeeDetail(const String& serial, const String& slotText, b
                 return;
             }
         }
-        if (request.containsKey("aroma") && !request.containsKey("profile")) {
-            request["profile"] = request["aroma"];
-        }
-        if (request.containsKey("profile")) {
+        if (request.containsKey("aroma")) {
             int32_t profileCode = 0;
-            if (!parseRecipeProfileCode(request["profile"], profileCode)) {
-                sendError(400, "unsupported profile value");
+            if (!parseRecipeProfileCode(request["aroma"], profileCode)) {
+                sendError(400, "unsupported aroma value");
                 return;
             }
             if (profileCode < 0 || profileCode > maxProfileCode) {
-                sendError(400, "profile is not supported for this machine");
+                sendError(400, "aroma is not supported for this machine");
                 return;
             }
-            request["profile"] = profileCode;
+            request["aroma"] = profileCode;
         }
         const uint16_t baseRegister = nivona::myCoffeeSlotBase(slotIndex);
         if (request.containsKey("name") && layout.nameOffset != UINT16_MAX) {
@@ -4908,7 +4885,7 @@ void handleMachineMyCoffeeDetail(const String& serial, const String& slotText, b
         if (!applyNumericField("icon", layout.iconOffset, false) ||
             !applyNumericField("typeSelector", layout.typeOffset, false) ||
             !applyNumericField("strength", layout.strengthOffset, false) ||
-            !applyNumericField("profile", layout.profileOffset, false) ||
+            !applyNumericField("aroma", layout.profileOffset, false) ||
             !applyNumericField("temperature", layout.temperatureOffset, false) ||
             !applyNumericField("coffeeTemperature", layout.coffeeTemperatureOffset, false) ||
             !applyNumericField("waterTemperature", layout.waterTemperatureOffset, false) ||

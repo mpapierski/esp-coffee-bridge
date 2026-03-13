@@ -1359,7 +1359,7 @@ static const char kPage[] PROGMEM = R"HTML(
     const includeName = options.includeName !== false;
     const includeIcon = options.includeIcon !== false;
     const maxStrengthBeans = Math.max(1, Math.min(5, Number(recipe.maxStrengthBeans || 5)));
-    const availableProfileOptions = PROFILE_OPTIONS.filter((option) => option.value <= Number(recipe.maxProfileCode ?? 4));
+    const availableAromaOptions = PROFILE_OPTIONS.filter((option) => option.value <= Number(recipe.maxProfileCode ?? 4));
     const pushSelect = (name, title, options, current) => {
       if (recipe[name] === undefined) {
         return;
@@ -1413,7 +1413,7 @@ static const char kPage[] PROGMEM = R"HTML(
       `);
     }
 
-    pushSelect("profile", "Profile", availableProfileOptions, recipe.profile);
+    pushSelect("aroma", "Aroma", availableAromaOptions, recipe.aroma);
     pushSelect("temperature", "Temperature", TEMPERATURE_OPTIONS, recipe.temperature);
     pushSelect("coffeeTemperature", "Coffee temperature", TEMPERATURE_OPTIONS, recipe.coffeeTemperature);
     pushSelect("waterTemperature", "Water temperature", TEMPERATURE_OPTIONS, recipe.waterTemperature);
@@ -1507,7 +1507,7 @@ static const char kPage[] PROGMEM = R"HTML(
               <div class="value-item"><span>Selector</span><span>${escapeHtml(String(recipe.selector ?? selector))}</span></div>
               <div class="value-item"><span>Source</span><span>${escapeHtml(sourceLabel)}</span></div>
               <div class="value-item"><span>Strength</span><span>${escapeHtml(recipe.strengthBeans ? `${recipe.strengthBeans} beans` : "-")}</span></div>
-              <div class="value-item"><span>Profile</span><span>${escapeHtml(recipe.profileLabel || "-")}</span></div>
+              <div class="value-item"><span>Aroma</span><span>${escapeHtml(recipe.aromaLabel || "-")}</span></div>
               <div class="value-item"><span>Temperature</span><span>${escapeHtml(recipe.temperatureLabel || recipe.coffeeTemperatureLabel || "-")}</span></div>
               <div class="value-item"><span>Size</span><span>${escapeHtml(recipe.coffeeAmountMl ?? recipe.waterAmountMl ?? "-")}${recipe.coffeeAmountMl !== undefined || recipe.waterAmountMl !== undefined ? " ml" : ""}</span></div>
             </div>

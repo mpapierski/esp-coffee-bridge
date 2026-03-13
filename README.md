@@ -50,7 +50,7 @@ The intended workflow is:
 - `Add machine flow`: scans nearby BLE devices, highlights likely supported coffee machines, probes a device before saving it, and also supports manual offline add by BLE address, serial number, and optional model.
 - `Live machine summary`: shows current status summary, process label/code, operator message label/code, progress, and whether the APK-backed `HY` host-confirm path is currently suggested.
 - `Standard drinks`: lists the built-in drink selectors, supports quick brew, and opens a per-drink customization view.
-- `Temporary brew customization`: refreshes current standard drink values from the machine, can warm the full standard-drink cache from the machine, and sends temporary overrides such as strength, profile/aroma, temperature, cup mode, and amount fields without overwriting the machine's saved recipe.
+- `Temporary brew customization`: refreshes current standard drink values from the machine, can warm the full standard-drink cache from the machine, and sends temporary overrides such as strength, aroma, temperature, cup mode, and amount fields without overwriting the machine's saved recipe.
 - `MyCoffee / saved recipes`: stores saved custom recipe snapshots in LittleFS too, exposes explicit refresh buttons, shows recipe details, and edits persisted custom recipes where the machine family supports them.
 - `Statistics`: reads beverage counters, maintenance counters, and serial or firmware details.
 - `Settings`: reads supported machine settings, writes updated values, and exposes factory reset actions for settings and recipe defaults.
@@ -134,7 +134,7 @@ That skill teaches the agent to:
 - read beverage counters with `GET /api/machines/{serial}/stats`
 - issue temporary brew commands with `POST /api/machines/{serial}/brew`
 
-Because it uses the bridge's live `writableFields` and `options` data, the agent can stay inside model-specific limits instead of guessing bean counts, profile codes, or temperature options. The skill also checks `/summary` first and avoids brewing when the machine is offline, busy, or reporting a non-zero operator message.
+Because it uses the bridge's live `writableFields` and `options` data, the agent can stay inside model-specific limits instead of guessing bean counts, aroma codes, or temperature options. The skill also checks `/summary` first and avoids brewing when the machine is offline, busy, or reporting a non-zero operator message.
 
 Example prompts:
 
@@ -170,7 +170,7 @@ Temporary overrides issued through `/brew` only apply to the started drink. They
 - `GET /api/machines/{serial}/recipes`
 - `GET /api/machines/{serial}/recipes/{selector}`
   - add `?refresh=1` to force a live reread from the machine; otherwise the bridge may serve the LittleFS-backed cached snapshot
-  - the `recipe` object now includes `writableFields` and enumerated `options` for machine-capped fields like `strength`, `strengthBeans`, `profile`/`aroma`, `temperature`, and `twoCups`
+  - the `recipe` object now includes `writableFields` and enumerated `options` for machine-capped fields like `strength`, `strengthBeans`, `aroma`, `temperature`, and `twoCups`
 - `POST /api/machines/{serial}/recipes/refresh`
   - warms or refreshes the cached detail snapshots for all standard drinks on that machine in one live session
 - `POST /api/machines/{serial}/brew`

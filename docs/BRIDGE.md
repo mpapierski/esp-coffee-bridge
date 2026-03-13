@@ -26,7 +26,7 @@ Current embedded bridge UI is now organized around remembered machines rather th
     - current bridge UI uses this for the standard-drink "Customize" page
     - the returned `recipe` object now also carries:
       - `writableFields`: bridge-accepted override keys for `/brew`
-      - `options`: enumerated option lists for machine-capped discrete fields such as `strength`, `strengthBeans`, `profile`, `aroma`, `temperature`, and `twoCups`
+      - `options`: enumerated option lists for machine-capped discrete fields such as `strength`, `strengthBeans`, `aroma`, `temperature`, and `twoCups`
   - `POST /api/machines/{serial}/recipes/refresh`
     - opens one live session, rereads all supported standard drink definitions, and rewrites the per-machine standard-recipe LittleFS cache in one pass
   - `POST /api/machines/{serial}/brew`
@@ -34,8 +34,7 @@ Current embedded bridge UI is now organized around remembered machines rather th
     - supported override fields:
       - `strength`
       - `strengthBeans`
-      - `profile`
-      - `aroma` alias for `profile`
+      - `aroma`
       - `temperature`
       - `coffeeTemperature`
       - `waterTemperature`
@@ -50,7 +49,7 @@ Current embedded bridge UI is now organized around remembered machines rather th
       - `milkFoamAmountMl`
       - `sizeMl` alias
     - recipe editors and writes are capability-gated by detected model
-      - example: `NICR 756` is capped to `3` beans and profile codes `dynamic`, `constant`, `intense`, `individual`
+      - example: `NICR 756` is capped to `3` beans and aroma codes `dynamic`, `constant`, `intense`, `individual`
     - those overrides are temporary for the started brew; they do not overwrite persistent `MyCoffee` slots
   - `POST /api/machines/{serial}/confirm`
     - sends the APK-backed `HY` host-confirmation command with the current machine-scoped live session
@@ -142,7 +141,7 @@ Current firmware behavior:
   - `temperature`: enum, example values `normal`, `high`, `max`, `individual`
   - `off_rinse`: boolean enum, example values `off`, `on`
   - `auto_off`: duration enum, example values `10 min`, `4 h`, `off`
-  - `profile`: aroma/profile enum, example values `dynamic`, `constant`, `intense`, `individual`
+  - `profile`: settings enum, example values `dynamic`, `constant`, `intense`, `individual`
 - `stats-probe`
   - beverage counts:
     - `espresso`, `coffee`, `cappuccino`, `frothy_milk`, `hot_water`, `my_coffee`
@@ -158,7 +157,7 @@ Current firmware behavior:
   - `temperature`: enum, live-verified example on model `756` = `individual`
   - `off_rinse`: boolean enum, live-verified example on model `756` = `on`
   - `auto_off`: duration enum, live-verified example on model `756` = `4 h`
-  - `profile`: aroma/profile enum, live-verified example on model `756` = `intense`
+  - `profile`: settings enum, live-verified example on model `756` = `intense`
   - `79x` models omit `off_rinse`
 - `stats-probe`
   - beverage counts:
@@ -201,7 +200,7 @@ Current firmware behavior:
   - `water_hardness`: enum, example values `soft`, `medium`, `hard`, `very hard`
   - `off_rinse`: boolean enum, example values `off`, `on`
   - `auto_off`: duration enum, example values `10 min`, `4 h`, `off`
-  - `profile`: aroma/profile enum, example values `dynamic`, `constant`, `intense`, `individual`
+  - `profile`: settings enum, example values `dynamic`, `constant`, `intense`, `individual`
   - `coffee_temperature`: enum, example values `normal`, `high`, `max`, `individual`
   - `water_temperature`: enum, example values `normal`, `high`, `max`, `individual`
   - `milk_temperature`: enum, example values `high`, `max`, `individual`
