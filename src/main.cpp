@@ -14,6 +14,7 @@
 #include <string>
 #include <vector>
 
+#include "brew_history.h"
 #include "bridge_time.h"
 #include "nivona.h"
 #include "web_ui.h"
@@ -31,6 +32,7 @@ constexpr uint32_t HTTP_TIMEOUT = 10000;
 constexpr uint32_t DEFAULT_RECONNECT_DELAY_MS = 750;
 constexpr uint32_t NOTIFICATION_BATCH_SETTLE_MS = 60;
 constexpr size_t LOG_CAPACITY   = 128;
+constexpr size_t BREW_HISTORY_PRECHECK_RESERVE_BYTES = 448;
 constexpr uint16_t TEMP_RECIPE_TYPE_REGISTER = 9001;
 constexpr char STANDARD_RECIPE_CACHE_PREFIX[] = "/stdrec-";
 constexpr uint32_t STANDARD_RECIPE_CACHE_SCHEMA = 2;
@@ -42,6 +44,7 @@ void rxNotifyCallback(NimBLERemoteCharacteristic* characteristic, uint8_t* data,
 constexpr char PREFS_WIFI[] = "wifi";
 constexpr char PREFS_SSID[] = "ssid";
 constexpr char PREFS_PASS[] = "pass";
+constexpr char PREFS_HISTORY_MAX_BYTES[] = "hist_max";
 constexpr char PREFS_MACHINES[] = "machines";
 constexpr char PREFS_MACHINE_STORE[] = "store";
 constexpr char PREFS_MACHINE_SCHEMA[] = "schema";
@@ -484,6 +487,30 @@ bool parseRefreshArg() {
     return !(rawValue.isEmpty() || rawValue == "0" || rawValue.equalsIgnoreCase("false") || rawValue.equalsIgnoreCase("no"));
 }
 
+size_t parseLimitArg(const char* name, size_t defaultValue, size_t maxValue) {
+    if (!server.hasArg(name)) {
+        return defaultValue;
+    }
+    const String rawValue = server.arg(name);
+    const long parsedValue = rawValue.toInt();
+    if (parsedValue <= 0) {
+        return defaultValue;
+    }
+    return std::min(static_cast<size_t>(parsedValue), maxValue);
+}
+
+size_t parseOffsetArg(const char* name, size_t defaultValue) {
+    if (!server.hasArg(name)) {
+        return defaultValue;
+    }
+    const String rawValue = server.arg(name);
+    const long parsedValue = rawValue.toInt();
+    if (parsedValue < 0) {
+        return defaultValue;
+    }
+    return static_cast<size_t>(parsedValue);
+}
+
 bool initializeLittleFs(String& error) {
     if (littleFsReady) {
         return true;
@@ -494,6 +521,17 @@ bool initializeLittleFs(String& error) {
     }
     error = "failed to mount LittleFS";
     return false;
+}
+
+void configureHistoryBudget() {
+    const size_t upperBytes = littleFsReady ? LittleFS.totalBytes() : brew_history::DEFAULT_HISTORY_BYTES;
+    const size_t storedBytes = static_cast<size_t>(preferences.getUInt(PREFS_HISTORY_MAX_BYTES,
+                                                                       static_cast<uint32_t>(brew_history::DEFAULT_HISTORY_BYTES)));
+    const size_t configuredBytes = brew_history::clampBudgetBytes(storedBytes, upperBytes);
+    brew_history::configureBudget(configuredBytes, upperBytes);
+    if (configuredBytes != storedBytes) {
+        preferences.putUInt(PREFS_HISTORY_MAX_BYTES, static_cast<uint32_t>(configuredBytes));
+    }
 }
 
 void clearStandardRecipeCachesByPrefix(const String& prefix) {
@@ -538,6 +576,26 @@ void clearAllSavedRecipeCaches() {
         return;
     }
     clearStandardRecipeCachesByPrefix(String(SAVED_RECIPE_CACHE_PREFIX));
+}
+
+void clearBrewHistoryForMachine(const String& serial) {
+    if (!littleFsReady || serial.isEmpty()) {
+        return;
+    }
+    String error;
+    if (!brew_history::clear(serial, error) && !error.isEmpty()) {
+        addLog("history", String("Brew history clear skipped: ") + error);
+    }
+}
+
+void clearAllBrewHistory() {
+    if (!littleFsReady) {
+        return;
+    }
+    String error;
+    if (!brew_history::clearAll(error) && !error.isEmpty()) {
+        addLog("history", String("Brew history reset skipped: ") + error);
+    }
 }
 
 bool loadStandardRecipeCache(const SavedMachine& machine,
@@ -3636,6 +3694,8 @@ void performScan() {
 
 void appendStatus(JsonDocument& doc) {
     const bridge_time::StatusSnapshot timeStatus = bridge_time::snapshot();
+    const size_t littleFsTotalBytes = littleFsReady ? LittleFS.totalBytes() : 0;
+    const size_t littleFsUsedBytes = littleFsReady ? LittleFS.usedBytes() : 0;
 
     doc["appName"]       = APP_NAME;
     doc["appVersion"]    = APP_VERSION;
@@ -3658,6 +3718,9 @@ void appendStatus(JsonDocument& doc) {
     doc["lastHuParseStatus"] = lastHuParseStatus;
     doc["protocolSessionCount"] = protocolSessions.size();
     doc["standardRecipeCacheReady"] = littleFsReady;
+    doc["littleFsReady"] = littleFsReady;
+    doc["littleFsTotalBytes"] = littleFsTotalBytes;
+    doc["littleFsUsedBytes"] = littleFsUsedBytes;
     doc["timeConfigured"] = timeStatus.configured;
     doc["timeSynced"] = timeStatus.synced;
     doc["timeLastAttemptMs"] = timeStatus.lastAttemptMs;
@@ -3680,6 +3743,25 @@ void appendStatus(JsonDocument& doc) {
     doc["lastScanAtMs"]     = lastScanAtMs;
     doc["scanInProgress"]   = idleScanInProgress || blockingScanInProgress;
     doc["idleScanInProgress"] = idleScanInProgress;
+
+    JsonObject historyStorage = doc.createNestedObject("historyStorage");
+    historyStorage["budgetBytes"] = brew_history::budgetBytes();
+    historyStorage["budgetMinBytes"] = brew_history::budgetMinBytes();
+    historyStorage["budgetUpperBytes"] = brew_history::budgetUpperBytes();
+    historyStorage["defaultBudgetBytes"] = brew_history::DEFAULT_HISTORY_BYTES;
+    if (littleFsReady) {
+        brew_history::StorageStats historyStats;
+        String historyError;
+        if (brew_history::collectStorageStats(historyStats, historyError)) {
+            historyStorage["fileCount"] = historyStats.fileCount;
+            historyStorage["totalBytes"] = historyStats.totalBytes;
+        } else if (!historyError.isEmpty()) {
+            historyStorage["error"] = historyError;
+        }
+    } else {
+        historyStorage["fileCount"] = 0;
+        historyStorage["totalBytes"] = 0;
+    }
 
     if (client != nullptr) {
         doc["clientCreated"] = true;
@@ -4251,6 +4333,111 @@ bool uploadTemporaryStandardRecipe(const nivona::StandardRecipeLayout& layout,
     return writeMachineNumericRegister(TEMP_RECIPE_TYPE_REGISTER, selector, error);
 }
 
+void handleMachineHistory(const String& serial) {
+    SavedMachine* machine = findSavedMachineBySerial(serial);
+    if (machine == nullptr) {
+        sendError(404, "saved machine not found");
+        return;
+    }
+
+    const size_t limit = parseLimitArg("limit", 40, 100);
+    const size_t offset = parseOffsetArg("offset", 0);
+    DynamicJsonDocument response(65536);
+    brew_history::Stats stats;
+    brew_history::Page page;
+    String error;
+
+    response["ok"] = true;
+    response["serial"] = machine->serial;
+    response["alias"] = machine->alias;
+    response["familyKey"] = machine->familyKey;
+    JsonArray entries = response.createNestedArray("entries");
+    if (!brew_history::loadPage(machine->serial, offset, limit, entries, stats, page, error)) {
+        lastError = error;
+        sendError(500, error);
+        return;
+    }
+
+    response["count"] = stats.entryCount;
+    response["returned"] = entries.size();
+    response["fileBytes"] = stats.fileBytes;
+    response["maxBytes"] = stats.maxBytes;
+    response["skippedEntries"] = stats.skippedEntries;
+    response["offset"] = page.offset;
+    response["limit"] = page.limit;
+    response["hasOlder"] = page.hasOlder;
+    response["hasNewer"] = page.hasNewer;
+    response["nextOffset"] = page.nextOffset;
+    response["prevOffset"] = page.prevOffset;
+    appendStatus(response);
+    sendJson(response);
+}
+
+void handleMachineHistoryClear(const String& serial) {
+    SavedMachine* machine = findSavedMachineBySerial(serial);
+    if (machine == nullptr) {
+        sendError(404, "saved machine not found");
+        return;
+    }
+
+    String error;
+    if (!brew_history::clear(machine->serial, error)) {
+        lastError = error;
+        sendError(500, error);
+        return;
+    }
+
+    DynamicJsonDocument response(2048);
+    response["ok"] = true;
+    response["serial"] = machine->serial;
+    response["count"] = 0;
+    response["fileBytes"] = 0;
+    response["maxBytes"] = brew_history::budgetBytes();
+    appendStatus(response);
+    sendJson(response);
+}
+
+void handleMachineHistoryImport(const String& serial) {
+    SavedMachine* machine = findSavedMachineBySerial(serial);
+    if (machine == nullptr) {
+        sendError(404, "saved machine not found");
+        return;
+    }
+    if (!littleFsReady) {
+        lastError = "LittleFS is unavailable";
+        sendError(503, lastError);
+        return;
+    }
+
+    DynamicJsonDocument requestDoc(65536);
+    String error;
+    if (!parseJsonBody(requestDoc, error)) {
+        sendError(400, error);
+        return;
+    }
+
+    std::vector<String> importedLines;
+    size_t importedCount = 0;
+    if (!brew_history::buildImportedLines(requestDoc.as<JsonVariantConst>(), importedLines, importedCount, error)) {
+        sendError(400, error);
+        return;
+    }
+    if (!brew_history::appendSerializedLines(machine->serial, importedLines, error)) {
+        lastError = error;
+        sendError(500, error);
+        return;
+    }
+
+    DynamicJsonDocument response(2048);
+    response["ok"] = true;
+    response["serial"] = machine->serial;
+    response["alias"] = machine->alias;
+    response["imported"] = importedCount;
+    response["maxBytes"] = brew_history::budgetBytes();
+    appendStatus(response);
+    sendJson(response);
+}
+
 void handleMachinesList() {
     refreshAllSavedMachinePresence();
     DynamicJsonDocument doc(16384);
@@ -4424,6 +4611,7 @@ void handleMachinesReset() {
     clearStoredSessionKey();
     clearAllStandardRecipeCaches();
     clearAllSavedRecipeCaches();
+    clearAllBrewHistory();
     machinePreferences.remove(PREFS_MACHINE_STORE);
     machinePreferences.putUInt(PREFS_MACHINE_SCHEMA, 1);
     DynamicJsonDocument doc(1024);
@@ -4654,6 +4842,43 @@ void handleMachineBrew(const String& serial) {
         return;
     }
     JsonObjectConst recipeView = recipe;
+
+    if (littleFsReady) {
+        DynamicJsonDocument historyPreflightDoc(3072);
+        JsonObject historyPreflightEntry = historyPreflightDoc.to<JsonObject>();
+        brew_history::buildAcceptedEntry(request.as<JsonVariantConst>(),
+                                         recipeView,
+                                         nivona::ProcessStatus{},
+                                         "",
+                                         bridge_time::snapshot(),
+                                         millis(),
+                                         historyPreflightEntry);
+        brew_history::CapacityCheck capacity;
+        if (!brew_history::canAppendWithoutCompaction(machine->serial,
+                                                      historyPreflightEntry,
+                                                      BREW_HISTORY_PRECHECK_RESERVE_BYTES,
+                                                      capacity,
+                                                      error)) {
+            if (error.isEmpty()) {
+                DynamicJsonDocument response(2048);
+                response["ok"] = false;
+                response["error"] = "brew history storage is full; clear or export history before brewing again";
+                response["historyStorageRejected"] = true;
+                response["historyFileBytes"] = capacity.fileBytes;
+                response["historyEntryBytes"] = capacity.entryBytes;
+                response["historyReserveBytes"] = capacity.reserveBytes;
+                response["historyProjectedBytes"] = capacity.projectedBytes;
+                response["historyMaxBytes"] = capacity.maxBytes;
+                appendStatus(response);
+                sendJson(response, 507);
+                return;
+            }
+            lastError = error;
+            sendError(500, error);
+            return;
+        }
+    }
+
     if (!uploadTemporaryStandardRecipe(layout, recipeView, static_cast<uint8_t>(selector), error)) {
         lastError = error;
         sendError(500, error);
@@ -4675,7 +4900,7 @@ void handleMachineBrew(const String& serial) {
     String processError;
     readMachineProcessStatus(processStatus, processError);
 
-    DynamicJsonDocument response(4096);
+    DynamicJsonDocument response(8192);
     response["ok"] = true;
     response["selector"] = selector;
     response["temporaryRecipeUploaded"] = true;
@@ -4683,6 +4908,30 @@ void handleMachineBrew(const String& serial) {
     recipeResponse.set(recipe);
     JsonObject status = response.createNestedObject("status");
     appendProcessStatusJson(status, processStatus, processError);
+    DynamicJsonDocument historyDoc(4096);
+    JsonObject historyEntry = historyDoc.to<JsonObject>();
+    brew_history::buildAcceptedEntry(request.as<JsonVariantConst>(),
+                                     recipeView,
+                                     processStatus,
+                                     processError,
+                                     bridge_time::snapshot(),
+                                     millis(),
+                                     historyEntry);
+    String historyError;
+    const bool historyLogged = littleFsReady && brew_history::append(machine->serial, historyEntry, historyError);
+    response["historyLogged"] = historyLogged;
+    JsonObject history = response.createNestedObject("history");
+    history["recipeFingerprint"] = historyEntry["recipeFingerprint"] | "";
+    history["timeSynced"] = historyEntry["timeSynced"] | false;
+    history["timeUnix"] = historyEntry["timeUnix"] | static_cast<int64_t>(0);
+    history["timeIsoUtc"] = historyEntry["timeIsoUtc"] | "";
+    if (!historyLogged) {
+        if (historyError.isEmpty() && !littleFsReady) {
+            historyError = "LittleFS is unavailable";
+        }
+        response["historyError"] = historyError;
+        addLog("history", String("Brew history append skipped: ") + historyError);
+    }
     appendStatus(response);
     sendJson(response);
 }
@@ -5114,6 +5363,7 @@ void handleMachineDelete(const String& serial) {
             clearStoredSessionKey(it->serial, it->address);
             clearStandardRecipeCachesForMachine(it->serial);
             clearSavedRecipeCachesForMachine(it->serial);
+            clearBrewHistoryForMachine(it->serial);
             savedMachines.erase(it);
             persistSavedMachines();
             DynamicJsonDocument response(512);
@@ -5157,6 +5407,18 @@ bool dispatchMachineApiRoute() {
         handleMachineBrew(serial);
         return true;
     }
+    if (section == "history" && server.method() == HTTP_GET && tail.isEmpty()) {
+        handleMachineHistory(serial);
+        return true;
+    }
+    if (section == "history" && server.method() == HTTP_POST && tail == "clear") {
+        handleMachineHistoryClear(serial);
+        return true;
+    }
+    if (section == "history" && server.method() == HTTP_POST && tail == "import") {
+        handleMachineHistoryImport(serial);
+        return true;
+    }
     if (section == "confirm" && server.method() == HTTP_POST) {
         handleMachineConfirm(serial);
         return true;
@@ -5190,7 +5452,7 @@ void handleRoot() {
 }
 
 void handleStatus() {
-    DynamicJsonDocument doc(4096);
+    DynamicJsonDocument doc(6144);
     doc["ok"] = true;
     appendStatus(doc);
     sendJson(doc);
@@ -5245,6 +5507,44 @@ void handleWifiSave() {
 
     DynamicJsonDocument response(2048);
     response["ok"] = true;
+    appendStatus(response);
+    sendJson(response);
+}
+
+void handleHistoryConfigSave() {
+    DynamicJsonDocument request(1024);
+    String error;
+    if (!parseJsonBody(request, error)) {
+        sendError(400, error);
+        return;
+    }
+    if (!littleFsReady) {
+        lastError = "LittleFS is unavailable";
+        sendError(503, lastError);
+        return;
+    }
+
+    const uint32_t requestedBytes = request["budgetBytes"] | 0U;
+    if (requestedBytes == 0U) {
+        sendError(400, "budgetBytes is required");
+        return;
+    }
+
+    const size_t appliedBytes = brew_history::clampBudgetBytes(requestedBytes, LittleFS.totalBytes());
+    brew_history::configureBudget(appliedBytes, LittleFS.totalBytes());
+    preferences.putUInt(PREFS_HISTORY_MAX_BYTES, static_cast<uint32_t>(appliedBytes));
+
+    String enforceError;
+    if (!brew_history::enforceBudget(enforceError)) {
+        lastError = enforceError;
+        sendError(500, enforceError);
+        return;
+    }
+
+    DynamicJsonDocument response(4096);
+    response["ok"] = true;
+    response["requestedBudgetBytes"] = requestedBytes;
+    response["budgetBytes"] = appliedBytes;
     appendStatus(response);
     sendJson(response);
 }
@@ -6291,6 +6591,7 @@ void registerRoutes() {
     server.on("/api/machines/reset", HTTP_POST, handleMachinesReset);
 
     server.on("/api/wifi/save", HTTP_POST, handleWifiSave);
+    server.on("/api/history/config", HTTP_POST, handleHistoryConfigSave);
     server.on("/api/scan", HTTP_POST, handleScan);
     server.on("/api/connect", HTTP_POST, handleConnect);
     server.on("/api/disconnect", HTTP_POST, handleDisconnect);
@@ -6349,6 +6650,13 @@ void setup() {
         addLog("fs", String("Failed to initialize LittleFS: ") + lastError);
     } else {
         addLog("fs", "LittleFS ready");
+    }
+    configureHistoryBudget();
+    if (littleFsReady) {
+        String historyBudgetError;
+        if (!brew_history::enforceBudget(historyBudgetError) && !historyBudgetError.isEmpty()) {
+            addLog("history", String("History budget enforcement skipped: ") + historyBudgetError);
+        }
     }
     loadSavedMachines();
     connectWifi();

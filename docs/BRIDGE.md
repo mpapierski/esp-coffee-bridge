@@ -31,6 +31,14 @@ Current embedded bridge UI is now organized around remembered machines rather th
     - opens one live session, rereads all supported standard drink definitions, and rewrites the per-machine standard-recipe LittleFS cache in one pass
   - `POST /api/machines/{serial}/brew`
     - current implementation first reads the live standard recipe, applies request overrides, uploads a temporary recipe snapshot into the machine scratch namespace, and only then sends the standard selector-based `HE` payload
+    - successful accepted brews are appended to a bounded per-machine JSONL history in LittleFS
+    - the per-machine history budget is runtime-configurable from the system page and persisted in controller preferences
+    - optional request metadata fields:
+      - `source`
+      - `actor`
+      - `label`
+      - `note`
+      - `correlationId`
     - supported override fields:
       - `strength`
       - `strengthBeans`
@@ -51,6 +59,20 @@ Current embedded bridge UI is now organized around remembered machines rather th
     - recipe editors and writes are capability-gated by detected model
       - example: `NICR 756` is capped to `3` beans and aroma codes `dynamic`, `constant`, `intense`, `individual`
     - those overrides are temporary for the started brew; they do not overwrite persistent `MyCoffee` slots
+    - if the next history entry would overflow the fixed per-machine history budget, the bridge rejects the brew before dispatch instead of compacting away older history
+  - `GET /api/machines/{serial}/history`
+    - returns newest brew log entries first
+    - supports optional `limit` and `offset` query parameters for pagination from newest to oldest
+    - each entry stores the final applied compact recipe snapshot plus a stable recipe fingerprint and UTC timestamp when NTP is synced
+  - `POST /api/machines/{serial}/history/import`
+    - accepts a single entry object, `{ "entry": { ... } }`, or `{ "entries": [ ... ] }`
+    - recomputes `recipeFingerprint` on the bridge from the imported `recipe` object instead of trusting caller input
+    - stores only the compact supported recipe fields in the persisted history entry
+  - `POST /api/history/config`
+    - updates the runtime per-machine brew-history budget in bytes
+    - clamps the cap between the configured minimum and the mounted LittleFS size
+    - compacts existing history files immediately if the new cap is lower than the current file size
+  - `POST /api/machines/{serial}/history/clear`
   - `POST /api/machines/{serial}/confirm`
     - sends the APK-backed `HY` host-confirmation command with the current machine-scoped live session
     - intended for machine-driven prompts during a workflow, such as flush-required or move-cup prompts

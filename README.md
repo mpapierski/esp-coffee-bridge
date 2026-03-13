@@ -51,11 +51,12 @@ The intended workflow is:
 - `Live machine summary`: shows current status summary, process label/code, operator message label/code, progress, and whether the APK-backed `HY` host-confirm path is currently suggested.
 - `Standard drinks`: lists the built-in drink selectors, supports quick brew, and opens a per-drink customization view.
 - `Temporary brew customization`: refreshes current standard drink values from the machine, can warm the full standard-drink cache from the machine, and sends temporary overrides such as strength, aroma, temperature, cup mode, and amount fields without overwriting the machine's saved recipe.
+- `Brew history`: stores a bounded per-machine history in LittleFS with the final applied recipe snapshot, a stable recipe fingerprint, optional source or actor metadata, UTC timestamps when NTP is available, and a runtime-adjustable cap from the system page.
 - `MyCoffee / saved recipes`: stores saved custom recipe snapshots in LittleFS too, exposes explicit refresh buttons, shows recipe details, and edits persisted custom recipes where the machine family supports them.
 - `Statistics`: reads beverage counters, maintenance counters, and serial or firmware details.
 - `Settings`: reads supported machine settings, writes updated values, and exposes factory reset actions for settings and recipe defaults.
 - `Diagnostics`: manages cached session keys, raw characteristic reads and writes, encrypted frame send, app-style probes, settings probe, stats probe, bridge logs, and the last raw diagnostics response.
-- `Bridge admin`: saves Wi-Fi credentials, uploads OTA firmware, reboots the bridge, resets the remembered-machine store, and exposes raw bridge status.
+- `Bridge admin`: saves Wi-Fi credentials, adjusts the brew-history cap, uploads OTA firmware, reboots the bridge, resets the remembered-machine store, and exposes raw bridge status.
 
 ## Build
 
@@ -174,6 +175,20 @@ Temporary overrides issued through `/brew` only apply to the started drink. They
 - `POST /api/machines/{serial}/recipes/refresh`
   - warms or refreshes the cached detail snapshots for all standard drinks on that machine in one live session
 - `POST /api/machines/{serial}/brew`
+  - accepts optional metadata fields such as `source`, `actor`, `label`, `note`, and `correlationId`
+  - successful accepted brews are appended to the bounded per-machine LittleFS history log
+  - if the next history entry would overflow that fixed per-machine history budget, the bridge rejects the brew before dispatch instead of evicting older history
+- `GET /api/machines/{serial}/history`
+  - returns the newest stored brew entries first
+  - optional `?limit=20&offset=40` style query supports pagination from newest to oldest
+- `POST /api/machines/{serial}/history/import`
+  - accepts either a single entry object, an `{ "entry": { ... } }` body, or an `{ "entries": [ ... ] }` batch
+  - recomputes `recipeFingerprint` server-side from the submitted compacted `recipe` snapshot and ignores any caller-supplied fingerprint
+- `POST /api/machines/{serial}/history/clear`
+- `POST /api/history/config`
+  - updates the runtime per-machine brew-history cap in bytes
+  - clamps the requested value between the configured minimum and the mounted LittleFS size
+  - compacts existing history files immediately if you lower the cap
 - `POST /api/machines/{serial}/confirm`
   - sends the APK-backed `HY` host-confirmation command for the selected machine
 - `GET /api/machines/{serial}/mycoffee`

@@ -623,6 +623,7 @@ static const char kPage[] PROGMEM = R"HTML(
   ];
 
   const PROTOCOL_API = "/api/protocol";
+  const HISTORY_PAGE_SIZE = 20;
 
   const state = {
     flash: { message: "Loading bridge status…", kind: "" },
@@ -775,6 +776,23 @@ static const char kPage[] PROGMEM = R"HTML(
     }
     const hours = Math.round(minutes / 60);
     return `${hours}h ago`;
+  }
+
+  function formatBytes(bytes) {
+    const value = Math.max(0, Number(bytes || 0));
+    if (value >= 1024 * 1024) {
+      return `${(value / (1024 * 1024)).toFixed(value >= 10 * 1024 * 1024 ? 0 : 1)} MiB`;
+    }
+    if (value >= 1024) {
+      return `${(value / 1024).toFixed(value >= 10 * 1024 ? 0 : 1)} KiB`;
+    }
+    return `${Math.round(value)} B`;
+  }
+
+  function percentOf(value, max) {
+    const numerator = Math.max(0, Number(value || 0));
+    const denominator = Math.max(1, Number(max || 0));
+    return Math.max(0, Math.min(100, (numerator / denominator) * 100));
   }
 
   function machinePresenceBadge(machine) {
@@ -933,6 +951,19 @@ static const char kPage[] PROGMEM = R"HTML(
     }
     cache.settings = await api(`/api/machines/${encodeURIComponent(serial)}/settings`);
     return cache.settings;
+  }
+
+  async function loadMachineHistory(serial, force = false, offsetOverride = null) {
+    const cache = getMachineCache(serial);
+    const offset = Math.max(0, Number(offsetOverride ?? cache.historyOffset ?? 0));
+    if (!force && cache.history && Number(cache.history.offset || 0) === offset &&
+        Number(cache.history.limit || HISTORY_PAGE_SIZE) === HISTORY_PAGE_SIZE) {
+      return cache.history;
+    }
+    cache.historyOffset = offset;
+    cache.history = await api(`/api/machines/${encodeURIComponent(serial)}/history?limit=${HISTORY_PAGE_SIZE}&offset=${offset}`);
+    cache.historyOffset = Number(cache.history?.offset || 0);
+    return cache.history;
   }
 
   function invalidateMachine(serial) {
@@ -1253,6 +1284,7 @@ static const char kPage[] PROGMEM = R"HTML(
         <div class="subnav">
           <a class="${currentSection === "recipes" ? "active" : ""}" href="${machineHref(machine.serial, "recipes")}">Coffee recipes</a>
           <a class="${currentSection === "saved" ? "active" : ""}" href="${machineHref(machine.serial, "saved")}">Saved recipes</a>
+          <a class="${currentSection === "history" ? "active" : ""}" href="${machineHref(machine.serial, "history")}">Brew history</a>
           <a class="${currentSection === "stats" ? "active" : ""}" href="${machineHref(machine.serial, "stats")}">Statistics</a>
           <a class="${currentSection === "settings" ? "active" : ""}" href="${machineHref(machine.serial, "settings")}">Settings</a>
           <a class="${currentSection === "diagnostics" ? "active" : ""}" href="${machineHref(machine.serial, "diagnostics")}">Diagnostics</a>
@@ -1575,6 +1607,218 @@ static const char kPage[] PROGMEM = R"HTML(
     `;
   }
 
+  function formatHistoryTimestamp(entry) {
+    const unix = Number(entry?.timeUnix || 0);
+    if (unix > 0) {
+      try {
+        return new Date(unix * 1000).toLocaleString();
+      } catch (error) {
+        return String(entry?.timeIsoUtc || "");
+      }
+    }
+    const loggedAtMs = Number(entry?.loggedAtMs || 0);
+    if (loggedAtMs > 0) {
+      return `uptime ${Math.round(loggedAtMs / 1000)}s`;
+    }
+    return "unknown";
+  }
+
+  function brewHistorySummary(entry) {
+    const recipe = entry?.recipe || {};
+    const parts = [];
+    if (recipe.strengthBeans !== undefined) {
+      parts.push(`${recipe.strengthBeans} beans`);
+    }
+    if (recipe.aromaLabel) {
+      parts.push(recipe.aromaLabel);
+    }
+    if (recipe.temperatureLabel || recipe.coffeeTemperatureLabel || recipe.overallTemperatureLabel) {
+      parts.push(recipe.temperatureLabel || recipe.coffeeTemperatureLabel || recipe.overallTemperatureLabel);
+    }
+    const sizeMl = recipe.coffeeAmountMl ?? recipe.waterAmountMl;
+    if (sizeMl !== undefined) {
+      parts.push(`${sizeMl} ml`);
+    }
+    return parts.join(" · ");
+  }
+
+  function hasNumericValue(value) {
+    return value !== null && value !== undefined && Number.isFinite(Number(value));
+  }
+
+  function buildHistoryReplayPayload(entry) {
+    const recipe = entry?.recipe || {};
+    const selector = Number(entry?.selector ?? recipe.selector);
+    if (!Number.isFinite(selector) || selector < 0) {
+      throw new Error("This history entry cannot be replayed because it has no recipe selector.");
+    }
+
+    const payload = { selector, source: "ui-history-replay" };
+    const numericFields = [
+      "strength",
+      "strengthBeans",
+      "aroma",
+      "temperature",
+      "coffeeTemperature",
+      "waterTemperature",
+      "milkTemperature",
+      "milkFoamTemperature",
+      "overallTemperature",
+      "preparation",
+      "twoCups",
+      "coffeeAmountMl",
+      "waterAmountMl",
+      "milkAmountMl",
+      "milkFoamAmountMl"
+    ];
+    numericFields.forEach((field) => {
+      if (hasNumericValue(recipe[field])) {
+        payload[field] = Number(recipe[field]);
+      }
+    });
+    if (entry?.label) {
+      payload.label = String(entry.label);
+    }
+    return payload;
+  }
+
+  function historyReplaySummaryLines(entry) {
+    const recipe = entry?.recipe || {};
+    const lines = [];
+    if (hasNumericValue(recipe.strengthBeans)) {
+      lines.push(`Beans: ${Number(recipe.strengthBeans)}`);
+    }
+    if (recipe.aromaLabel) {
+      lines.push(`Aroma: ${recipe.aromaLabel}`);
+    } else if (hasNumericValue(recipe.aroma)) {
+      lines.push(`Aroma code: ${Number(recipe.aroma)}`);
+    }
+    if (recipe.temperatureLabel) {
+      lines.push(`Temperature: ${recipe.temperatureLabel}`);
+    }
+    if (recipe.coffeeTemperatureLabel) {
+      lines.push(`Coffee temp: ${recipe.coffeeTemperatureLabel}`);
+    }
+    if (recipe.waterTemperatureLabel) {
+      lines.push(`Water temp: ${recipe.waterTemperatureLabel}`);
+    }
+    if (recipe.milkTemperatureLabel) {
+      lines.push(`Milk temp: ${recipe.milkTemperatureLabel}`);
+    }
+    if (recipe.milkFoamTemperatureLabel) {
+      lines.push(`Foam temp: ${recipe.milkFoamTemperatureLabel}`);
+    }
+    if (recipe.overallTemperatureLabel) {
+      lines.push(`Overall temp: ${recipe.overallTemperatureLabel}`);
+    }
+    if (hasNumericValue(recipe.twoCups)) {
+      lines.push(`Cup mode: ${Number(recipe.twoCups) ? "two cups" : "one cup"}`);
+    }
+    if (hasNumericValue(recipe.preparation)) {
+      lines.push(`Preparation: ${Number(recipe.preparation)}`);
+    }
+    if (hasNumericValue(recipe.coffeeAmountMl)) {
+      lines.push(`Coffee: ${Number(recipe.coffeeAmountMl)} ml`);
+    }
+    if (hasNumericValue(recipe.waterAmountMl) && Number(recipe.waterAmountMl) > 0) {
+      lines.push(`Water: ${Number(recipe.waterAmountMl)} ml`);
+    }
+    if (hasNumericValue(recipe.milkAmountMl) && Number(recipe.milkAmountMl) > 0) {
+      lines.push(`Milk: ${Number(recipe.milkAmountMl)} ml`);
+    }
+    if (hasNumericValue(recipe.milkFoamAmountMl) && Number(recipe.milkFoamAmountMl) > 0) {
+      lines.push(`Milk foam: ${Number(recipe.milkFoamAmountMl)} ml`);
+    }
+    return lines;
+  }
+
+  function historyReplayConfirmMessage(entry) {
+    const title = String(entry?.label || entry?.recipeTitle || entry?.recipeName || "Logged brew");
+    const drink = String(entry?.recipeTitle || entry?.recipeName || entry?.recipe?.title || entry?.recipe?.name || title);
+    const lines = [`Brew this recipe again?`, "", `Drink: ${drink}`];
+    if (title && title !== drink) {
+      lines.push(`Label: ${title}`);
+    }
+    lines.push(`Original brew: ${formatHistoryTimestamp(entry)}`);
+    historyReplaySummaryLines(entry).forEach((line) => lines.push(line));
+    if (entry?.recipeFingerprint) {
+      lines.push(`Fingerprint: ${entry.recipeFingerprint}`);
+    }
+    return lines.join("\n");
+  }
+
+  function renderHistorySection(machine, data) {
+    const entries = data?.entries || [];
+    const total = Math.max(0, Number(data?.count || 0));
+    const offset = Math.max(0, Number(data?.offset || 0));
+    const returned = Math.max(0, Number(data?.returned || entries.length));
+    const rangeStart = returned ? offset + 1 : 0;
+    const rangeEnd = returned ? offset + returned : 0;
+    return `
+      <section class="panel">
+        <div class="row" style="justify-content:space-between;">
+          <div>
+            <h2 class="section-title" style="margin:0;">Brew history</h2>
+            <div class="muted">The bridge stores a bounded per-machine history in flash and keeps only the newest entries.</div>
+          </div>
+          <div class="row">
+            <span class="badge">${escapeHtml(String(data?.count ?? 0))} stored</span>
+            <span class="badge">${escapeHtml(String(data?.fileBytes ?? 0))} / ${escapeHtml(String(data?.maxBytes ?? 0))} bytes</span>
+            <button class="secondary" data-action="refresh-history" data-serial="${escapeHtml(machine.serial)}">Refresh history</button>
+            <button class="warn" data-action="clear-history" data-serial="${escapeHtml(machine.serial)}">Clear history</button>
+          </div>
+        </div>
+        <div class="row" style="margin-top:14px;justify-content:space-between;">
+          <div class="muted">
+            ${returned ? `Showing newest ${escapeHtml(String(rangeStart))}-${escapeHtml(String(rangeEnd))} of ${escapeHtml(String(total))}.` : "No stored brews yet."}
+          </div>
+          <div class="row">
+            <button class="secondary" data-action="history-prev-page" data-serial="${escapeHtml(machine.serial)}" data-offset="${escapeHtml(String(data?.prevOffset ?? 0))}" ${data?.hasNewer ? "" : "disabled"}>Newer</button>
+            <button class="secondary" data-action="history-next-page" data-serial="${escapeHtml(machine.serial)}" data-offset="${escapeHtml(String(data?.nextOffset ?? 0))}" ${data?.hasOlder ? "" : "disabled"}>Older</button>
+          </div>
+        </div>
+        ${entries.length ? `
+          <div class="recipe-list" style="margin-top:16px;">
+            ${entries.map((entry, index) => {
+              const canReplay = Number.isFinite(Number(entry?.selector ?? entry?.recipe?.selector)) &&
+                Number(entry?.selector ?? entry?.recipe?.selector) >= 0;
+              return `
+              <article class="recipe-card">
+                <div class="row" style="justify-content:space-between;align-items:flex-start;">
+                  <div>
+                    <h3>${escapeHtml(entry.label || entry.recipeTitle || entry.recipeName || "Logged brew")}</h3>
+                    <div class="meta">
+                      <span>${escapeHtml(formatHistoryTimestamp(entry))}</span>
+                      <span>${escapeHtml(entry.source || "api")}${entry.actor ? ` · ${escapeHtml(entry.actor)}` : ""}</span>
+                    </div>
+                  </div>
+                  <div class="badge-row">
+                    <span class="badge">${escapeHtml(entry.recipeFingerprint || "")}</span>
+                    <span class="badge">${escapeHtml(entry.statusSummary || entry.result || "accepted")}</span>
+                  </div>
+                </div>
+                <div class="value-list">
+                  <div class="value-item"><span>Drink</span><span>${escapeHtml(entry.recipeTitle || entry.recipeName || "-")}</span></div>
+                  <div class="value-item"><span>Summary</span><span>${escapeHtml(brewHistorySummary(entry) || "-")}</span></div>
+                  <div class="value-item"><span>Machine message</span><span>${escapeHtml(formatStatusCode(entry.messageLabel, entry.message))}</span></div>
+                </div>
+                <div class="row">
+                  <button class="secondary" data-action="brew-history-again" data-serial="${escapeHtml(machine.serial)}" data-index="${escapeHtml(String(index))}" ${canReplay ? "" : "disabled"}>Brew again</button>
+                </div>
+                ${entry.note ? `<div class="muted">${escapeHtml(entry.note)}</div>` : ""}
+                <details>
+                  <summary>Raw history entry</summary>
+                  <pre>${escapeHtml(pretty(entry))}</pre>
+                </details>
+              </article>
+            `;
+            }).join("")}
+          </div>
+        ` : '<div class="empty" style="margin-top:16px;">No brews have been logged for this machine yet.</div>'}
+      </section>
+    `;
+  }
+
   function settingSelectHtml(key, currentLabel) {
     const values = SETTING_OPTIONS[key] || [];
     return `
@@ -1820,6 +2064,16 @@ static const char kPage[] PROGMEM = R"HTML(
   }
 
   function renderSystemPage() {
+    const history = state.status?.historyStorage || {};
+    const historyBudgetBytes = Math.max(0, Number(history.budgetBytes || 0));
+    const historyBudgetMinBytes = Math.max(0, Number(history.budgetMinBytes || 0));
+    const historyBudgetUpperBytes = Math.max(historyBudgetBytes, Number(history.budgetUpperBytes || 0));
+    const historyTotalBytes = Math.max(0, Number(history.totalBytes || 0));
+    const littleFsTotalBytes = Math.max(0, Number(state.status?.littleFsTotalBytes || 0));
+    const littleFsUsedBytes = Math.max(0, Number(state.status?.littleFsUsedBytes || 0));
+    const historyBudgetPercent = percentOf(historyBudgetBytes, historyBudgetUpperBytes);
+    const historyUsagePercent = percentOf(historyTotalBytes, littleFsTotalBytes);
+    const littleFsUsagePercent = percentOf(littleFsUsedBytes, littleFsTotalBytes);
     return sectionShell(
       "System",
       "Bridge-level controls stay separate from the coffee-machine dashboard: Wi-Fi, OTA, reboot, and store reset.",
@@ -1852,6 +2106,55 @@ static const char kPage[] PROGMEM = R"HTML(
               </div>
             </form>
           </article>
+        </section>
+
+        <section class="panel">
+          <div class="row" style="justify-content:space-between;align-items:flex-start;">
+            <div>
+              <h2 class="section-title">Brew history budget</h2>
+              <div class="muted">Adjust the per-machine brew-history cap at runtime. The slider maximum is bounded by the mounted LittleFS size.</div>
+            </div>
+            <div class="badge-row">
+              <span class="badge">${escapeHtml(formatBytes(historyBudgetBytes))} cap</span>
+              <span class="badge">${escapeHtml(formatBytes(historyTotalBytes))} stored</span>
+              <span class="badge">${escapeHtml(String(history.fileCount || 0))} files</span>
+            </div>
+          </div>
+          <div class="grid two" style="margin-top:16px;">
+            <article class="setting-row">
+              <strong>Per-machine cap</strong>
+              <div class="muted">Lowering the cap compacts existing history files immediately. Raising it only expands future headroom.</div>
+              <div class="value-list">
+                <div class="value-item"><span>Current</span><span>${escapeHtml(formatBytes(historyBudgetBytes))}</span></div>
+                <div class="value-item"><span>Minimum</span><span>${escapeHtml(formatBytes(historyBudgetMinBytes))}</span></div>
+                <div class="value-item"><span>Maximum</span><span>${escapeHtml(formatBytes(historyBudgetUpperBytes))}</span></div>
+              </div>
+              <div class="progress"><span style="width:${historyBudgetPercent}%;"></span></div>
+              <form data-action="save-history-budget">
+                <label class="label">Budget
+                  <input type="range" name="budgetBytes" min="${escapeHtml(String(historyBudgetMinBytes || 0))}" max="${escapeHtml(String(historyBudgetUpperBytes || historyBudgetBytes || 0))}" step="4096" value="${escapeHtml(String(historyBudgetBytes || 0))}" data-action="history-budget-range">
+                </label>
+                <div class="row" style="justify-content:space-between;">
+                  <span class="muted tiny">Selected: <output data-role="history-budget-output">${escapeHtml(formatBytes(historyBudgetBytes))}</output></span>
+                  <button type="submit">Save history budget</button>
+                </div>
+              </form>
+            </article>
+            <article class="setting-row">
+              <strong>LittleFS usage</strong>
+              <div class="muted">History files share flash with recipe caches and other bridge data.</div>
+              <div class="value-list">
+                <div class="value-item"><span>History total</span><span>${escapeHtml(formatBytes(historyTotalBytes))}</span></div>
+                <div class="value-item"><span>LittleFS used</span><span>${escapeHtml(formatBytes(littleFsUsedBytes))}</span></div>
+                <div class="value-item"><span>LittleFS total</span><span>${escapeHtml(formatBytes(littleFsTotalBytes))}</span></div>
+              </div>
+              <div class="muted tiny">History files vs LittleFS total</div>
+              <div class="progress"><span style="width:${historyUsagePercent}%;"></span></div>
+              <div class="muted tiny" style="margin-top:10px;">All LittleFS files in use</div>
+              <div class="progress"><span style="width:${littleFsUsagePercent}%;"></span></div>
+              ${history.error ? `<div class="muted tiny">History stats error: ${escapeHtml(history.error)}</div>` : ""}
+            </article>
+          </div>
         </section>
 
         <section class="panel">
@@ -1896,6 +2199,8 @@ static const char kPage[] PROGMEM = R"HTML(
         body = renderRecipesSection(machine, recipesData, savedData);
       } else if (section === "saved") {
         body = renderSavedRecipesSection(machine, await loadSavedRecipes(serial, false));
+      } else if (section === "history") {
+        body = renderHistorySection(machine, await loadMachineHistory(serial, false));
       } else if (section === "stats") {
         body = renderStatsSection(await loadMachineStats(serial, false));
       } else if (section === "settings") {
@@ -2094,7 +2399,30 @@ static const char kPage[] PROGMEM = R"HTML(
       if (action === "brew-standard") {
         const serial = button.dataset.serial;
         const selector = Number(button.dataset.selector);
-        const response = await runWithFlash("Sending brew command…", () => api(`/api/machines/${encodeURIComponent(serial)}/brew`, { json: { selector } }), "Brew command sent.");
+        const response = await runWithFlash("Sending brew command…", () => api(`/api/machines/${encodeURIComponent(serial)}/brew`, { json: { selector, source: "ui" } }), "Brew command sent.");
+        state.diagnostics.output = response;
+        invalidateMachine(serial);
+        await renderRoute();
+      }
+
+      if (action === "brew-history-again") {
+        const serial = String(button.dataset.serial || "");
+        const index = Number(button.dataset.index || -1);
+        const cache = getMachineCache(serial);
+        const entries = Array.isArray(cache.history?.entries) ? cache.history.entries : [];
+        const entry = Number.isInteger(index) && index >= 0 ? entries[index] : null;
+        if (!entry) {
+          throw new Error("History entry is no longer available. Refresh history and try again.");
+        }
+        const payload = buildHistoryReplayPayload(entry);
+        if (!window.confirm(historyReplayConfirmMessage(entry))) {
+          return;
+        }
+        const response = await runWithFlash(
+          "Sending brew command…",
+          () => api(`/api/machines/${encodeURIComponent(serial)}/brew`, { json: payload }),
+          "Brew command sent."
+        );
         state.diagnostics.output = response;
         invalidateMachine(serial);
         await renderRoute();
@@ -2135,6 +2463,32 @@ static const char kPage[] PROGMEM = R"HTML(
         const serial = button.dataset.serial;
         const slot = String(button.dataset.slot || "");
         await runWithFlash(`Refreshing saved recipe ${slot}…`, () => loadRecipeDetail(serial, slot, true), "Saved recipe refreshed.");
+        await renderRoute();
+      }
+
+      if (action === "refresh-history") {
+        const serial = button.dataset.serial;
+        const cache = getMachineCache(serial);
+        await runWithFlash("Refreshing brew history…", () => loadMachineHistory(serial, true, Number(cache.historyOffset || 0)), "Brew history refreshed.");
+        await renderRoute();
+      }
+
+      if (action === "clear-history") {
+        const serial = button.dataset.serial;
+        if (!window.confirm(`Clear brew history for ${serial}?`)) {
+          return;
+        }
+        await runWithFlash("Clearing brew history…", () => api(`/api/machines/${encodeURIComponent(serial)}/history/clear`, { method: "POST", json: {} }), "Brew history cleared.");
+        const cache = getMachineCache(serial);
+        cache.history = null;
+        cache.historyOffset = 0;
+        await renderRoute();
+      }
+
+      if (action === "history-prev-page" || action === "history-next-page") {
+        const serial = button.dataset.serial;
+        const offset = Number(button.dataset.offset || 0);
+        await loadMachineHistory(serial, false, offset);
         await renderRoute();
       }
 
@@ -2218,6 +2572,19 @@ static const char kPage[] PROGMEM = R"HTML(
     if (target.dataset.action === "toggle-show-coffee-machines") {
       state.showCoffeeMachines = !!target.checked;
       await renderRoute();
+    }
+  });
+
+  document.body.addEventListener("input", (event) => {
+    const target = event.target;
+    if (!(target instanceof HTMLInputElement)) {
+      return;
+    }
+    if (target.dataset.action === "history-budget-range") {
+      const output = target.form?.querySelector('[data-role="history-budget-output"]');
+      if (output) {
+        output.textContent = formatBytes(Number(target.value || 0));
+      }
     }
   });
 
@@ -2328,7 +2695,7 @@ static const char kPage[] PROGMEM = R"HTML(
       if (action === "brew-standard-custom") {
         const serial = form.dataset.serial;
         const selector = Number(form.dataset.selector);
-        const payload = { selector };
+        const payload = { selector, source: "ui" };
         Array.from(form.elements).forEach((field) => {
           if (!field.name || field.disabled) {
             return;
@@ -2467,6 +2834,20 @@ static const char kPage[] PROGMEM = R"HTML(
         const body = new FormData();
         body.append("file", file);
         await runWithFlash("Uploading OTA firmware…", () => api("/api/ota", { method: "POST", body }), "OTA upload accepted.");
+      }
+
+      if (action === "save-history-budget") {
+        const budgetBytes = Number(form.elements.budgetBytes.value || 0);
+        await runWithFlash("Saving brew history budget…", () => api("/api/history/config", {
+          method: "POST",
+          json: { budgetBytes }
+        }), "Brew history budget saved.");
+        Object.values(state.machineCache || {}).forEach((cache) => {
+          cache.history = null;
+          cache.historyOffset = 0;
+        });
+        await refreshCore();
+        await renderRoute();
       }
     } catch (error) {
       console.error(error);
