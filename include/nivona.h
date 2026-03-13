@@ -27,7 +27,9 @@ inline constexpr char NIVONA_AUX1[]    = "0000AD04-B35C-11E4-9813-0002A5D5C51B";
 inline constexpr char NIVONA_AUX2[]    = "0000AD05-B35C-11E4-9813-0002A5D5C51B";
 inline constexpr char NIVONA_NAME[]    = "0000AD06-B35C-11E4-9813-0002A5D5C51B";
 
+inline constexpr char CMD_HI[] = "HI";
 inline constexpr char CMD_HU[] = "HU";
+inline constexpr size_t HI_FEATURE_PAYLOAD_SIZE = 10;
 inline constexpr uint16_t HE_FACTORY_RESET_SETTINGS = 0x0032;
 inline constexpr uint16_t HE_FACTORY_RESET_RECIPES  = 0x0033;
 
@@ -176,6 +178,19 @@ struct ProcessStatus {
     String messageLabel;
 };
 
+struct MachineFeatureDescriptor {
+    const char* key;
+    const char* title;
+    uint8_t byteIndex;
+    uint8_t mask;
+};
+
+struct MachineFeatures {
+    bool ok{false};
+    ByteVector payload;
+    bool imageTransfer{false};
+};
+
 template <typename T, size_t N>
 constexpr size_t arraySize(const T (&)[N]) {
     return N;
@@ -233,6 +248,9 @@ bool decodeHrNumericResponse(const std::vector<ByteVector>& chunks,
                              uint16_t& registerIdOut,
                              int32_t& valueOut,
                              String& error);
+void selectMachineFeatures(std::vector<const MachineFeatureDescriptor*>& selectedOut);
+bool hiFeatureEnabled(const MachineFeatures& features, const MachineFeatureDescriptor& descriptor);
+bool decodeHiResponse(const std::vector<ByteVector>& chunks, bool encrypted, MachineFeatures& featuresOut, String& error);
 const char* describeProcessCode(int16_t process);
 const char* describeSubProcessCode(int16_t process, int16_t subProcess);
 const char* describeMessageCode(int16_t message);

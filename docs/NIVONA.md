@@ -21,12 +21,46 @@ ESP32 bridge firmware and webapp notes live in [BRIDGE.md](BRIDGE.md).
   - Brew payload layout
   - Customer-key bootstrap constants
 - Medium confidence:
-  - `HE`, `HN`, and `HS` semantics outside the traced call sites
+  - `HE` and `HS` semantics outside the traced call sites
   - Exact meaning of the anonymous `FrameDefinition` flags `a` / `b`
   - Per-model recipe selector mapping outside the families listed below
 - Low confidence:
   - `HS`, `HA`, and `HI` beyond the limited call sites and flags documented here
   - Exhaustive writable/register coverage across all model families
+
+## Packet Glossary
+
+Quick reference for the frame mnemonics used below. Detailed sections later in this document take precedence over this summary.
+
+Confidence score is a working shorthand, not a statistical measure:
+
+- `0.95+`
+  - APK-traced and live-validated on hardware
+- `0.70` to `0.90`
+  - APK-traced with clear payload structure, but still limited by model family or live coverage
+- `0.40` to `0.65`
+  - partial, parser-only, or semantics still incomplete
+
+| Packet | Meaning | Payload summary | Status / confidence |
+| --- | --- | --- | --- |
+| `Hp` | Ping / liveness probe | Request: `00 00`. Response: built-in parser expects `24` bytes; fields are not fully documented here. | Request vector confirmed; response meaning still partial, `0.70` |
+| `HU` | Session setup | Request: `seed4 || verifier2`. Response: `echoed_seed4 || session_key2 || verifier2`. | Fully reversed and live-validated, `0.98` |
+| `HV` | Read software version | Request: empty in the normal app read flow. Response: `11`-byte software-version payload. | APK-traced and live-validated, `0.95` |
+| `HL` | Read serial number | Request: empty in the normal app read flow. Response: `20`-byte serial payload. | APK-traced and live-validated, `0.95` |
+| `HN` | Write image-transfer block for "Flying Picture" | Request: `53` bytes total: big-endian block index plus `51` bytes of image data; final transfer packet uses `FE FE` plus zero padding. Response: `A` or `N`. | APK-traced image-transfer path, `0.85` |
+| `HR` | Read numeric value | Request: big-endian `UInt16` register id. Response: echoed register id plus big-endian signed `Int32` value. | APK-traced and live-validated, `0.95` |
+| `HA` | Read string value | Request: big-endian `UInt16` register id. Response: echoed register id plus `64`-byte string field. Encoding is family-dependent. | Payload shape is clear; semantics remain limited by family and call site, `0.65` |
+| `HW` | Write numeric value | Request: big-endian `UInt16` register id plus big-endian signed `Int32` value. Response: `A` or `N`. | APK-traced write path with clear payload layout, `0.80` |
+| `HB` | Write string value | Request: big-endian `UInt16` register id plus `64`-byte string field. Encoding is family-dependent. Response: `A` or `N`. | APK-traced write path; live coverage is still limited, `0.70` |
+| `HX` | Read process status | Request: empty. Response: four big-endian `Int16` values: `process`, `sub_process`, `message`, `progress`. | APK-traced and live-validated, `0.92` |
+| `HD` | Reset a numeric item to its default | Request: big-endian `UInt16` item id. Response: `A` or `N`. | Command is clear; per-family target tables are still incomplete, `0.70` |
+| `HY` | Confirm machine-driven user prompt from host side | Request: `00 00 00 00`. Response: `A` or `N`. | APK call sites and bridge support are confirmed, `0.80` |
+| `HZ` | Cancel process | Request: `00 00 00 00`. Response: `A` or `N`. | Payload is clear; behavior is less explored than other commands, `0.65` |
+| `HI` | Read feature / capability bits | Request: empty. Response: `10` bytes; APK `3.8.6` defines only byte `0`, mask `0x01` as `ImageTransfer`. All remaining bytes/bits are still raw. | Partial feature-bit coverage only, `0.50` |
+| `HS` | Parser-registered status / capability frame | Response parser expects `10` bytes. Exact field semantics are still unresolved. | Registered in the Android connector, but no direct send/use site is confirmed, `0.35` |
+| `HE` | Brew or other structured machine action | Request: `18`-byte structured action payload. Also used for factory-reset style actions. Response: usually `A` or `N`, with follow-up status read via `HX`. | Standard brew path is traced; broader semantics are still medium confidence, `0.75` |
+| `A` | ACK / write success | Response: empty. | Parser and write-success meaning are confirmed, `0.90` |
+| `N` | Negative / error response | Response: empty. | Parser and failure meaning are confirmed, `0.85` |
 
 ## App Architecture
 
@@ -1005,6 +1039,8 @@ The library checksum is:
 
 ## High-Level Commands
 
+Cross-checking direct `ldstr` call sites in `EugsterMobileApp.dll` / `EugsterMobileApp.Droid.dll` with the obfuscated `Eugster.EFLibrary` string accessor now yields the full packet-mnemonic inventory listed here for the analyzed APK.
+
 ### Confirmed
 
 - `Hp`
@@ -1015,6 +1051,8 @@ The library checksum is:
   - read software version
 - `HL`
   - read serial number
+- `HN`
+  - write image-transfer block for "Flying Picture" / personal lock screen
 - `HR`
   - read numeric value
 - `HA`
@@ -1207,9 +1245,93 @@ Request payload:
 Response payload:
 
 - 10 bytes total
-- current app only checks:
-  - `response[0] & 0x01`
-  - bit `0x01` means `ImageTransfer`
+- APK-defined feature map:
+
+| Byte | Mask | Meaning | APK evidence | Status |
+| --- | --- | --- | --- | --- |
+| `0` | `0x01` | `ImageTransfer` | only enum member of `CoffeeMachineFeature`; `IsFeatureSupported(...)` returns `response[0] & feature` when `feature == 0x01` | high confidence |
+
+- no additional `CoffeeMachineFeature` enum values were found in `de.nivona.mobileapp` `3.8.6`
+- no additional `IsFeatureSupported(...)` branches were found beyond the `feature == 0x01` mask test
+- all remaining bits in byte `0` and all bytes `1..9` should currently be treated as unknown raw capability bits
+
+Live observation on March 13, 2026 via the ESP bridge:
+
+- target machine:
+  - model `NICR 756`
+  - serial `756573071020106-----`
+  - BLE address `C8:B4:17:D8:A3:8C`
+  - BLE details `EF-BTLE`, software `EF_1.00R4__386`
+- session health:
+  - encrypted `HU` succeeded
+  - `HX` returned `process=8`, `message=0`, summary `ready`
+- `HI` behavior:
+  - encrypted request on a live session produced request frame `534849FC853F45`
+  - no `AD02` notification arrived within `5 s`
+  - unencrypted control request `5348496E45` also produced no notification within `5 s`
+- current interpretation:
+  - `HI` is not guaranteed to answer on all model / firmware combinations
+  - a timeout on `HI` should currently be treated as a real model-specific possibility, not automatically as a bridge parser failure
+
+### `HN` image-transfer block write
+
+This command is used by the APK's `CoffeeMachineSettingsService::WriteImage(...)` path for the "Flying Picture" feature, described in locales as a personal lock-screen image.
+
+Feature gating:
+
+- app feature enum:
+  - `CoffeeMachineFeature.ImageTransfer = 0x01`
+- enable check:
+  - `CoffeeMachineService::IsFeatureSupported(...)` sends `HI`
+  - current app only tests `response[0] & 0x01`
+
+Request payload:
+
+- `53` bytes total
+- bytes `0..1`:
+  - big-endian `Int16` block number
+  - first block is `0`
+- bytes `2..52`:
+  - up to `51` bytes of raw image data for that block
+  - short final block is zero-padded by the app
+
+Transfer behavior recovered from the APK:
+
+- number of data packets:
+  - `ceil(image_len / 51)`
+- each normal data block is sent as:
+  - `HN payload53`
+  - timeout `500 ms`
+- after all data blocks, the app sends one final terminator packet:
+  - bytes `0..1` = `FE FE`
+  - bytes `2..52` = `00`
+  - default timeout (`null`)
+- write success/failure is handled through the normal `A` / `N` write path
+
+Serializer-reproduced request examples:
+
+```text
+HN block 0 with session 12 34 and sample data:
+  payload = 00 00 11 22 33 44 55 66 77 88 99 AA BB CC DD EE FF 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+  packet  = 53 48 4E 0D FC 01 4D 16 CD 67 06 9F F2 0C 48 A3 23 2F 76 5D 54 69 BD F9 98 E5 28 E2 AD 15 6B A5 A6 AE D8 5B 77 5A 70 98 38 95 02 CD 91 63 8A 93 DA 1F 3B 57 9B 8D 89 5D D9 72 49 45
+
+HN terminator with session 12 34:
+  payload = FE FE 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+  packet  = 53 48 4E 0D FC FF B3 07 EF 54 42 CA 94 7B C0 3A 89 94 BA 80 BA 96 BD F9 98 E5 28 E2 AD 15 6B A5 A6 AE D8 5B 77 5A 70 98 38 95 02 CD 91 63 8A 93 DA 1F 3B 57 9B 8D 89 5D D9 72 45 45
+```
+
+Reset behavior:
+
+- there is no separate reset command for image transfer
+- `ResetImage()` simply calls `WriteImage(new byte[1], ...)`
+- practical implication:
+  - reset still emits a normal block `0` packet followed by the `FE FE` terminator
+
+Current interpretation:
+
+- `HN` is a chunked image-upload transport, not a generic blob write
+- the APK does not expose any complementary image-read command
+- locale strings indicate the target display is optimized for roughly `16:9`
 
 ### `HE` brew / machine action
 

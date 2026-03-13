@@ -1243,6 +1243,80 @@ void appendProcessStatusJson(JsonObject target, const nivona::ProcessStatus& sta
     target["error"] = error;
 }
 
+String formatByteHex(uint8_t value) {
+    String text = String(value, HEX);
+    text.toUpperCase();
+    if (text.length() < 2) {
+        text = "0" + text;
+    }
+    return String("0x") + text;
+}
+
+void appendMachineFeaturesJson(JsonObject target, const nivona::MachineFeatures& features) {
+    target["ok"] = features.ok;
+    target["payloadSize"] = features.payload.size();
+    target["rawHex"] = nivona::hexEncode(features.payload);
+    target["imageTransfer"] = features.imageTransfer;
+    target["source"] = "de.nivona.mobileapp 3.8.6";
+
+    JsonArray bytes = target.createNestedArray("bytes");
+    for (uint8_t value : features.payload) {
+        bytes.add(value);
+    }
+
+    JsonObject appKnown = target.createNestedObject("appKnown");
+    appKnown["imageTransfer"] = features.imageTransfer;
+
+    uint8_t knownMasks[nivona::HI_FEATURE_PAYLOAD_SIZE] = {0};
+    size_t knownEnabledCount = 0;
+    std::vector<const nivona::MachineFeatureDescriptor*> descriptors;
+    nivona::selectMachineFeatures(descriptors);
+    JsonArray knownFlags = target.createNestedArray("knownFlags");
+    for (const auto* descriptor : descriptors) {
+        if (descriptor == nullptr) {
+            continue;
+        }
+        const bool enabled = nivona::hiFeatureEnabled(features, *descriptor);
+        JsonObject item = knownFlags.createNestedObject();
+        item["key"] = descriptor->key;
+        item["title"] = descriptor->title;
+        item["byteIndex"] = descriptor->byteIndex;
+        item["mask"] = descriptor->mask;
+        item["maskHex"] = formatByteHex(descriptor->mask);
+        item["enabled"] = enabled;
+        item["source"] = "apk-3.8.6";
+        if (descriptor->byteIndex < nivona::HI_FEATURE_PAYLOAD_SIZE) {
+            knownMasks[descriptor->byteIndex] = static_cast<uint8_t>(knownMasks[descriptor->byteIndex] | descriptor->mask);
+        }
+        if (enabled) {
+            ++knownEnabledCount;
+        }
+    }
+    target["knownFlagCount"] = descriptors.size();
+    target["knownEnabledCount"] = knownEnabledCount;
+
+    size_t unknownNonZeroBitCount = 0;
+    JsonArray unknownBits = target.createNestedArray("unknownNonZeroBits");
+    for (size_t index = 0; index < features.payload.size(); ++index) {
+        const uint8_t value = features.payload[index];
+        const uint8_t unknownMask = static_cast<uint8_t>(value & static_cast<uint8_t>(~knownMasks[index]));
+        for (uint8_t bit = 0; bit < 8; ++bit) {
+            const uint8_t mask = static_cast<uint8_t>(1u << bit);
+            if ((unknownMask & mask) == 0) {
+                continue;
+            }
+            JsonObject item = unknownBits.createNestedObject();
+            item["byteIndex"] = index;
+            item["mask"] = mask;
+            item["maskHex"] = formatByteHex(mask);
+            item["value"] = value;
+            item["valueHex"] = formatByteHex(value);
+            ++unknownNonZeroBitCount;
+        }
+    }
+    target["unknownNonZeroBitCount"] = unknownNonZeroBitCount;
+}
+
 String recipeTypeTitle(const nivona::ModelInfo& modelInfo, int32_t selector) {
     std::vector<const nivona::StandardRecipeDescriptor*> recipes;
     nivona::selectStandardRecipes(modelInfo, recipes);
@@ -3647,6 +3721,7 @@ bool sendMachineCommand(const char* command,
                         const ByteVector* sessionKey,
                         bool encrypt,
                         String& error,
+                        uint32_t waitMs = 0,
                         std::vector<ByteVector>* chunksOut = nullptr) {
     ByteVector requestPacket;
     std::vector<ByteVector> chunks;
@@ -3660,7 +3735,7 @@ bool sendMachineCommand(const char* command,
                                  encrypt,
                                  false,
                                  0,
-                                 0,
+                                 waitMs,
                                  writeWithResponse,
                                  canWrite,
                                  canWriteNoResponse,
@@ -5838,6 +5913,52 @@ void handleMachineStats(const String& serial) {
     sendJson(response);
 }
 
+void handleMachineFeaturesGet(const String& serial) {
+    SavedMachine* machine = findSavedMachineBySerial(serial);
+    if (machine == nullptr) {
+        sendError(404, "saved machine not found");
+        return;
+    }
+
+    String error;
+    if (!beginMachineProtocolSession(*machine, error)) {
+        lastError = error;
+        sendError(500, error);
+        return;
+    }
+    if (!ensureMachineHuSession(2500, error)) {
+        lastError = error;
+        sendError(500, error);
+        return;
+    }
+
+    std::vector<ByteVector> chunks;
+    const ByteVector* sessionKey = resolveStoredSessionIfAvailable();
+    if (!sendMachineCommand(nivona::CMD_HI, ByteVector{}, sessionKey, true, error, 2500, &chunks)) {
+        lastError = error;
+        sendError(500, error);
+        return;
+    }
+
+    nivona::MachineFeatures features;
+    if (!nivona::decodeHiResponse(chunks, true, features, error)) {
+        lastError = error;
+        sendError(500, error);
+        return;
+    }
+
+    DynamicJsonDocument response(8192);
+    response["ok"] = true;
+    response["supported"] = true;
+    JsonObject machineJson = response.createNestedObject("machine");
+    appendSavedMachineJson(machineJson, *machine);
+    JsonObject featureJson = response.createNestedObject("features");
+    appendMachineFeaturesJson(featureJson, features);
+    JsonObject protocolSession = response.createNestedObject("protocolSession");
+    appendProtocolSessionJson(protocolSession, resolveStoredSessionEntry(machine->serial, machine->address));
+    sendJson(response);
+}
+
 void handleMachineStatsHistory(const String& serial) {
     SavedMachine* machine = findSavedMachineBySerial(serial);
     if (machine == nullptr) {
@@ -6126,6 +6247,10 @@ bool dispatchMachineApiRoute() {
     }
     if (section == "stats" && server.method() == HTTP_GET) {
         handleMachineStats(serial);
+        return true;
+    }
+    if (section == "features" && server.method() == HTTP_GET) {
+        handleMachineFeaturesGet(serial);
         return true;
     }
     if (section == "settings" && server.method() == HTTP_GET) {

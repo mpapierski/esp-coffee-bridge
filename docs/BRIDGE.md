@@ -102,6 +102,12 @@ Current embedded bridge UI is now organized around remembered machines rather th
   - `POST /api/machines/{serial}/mycoffee/{slot}`
     - after a successful write, the bridge updates the cached saved-recipe snapshot for that slot
   - `GET /api/machines/{serial}/stats`
+  - `GET /api/machines/{serial}/features`
+    - opens a live saved-machine session, performs internal `HU`, then issues encrypted `HI`
+    - returns the raw `10`-byte feature payload plus an APK-derived named-flag list
+    - current APK-backed semantic coverage is limited to byte `0`, mask `0x01` = `ImageTransfer`
+    - all remaining non-zero bits are surfaced as raw unknowns so the web UI can expose them without overclaiming meaning
+    - live observation on March 13, 2026: a `NICR 756` (`EF_1.00R4__386`) stayed silent on `HI` even though `HU` and `HX` succeeded, so this endpoint can legitimately return a timeout on models that do not answer `HI`
   - `GET /api/machines/{serial}/settings`
   - `POST /api/machines/{serial}/settings`
 - diagnostics page
@@ -167,6 +173,11 @@ Current firmware behavior:
   - now also performs `HU` first
   - now selects family-specific metric tables from `nivona.cpp`
   - groups values into `beverages`, `maintenance`, and serial/details sections for the web app
+- `GET /api/machines/{serial}/features`
+  - performs encrypted internal `HU` first
+  - reads `HI`
+  - exposes the raw `10`-byte payload, APK-known flags, and unknown non-zero bits for the web app's machine-features page
+  - some machines may still return no `HI` notification at all; current live example is `NICR 756` on March 13, 2026, where the bridge observed a clean bonded/encrypted session but timed out waiting for any `HI` response
 
 ### Family 600
 

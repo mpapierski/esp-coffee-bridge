@@ -662,6 +662,16 @@ static const char kPage[] PROGMEM = R"HTML(
     }
   }
 
+  function formatByteHex(value) {
+    const byte = Math.max(0, Math.min(255, Number(value ?? 0) || 0));
+    return `0x${byte.toString(16).toUpperCase().padStart(2, "0")}`;
+  }
+
+  function formatByteBits(value) {
+    const byte = Math.max(0, Math.min(255, Number(value ?? 0) || 0));
+    return byte.toString(2).padStart(8, "0");
+  }
+
   function parsePayload(text) {
     if (!text) {
       return null;
@@ -965,6 +975,15 @@ static const char kPage[] PROGMEM = R"HTML(
     }
     cache.settings = await api(`/api/machines/${encodeURIComponent(serial)}/settings`);
     return cache.settings;
+  }
+
+  async function loadMachineFeatures(serial, force = false) {
+    const cache = getMachineCache(serial);
+    if (!force && cache.features) {
+      return cache.features;
+    }
+    cache.features = await api(`/api/machines/${encodeURIComponent(serial)}/features`);
+    return cache.features;
   }
 
   async function loadMachineHistory(serial, force = false, offsetOverride = null) {
@@ -1301,6 +1320,7 @@ static const char kPage[] PROGMEM = R"HTML(
           <a class="${currentSection === "history" ? "active" : ""}" href="${machineHref(machine.serial, "history")}">Brew history</a>
           <a class="${currentSection === "stats" ? "active" : ""}" href="${machineHref(machine.serial, "stats")}">Statistics</a>
           <a class="${currentSection === "settings" ? "active" : ""}" href="${machineHref(machine.serial, "settings")}">Settings</a>
+          <a class="${currentSection === "features" ? "active" : ""}" href="${machineHref(machine.serial, "features")}">Machine features</a>
           <a class="${currentSection === "diagnostics" ? "active" : ""}" href="${machineHref(machine.serial, "diagnostics")}">Diagnostics</a>
         </div>
       </section>
@@ -1990,6 +2010,88 @@ static const char kPage[] PROGMEM = R"HTML(
     `;
   }
 
+  function renderMachineFeaturesSection(machine, data) {
+    const features = data?.features || {};
+    const knownFlags = Array.isArray(features?.knownFlags) ? features.knownFlags : [];
+    const bytes = Array.isArray(features?.bytes) ? features.bytes : [];
+    const unknownBits = Array.isArray(features?.unknownNonZeroBits) ? features.unknownNonZeroBits : [];
+
+    return `
+      <section class="panel">
+        <div class="row" style="justify-content:space-between;align-items:flex-start;">
+          <div>
+            <h2 class="section-title" style="margin:0;">Machine features</h2>
+            <div class="muted">This page reads the APK-backed <code>HI</code> capability payload. Only flags explicitly named in the Android app are decoded semantically; remaining non-zero bits stay raw.</div>
+          </div>
+          <div class="row">
+            <button class="secondary" data-action="refresh-machine-features" data-serial="${escapeHtml(machine.serial)}">Refresh features</button>
+          </div>
+        </div>
+        <div class="value-list" style="margin-top:16px;">
+          <div class="value-item"><span>APK source</span><span>${escapeHtml(features.source || "de.nivona.mobileapp 3.8.6")}</span></div>
+          <div class="value-item"><span>Raw payload</span><span><code>${escapeHtml(features.rawHex || "-")}</code></span></div>
+          <div class="value-item"><span>Payload size</span><span>${escapeHtml(String(features.payloadSize || bytes.length || 0))} bytes</span></div>
+          <div class="value-item"><span>APK-known flags enabled</span><span>${escapeHtml(String(features.knownEnabledCount || 0))} / ${escapeHtml(String(features.knownFlagCount || knownFlags.length))}</span></div>
+          <div class="value-item"><span>Unknown non-zero bits</span><span>${escapeHtml(String(features.unknownNonZeroBitCount || unknownBits.length))}</span></div>
+        </div>
+      </section>
+      <section class="panel">
+        <h2 class="section-title">APK-known flags</h2>
+        ${knownFlags.length ? `
+          <div class="stack">
+            ${knownFlags.map((flag) => `
+              <article class="recipe-card">
+                <div class="row" style="justify-content:space-between;align-items:flex-start;">
+                  <div>
+                    <strong>${escapeHtml(flag.title || flag.key || "feature")}</strong>
+                    <div class="muted tiny">${escapeHtml(flag.key || "")} · byte ${escapeHtml(String(flag.byteIndex ?? 0))} · mask ${escapeHtml(flag.maskHex || formatByteHex(flag.mask))}</div>
+                  </div>
+                  ${flag.enabled ? '<span class="badge good">enabled</span>' : '<span class="badge warn">off</span>'}
+                </div>
+                <div class="muted tiny">Source: ${escapeHtml(flag.source || "apk-3.8.6")}</div>
+              </article>
+            `).join("")}
+          </div>
+        ` : '<div class="empty">The current bridge build does not expose any named HI flags yet.</div>'}
+      </section>
+      <section class="panel">
+        <h2 class="section-title">Raw HI bytes</h2>
+        ${bytes.length ? `
+          <div class="value-list">
+            ${bytes.map((value, index) => `
+              <div class="value-item">
+                <span>Byte ${escapeHtml(String(index))}</span>
+                <span><code>${escapeHtml(formatByteHex(value))}</code> · ${escapeHtml(formatByteBits(value))}</span>
+              </div>
+            `).join("")}
+          </div>
+        ` : '<div class="empty">No raw HI payload bytes were returned.</div>'}
+      </section>
+      <section class="panel">
+        <h2 class="section-title">Unknown non-zero bits</h2>
+        ${unknownBits.length ? `
+          <div class="stack">
+            ${unknownBits.map((bit) => `
+              <article class="recipe-card">
+                <div class="row" style="justify-content:space-between;align-items:flex-start;">
+                  <div>
+                    <strong>Byte ${escapeHtml(String(bit.byteIndex ?? 0))} · ${escapeHtml(bit.maskHex || formatByteHex(bit.mask))}</strong>
+                    <div class="muted tiny">Observed byte value ${escapeHtml(bit.valueHex || formatByteHex(bit.value))} while no APK-defined meaning is known yet.</div>
+                  </div>
+                  <span class="badge">${escapeHtml(formatByteBits(bit.value))}</span>
+                </div>
+              </article>
+            `).join("")}
+          </div>
+        ` : '<div class="empty">No unknown non-zero bits are set in the current HI response.</div>'}
+      </section>
+      <details>
+        <summary>Raw machine features JSON</summary>
+        <pre>${escapeHtml(pretty(data))}</pre>
+      </details>
+    `;
+  }
+
   function diagnosticsDefault(machine) {
     return {
       address: machine.address,
@@ -2336,6 +2438,8 @@ static const char kPage[] PROGMEM = R"HTML(
         const statsData = await loadMachineStats(serial, false);
         const statsHistory = await loadMachineStatsHistory(serial, false);
         body = renderStatsSection(machine, statsData, statsHistory);
+      } else if (section === "features") {
+        body = renderMachineFeaturesSection(machine, await loadMachineFeatures(serial, false));
       } else if (section === "settings") {
         body = renderSettingsSection(machine, await loadMachineSettings(serial, false));
       } else if (section === "diagnostics") {
@@ -2642,6 +2746,12 @@ static const char kPage[] PROGMEM = R"HTML(
           await loadMachineStats(serial, true);
           await loadMachineStatsHistory(serial, true, Number(cache.statsHistoryOffset || 0));
         }, "Machine statistics refreshed.");
+        await renderRoute();
+      }
+
+      if (action === "refresh-machine-features") {
+        const serial = button.dataset.serial;
+        await runWithFlash("Refreshing machine features…", () => loadMachineFeatures(serial, true), "Machine features refreshed.");
         await renderRoute();
       }
 

@@ -176,6 +176,10 @@ const SettingProbeDescriptor SETTINGS_1040_PROBES[] = {
     {"power_on_frother_time", "Power-on frother time", 119, POWER_ON_FROTHER_TIME_1040_OPTIONS, arraySize(POWER_ON_FROTHER_TIME_1040_OPTIONS)},
 };
 
+const MachineFeatureDescriptor MACHINE_FEATURES[] = {
+    {"image_transfer", "Image transfer", 0, 0x01},
+};
+
 const StandardRecipeDescriptor RECIPES_600[] = {
     {0, "espresso", "Espresso"},
     {1, "coffee", "Coffee"},
@@ -1053,6 +1057,40 @@ bool decodeHrNumericResponse(const std::vector<ByteVector>& chunks,
                (static_cast<int32_t>(decodedPayload[3]) << 16) |
                (static_cast<int32_t>(decodedPayload[4]) << 8) |
                static_cast<int32_t>(decodedPayload[5]);
+    return true;
+}
+
+void selectMachineFeatures(std::vector<const MachineFeatureDescriptor*>& selectedOut) {
+    selectedOut.clear();
+    for (const auto& feature : MACHINE_FEATURES) {
+        selectedOut.push_back(&feature);
+    }
+}
+
+bool hiFeatureEnabled(const MachineFeatures& features, const MachineFeatureDescriptor& descriptor) {
+    return descriptor.byteIndex < features.payload.size() &&
+           (features.payload[descriptor.byteIndex] & descriptor.mask) != 0;
+}
+
+bool decodeHiResponse(const std::vector<ByteVector>& chunks, bool encrypted, MachineFeatures& featuresOut, String& error) {
+    featuresOut = MachineFeatures{};
+    ByteVector packet = selectPacketForCommand(chunks, CMD_HI);
+    if (packet.empty()) {
+        error = "no notifications";
+        return false;
+    }
+    ByteVector decodedPayload;
+    if (!decodePacketAssumed(packet, CMD_HI, nullptr, encrypted, decodedPayload, error)) {
+        return false;
+    }
+    if (decodedPayload.size() != HI_FEATURE_PAYLOAD_SIZE) {
+        error = String("unexpected HI payload size ") + decodedPayload.size();
+        return false;
+    }
+
+    featuresOut.ok = true;
+    featuresOut.payload = decodedPayload;
+    featuresOut.imageTransfer = !decodedPayload.empty() && (decodedPayload[0] & 0x01) != 0;
     return true;
 }
 
