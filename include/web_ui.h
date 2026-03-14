@@ -449,6 +449,49 @@ static const char kPage[] PROGMEM = R"HTML(
     gap: 10px;
   }
 
+  .recipe-card-head {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    gap: 12px;
+    align-items: flex-start;
+  }
+
+  .recipe-card-main {
+    min-width: 0;
+    display: grid;
+    gap: 4px;
+  }
+
+  .recipe-card-head .badge-row {
+    justify-content: flex-end;
+  }
+
+  .recipe-icon {
+    width: 56px;
+    height: 56px;
+    flex: 0 0 auto;
+    border-radius: 18px;
+    object-fit: contain;
+    padding: 6px;
+    background: linear-gradient(180deg, rgba(255, 255, 255, 0.94), rgba(239, 231, 220, 0.92));
+    border: 1px solid rgba(71, 56, 40, 0.14);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.6);
+  }
+
+  .recipe-icon.small {
+    width: 44px;
+    height: 44px;
+    border-radius: 14px;
+    padding: 5px;
+  }
+
+  .recipe-icon.large {
+    width: 72px;
+    height: 72px;
+    border-radius: 22px;
+    padding: 8px;
+  }
+
   .setting-row {
     display: grid;
     gap: 12px;
@@ -880,6 +923,113 @@ static const char kPage[] PROGMEM = R"HTML(
 
   function machineStandardRecipeHref(serial, selector) {
     return `#/machine/${encodeURIComponent(serial)}/standard/${selector}`;
+  }
+
+  const RECIPE_ICON_ALIASES = {
+    espresso: "espresso",
+    creme: "creme",
+    cream: "creme",
+    lungo: "lungo",
+    americano: "americano",
+    cappuccino: "cappuccino",
+    macchiato: "macchiato",
+    latte_macchiato: "macchiato",
+    milk: "milk",
+    water: "water",
+    hot_water: "water",
+    caffe_latte: "caffe-latte",
+    coffee: "coffee",
+    frothy_milk: "frothy-milk",
+    hot_milk: "hot-milk",
+    warm_milk: "warm-milk",
+    mycoffee: "my-coffee",
+    my_coffee: "my-coffee",
+    flower: "flower",
+    heart: "heart",
+    smily: "smily",
+    smiley: "smily",
+    sun: "sun",
+    star: "star",
+    cloud: "cloud",
+    chilled_espresso: "chilled-espresso",
+    chilled_lungo: "chilled-lungo",
+    chilled_americano: "chilled-americano",
+    undefined: "undefined",
+    unknown: "undefined"
+  };
+
+  const RECIPE_ICON_TITLES = {
+    "espresso": "Espresso",
+    "creme": "Creme",
+    "lungo": "Lungo",
+    "americano": "Americano",
+    "cappuccino": "Cappuccino",
+    "macchiato": "Latte macchiato",
+    "milk": "Milk",
+    "water": "Hot water",
+    "caffe-latte": "Caffe latte",
+    "coffee": "Coffee",
+    "frothy-milk": "Frothy milk",
+    "hot-milk": "Hot milk",
+    "warm-milk": "Warm milk",
+    "my-coffee": "MyCoffee",
+    "flower": "Flower",
+    "heart": "Heart",
+    "smily": "Smily",
+    "sun": "Sun",
+    "star": "Star",
+    "cloud": "Cloud",
+    "chilled-espresso": "Chilled espresso",
+    "chilled-lungo": "Chilled lungo",
+    "chilled-americano": "Chilled americano",
+    "undefined": "Undefined"
+  };
+
+  function normalizeRecipeIconToken(value) {
+    return String(value ?? "")
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "_")
+      .replace(/^_+|_+$/g, "");
+  }
+
+  function recipeIconKeyFromCandidate(value) {
+    const token = normalizeRecipeIconToken(value);
+    return token ? (RECIPE_ICON_ALIASES[token] || null) : null;
+  }
+
+  function recipeIconTitle(key, fallback = "") {
+    return RECIPE_ICON_TITLES[key] || String(fallback || RECIPE_ICON_TITLES.undefined);
+  }
+
+  function resolveRecipeIconKey(recipe, entry = null) {
+    const candidates = [
+      recipe?.iconKey,
+      entry?.iconKey,
+      recipe?.iconName,
+      recipe?.typeName,
+      recipe?.title,
+      entry?.recipeTitle,
+      recipe?.name,
+      entry?.recipeName
+    ];
+    for (const candidate of candidates) {
+      const key = recipeIconKeyFromCandidate(candidate);
+      if (key) {
+        return key;
+      }
+    }
+    return "undefined";
+  }
+
+  function recipeIconUrl(key) {
+    return `/icons/recipe?name=${encodeURIComponent(key || "undefined")}`;
+  }
+
+  function renderRecipeIcon(recipe, entry = null, size = "") {
+    const key = resolveRecipeIconKey(recipe, entry);
+    const title = recipeIconTitle(key, recipe?.iconName || entry?.recipe?.iconName || "");
+    const sizeValue = size === "small" ? 44 : size === "large" ? 72 : 56;
+    return `<img class="recipe-icon${size ? ` ${size}` : ""}" src="${recipeIconUrl(key)}" alt="${escapeHtml(`${title} icon`)}" width="${sizeValue}" height="${sizeValue}" loading="lazy" decoding="async">`;
   }
 
   function isRouteActive(test) {
@@ -1545,10 +1695,15 @@ static const char kPage[] PROGMEM = R"HTML(
         <div class="recipes-grid">
           ${recipes.map((recipe) => `
             <article class="recipe-card">
-              <h3>${escapeHtml(recipe.title || recipe.name)}</h3>
-              <div class="meta">
-                <span>Selector ${escapeHtml(String(recipe.selector))}</span>
-                <span>${escapeHtml(recipe.name)}</span>
+              <div class="recipe-card-head">
+                ${renderRecipeIcon(recipe)}
+                <div class="recipe-card-main">
+                  <h3>${escapeHtml(recipe.title || recipe.name)}</h3>
+                  <div class="meta">
+                    <span>Selector ${escapeHtml(String(recipe.selector))}</span>
+                    <span>${escapeHtml(recipe.name)}</span>
+                  </div>
+                </div>
               </div>
               <div class="row">
                 <button data-action="brew-standard" data-serial="${escapeHtml(machine.serial)}" data-selector="${escapeHtml(String(recipe.selector))}">Quick brew</button>
@@ -1570,12 +1725,15 @@ static const char kPage[] PROGMEM = R"HTML(
           <div class="recipe-list">
             ${savedRecipes.map((recipe) => `
               <article class="recipe-card">
-                <div class="row" style="justify-content:space-between;">
-                  <div>
+                <div class="recipe-card-head">
+                  ${renderRecipeIcon(recipe)}
+                  <div class="recipe-card-main">
                     <strong>${escapeHtml(recipe.name || `Slot ${recipe.slot}`)}</strong>
                     <div class="muted tiny">${escapeHtml(recipe.typeName || "custom")} · slot ${escapeHtml(String(recipe.slot))}</div>
                   </div>
-                  ${recipe.enabled ? '<span class="badge good">enabled</span>' : '<span class="badge warn">disabled</span>'}
+                  <div class="badge-row">
+                    ${recipe.enabled ? '<span class="badge good">enabled</span>' : '<span class="badge warn">disabled</span>'}
+                  </div>
                 </div>
                 <div class="row">
                   <a class="button-link ghost" href="${machineRecipeHref(machine.serial, recipe.slot)}">View details</a>
@@ -1602,15 +1760,18 @@ static const char kPage[] PROGMEM = R"HTML(
         <div class="recipe-list">
           ${items.map((recipe) => `
             <article class="recipe-card">
-              <div class="row" style="justify-content:space-between;">
-                <div>
+              <div class="recipe-card-head">
+                ${renderRecipeIcon(recipe)}
+                <div class="recipe-card-main">
                   <h3>${escapeHtml(recipe.name || `Slot ${recipe.slot}`)}</h3>
                   <div class="meta">
                     <span>${escapeHtml(recipe.typeName || "custom")}</span>
                     <span>Slot ${escapeHtml(String(recipe.slot))}</span>
                   </div>
                 </div>
-                ${recipe.enabled ? '<span class="badge good">enabled</span>' : '<span class="badge warn">disabled</span>'}
+                <div class="badge-row">
+                  ${recipe.enabled ? '<span class="badge good">enabled</span>' : '<span class="badge warn">disabled</span>'}
+                </div>
               </div>
               <div class="badge-row">
                 ${recipe.nameRegister ? `<span class="badge">name @ ${escapeHtml(String(recipe.nameRegister))}</span>` : ""}
@@ -1712,9 +1873,12 @@ static const char kPage[] PROGMEM = R"HTML(
     return `
       <section class="panel">
         <div class="row" style="justify-content:space-between;">
-          <div>
-            <h2 class="section-title" style="margin:0;">${escapeHtml(recipe.name || `Recipe slot ${slot}`)}</h2>
-            <div class="muted">Saved custom recipe details for slot ${escapeHtml(String(slot))}</div>
+          <div class="row" style="gap:14px;align-items:center;">
+            ${renderRecipeIcon(recipe, null, "large")}
+            <div>
+              <h2 class="section-title" style="margin:0;">${escapeHtml(recipe.name || `Recipe slot ${slot}`)}</h2>
+              <div class="muted">Saved custom recipe details for slot ${escapeHtml(String(slot))}</div>
+            </div>
           </div>
           <div class="row">
             <button data-action="refresh-saved-recipe" data-serial="${escapeHtml(machine.serial)}" data-slot="${escapeHtml(String(slot))}">Refresh from machine</button>
@@ -1726,7 +1890,7 @@ static const char kPage[] PROGMEM = R"HTML(
             <div class="value-list">
               <div class="value-item"><span>Name</span><span>${escapeHtml(recipe.name || "")}</span></div>
               <div class="value-item"><span>Source</span><span>${escapeHtml(sourceLabel)}</span></div>
-              <div class="value-item"><span>Icon</span><span>${escapeHtml(recipe.icon ?? "-")}</span></div>
+              <div class="value-item"><span>Icon</span><span>${escapeHtml(recipe.iconName || "-")}${recipe.icon !== undefined ? ` · ${escapeHtml(String(recipe.icon))}` : ""}</span></div>
               <div class="value-item"><span>Strength</span><span>${escapeHtml(recipe.strengthBeans ? `${recipe.strengthBeans} beans` : "-")}</span></div>
               <div class="value-item"><span>Temperature</span><span>${escapeHtml(recipe.temperatureLabel || recipe.coffeeTemperatureLabel || "-")}</span></div>
               <div class="value-item"><span>Size</span><span>${escapeHtml(recipe.coffeeAmountMl ?? recipe.waterAmountMl ?? "-")}${recipe.coffeeAmountMl !== undefined || recipe.waterAmountMl !== undefined ? " ml" : ""}</span></div>
@@ -2117,10 +2281,12 @@ static const char kPage[] PROGMEM = R"HTML(
             ${entries.map((entry, index) => {
               const canReplay = Number.isFinite(Number(entry?.selector ?? entry?.recipe?.selector)) &&
                 Number(entry?.selector ?? entry?.recipe?.selector) >= 0;
+              const recipe = entry?.recipe || {};
               return `
               <article class="recipe-card">
-                <div class="row" style="justify-content:space-between;align-items:flex-start;">
-                  <div>
+                <div class="recipe-card-head">
+                  ${renderRecipeIcon(recipe, entry, "small")}
+                  <div class="recipe-card-main">
                     <h3>${escapeHtml(entry.label || entry.recipeTitle || entry.recipeName || "Logged brew")}</h3>
                     <div class="meta">
                       <span>${escapeHtml(formatHistoryTimestamp(entry))}</span>

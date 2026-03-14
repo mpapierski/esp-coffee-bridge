@@ -669,6 +669,8 @@ void appendCompactRecipe(JsonObject target, JsonObjectConst recipe) {
         "selector",
         "name",
         "title",
+        "iconKey",
+        "iconName",
         "typeSelector",
         "typeName",
         "strength",

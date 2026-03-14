@@ -1536,6 +1536,138 @@ Recovered from `RecipeFactory`.
 - `9` chilled lungo
 - `10` chilled americano
 
+## `MyCoffee` Icon IDs
+
+APK `3.8.6` exposes a dedicated `RecipeIcon` enum plus a family-specific `IconConverter` for saved-recipe icon values.
+This means the `MyCoffee` `icon` field is not just a free-form number; it is a machine-side icon selector whose meaning depends on model family.
+
+Recovered app-side enum values from `EugsterMobileApp.Model.CoffeeRecipes.RecipeIcon`:
+
+- `0` `Espresso`
+- `1` `Creme`
+- `2` `Lungo`
+- `3` `Americano`
+- `4` `Cappuccino`
+- `5` `Macchiato`
+- `6` `Milk`
+- `7` `Water`
+- `8` `CaffeLatte`
+- `9` `Coffee`
+- `10` `FrothyMilk`
+- `11` `HotMilk`
+- `12` `WarmMilk`
+- `13` `MyCoffee`
+- `14` `Flower`
+- `15` `Heart`
+- `16` `Smily`
+- `17` `Sun`
+- `18` `Star`
+- `19` `Cloud`
+- `20` `ChilledEspresso`
+- `21` `ChilledLungo`
+- `22` `ChilledAmericano`
+- `23` `Undefined`
+
+Naming notes:
+
+- `RecipeIcon.Macchiato` is the app icon used for the localized drink name `App_Macchiato = Latte Macchiato`.
+- `RecipeIcon.Smily` is the exact APK enum spelling.
+- Unknown or unmapped machine-side icon ids decode to `RecipeIcon.Undefined`.
+
+Saved-recipe read-side icon ids recovered from `IconConverter::ToRecipeIcon(int iconId, EugsterModelFamily)`:
+
+### Family 600
+
+- `1` -> `Espresso`
+- `4` -> `Americano`
+- `5` -> `Cappuccino`
+- `8` -> `Water`
+- `9` -> `MyCoffee`
+- `12` -> `Flower`
+- `13` -> `Heart`
+- `14` -> `Smily`
+- `15` -> `Sun`
+- `16` -> `Star`
+- `19` -> `Coffee`
+- `20` -> `FrothyMilk`
+
+### Family 700
+
+- `1` -> `Espresso`
+- `2` -> `Creme`
+- `3` -> `Lungo`
+- `4` -> `Americano`
+- `5` -> `Cappuccino`
+- `6` -> `Macchiato`
+- `7` -> `Milk`
+- `8` -> `Water`
+- `9` -> `MyCoffee`
+- `12` -> `Flower`
+- `13` -> `Heart`
+- `14` -> `Smily`
+- `15` -> `Sun`
+- `16` -> `Star`
+
+### Family 79x
+
+- The shared converter contains the same raw id table as `700`.
+- But the official app `TryGetIcon(...)` read path does not use the raw icon register on this family.
+  - instead it derives the displayed icon directly from `CoffeeRecipeType`
+  - so current app behavior should be treated as recipe-type-derived, not icon-id-derived, on `79x`
+
+### Family 900 / 900 Light
+
+- `1` -> `Espresso`
+- `2` -> `Coffee`
+- `3` -> `Americano`
+- `4` -> `Cappuccino`
+- `5` -> `CaffeLatte`
+- `6` -> `Macchiato`
+- `7` -> `HotMilk`
+- `8` -> `Water`
+- `9` -> `MyCoffee`
+
+### Family 1000 (`1030` / `1040`)
+
+- `1` -> `Espresso`
+- `2` -> `Coffee`
+- `3` -> `Americano`
+- `4` -> `Cappuccino`
+- `5` -> `CaffeLatte`
+- `6` -> `Macchiato`
+- `7` -> `WarmMilk`
+- `8` -> `Water`
+- `9` -> `MyCoffee`
+- `13` -> `HotMilk`
+- `14` -> `FrothyMilk`
+- `15` -> `Star`
+- `16` -> `Flower`
+- `17` -> `Sun`
+- `18` -> `Heart`
+- `19` -> `Smily`
+- `20` -> `Cloud`
+
+### Family 8000
+
+- `0` -> `Espresso`
+- `1` -> `Coffee`
+- `2` -> `Americano`
+- `3` -> `Cappuccino`
+- `4` -> `CaffeLatte`
+- `5` -> `Macchiato`
+- `6` -> `Milk`
+- `7` -> `Water`
+- `21` -> `ChilledEspresso`
+- `22` -> `ChilledLungo`
+- `23` -> `ChilledAmericano`
+
+Practical interpretation:
+
+- On most families, `type` and `icon` are separate recipe fields.
+- So a slot can keep the same base recipe type while showing a different symbol.
+- On `79x`, the app currently treats the icon as derived from the recipe type rather than as an independently loaded machine field.
+- On `8000`, the icon-id meaning is now recovered, but the exact `MyCoffee` slot offset still needs live confirmation because the decompiled offset enums overlap `icon` and `recipe type` at `+3`.
+
 ## Standard Recipe Register Model
 
 The managed app does not treat standard drinks as selector-only actions. Standard recipe content is queryable and forms a family-specific register table.

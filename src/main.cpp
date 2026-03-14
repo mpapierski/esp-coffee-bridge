@@ -18,6 +18,7 @@
 #include "brew_history.h"
 #include "bridge_time.h"
 #include "nivona.h"
+#include "recipe_icons.h"
 #include "stats_history.h"
 #include "web_ui.h"
 
@@ -40,7 +41,7 @@ constexpr uint16_t TEMP_RECIPE_TYPE_REGISTER = 9001;
 constexpr char STANDARD_RECIPE_CACHE_PREFIX[] = "/stdrec-";
 constexpr uint32_t STANDARD_RECIPE_CACHE_SCHEMA = 2;
 constexpr char SAVED_RECIPE_CACHE_PREFIX[] = "/mycoffee-";
-constexpr uint32_t SAVED_RECIPE_CACHE_SCHEMA = 2;
+constexpr uint32_t SAVED_RECIPE_CACHE_SCHEMA = 3;
 constexpr uint32_t BACKUP_BUNDLE_SCHEMA = 1;
 constexpr char BACKUP_RESTORE_UPLOAD_PATH[] = "/restore-upload.ndjson";
 
@@ -1376,6 +1377,23 @@ String recipeTypeTitle(const nivona::ModelInfo& modelInfo, int32_t selector) {
         }
     }
     return selector >= 0 ? String("Recipe ") + selector : "";
+}
+
+void appendSavedRecipeIconMetadata(JsonObject target, const nivona::ModelInfo& modelInfo) {
+    const bool hasTypeSelector = !target["typeSelector"].isNull();
+    const int32_t typeSelector = hasTypeSelector ? target["typeSelector"].as<int32_t>() : -1;
+    const bool hasIconValue = !target["icon"].isNull();
+    const int32_t rawIconValue = hasIconValue ? target["icon"].as<int32_t>() : -1;
+    recipe_icons::appendMetadata(target,
+                                 recipe_icons::keyForSavedRecipe(modelInfo,
+                                                                 hasTypeSelector,
+                                                                 typeSelector,
+                                                                 hasIconValue,
+                                                                 rawIconValue));
+}
+
+void appendStandardRecipeIconMetadata(JsonObject target, const nivona::ModelInfo& modelInfo, int32_t selector) {
+    recipe_icons::appendMetadata(target, recipe_icons::keyForStandardRecipe(modelInfo, selector));
 }
 
 String recipeTemperatureLabel(int32_t rawValue) {
@@ -4630,12 +4648,15 @@ bool appendMyCoffeeSlot(JsonObject target, SavedMachine& machine, uint8_t slotIn
         target["typeRegister"] = baseRegister + layout.typeOffset;
     }
 
+    if (detail) {
+        if (!readOptionalNumeric("icon", "Icon", layout.iconOffset, false, "")) {
+            return false;
+        }
+    }
+    appendSavedRecipeIconMetadata(target, modelInfo);
+
     if (!detail) {
         return true;
-    }
-
-    if (!readOptionalNumeric("icon", "Icon", layout.iconOffset, false, "")) {
-        return false;
     }
     if (!readOptionalNumeric("strength", "Strength", layout.strengthOffset, false, "")) {
         return false;
@@ -4726,6 +4747,7 @@ bool appendStandardRecipe(JsonObject target, SavedMachine& machine, uint8_t sele
     target["maxStrengthBeans"] = modelInfo.strengthLevelCount;
     target["maxProfileCode"] = modelInfo.maxProfileCode;
     appendStandardRecipeDiscovery(target, modelInfo, layout);
+    appendStandardRecipeIconMetadata(target, modelInfo, selector);
 
     if (!detail) {
         return true;
@@ -6447,6 +6469,21 @@ void handleRoot() {
     server.send_P(200, "text/html; charset=utf-8", web_ui::kPage);
 }
 
+void handleRecipeIconAsset() {
+    const String requestedKey = server.hasArg("name") ? server.arg("name") : "";
+    const recipe_icons::Asset* asset = recipe_icons::findAsset(requestedKey);
+    if (asset == nullptr) {
+        asset = recipe_icons::findAsset(recipe_icons::defaultKey());
+    }
+    if (asset == nullptr) {
+        sendError(404, "recipe icon not found");
+        return;
+    }
+
+    server.sendHeader("Cache-Control", "public, max-age=604800");
+    server.send_P(200, "image/webp", reinterpret_cast<PGM_P>(asset->data), asset->size);
+}
+
 void handleStatus() {
     maybeApplyClientTimeHeader();
     DynamicJsonDocument doc(6144);
@@ -7853,6 +7890,7 @@ void registerRoutes() {
     const char* trackedHeaders[] = {CLIENT_TIME_HEADER};
     server.collectHeaders(trackedHeaders, 1);
     server.on("/", HTTP_GET, handleRoot);
+    server.on("/icons/recipe", HTTP_GET, handleRecipeIconAsset);
     server.on("/api/status", HTTP_GET, handleStatus);
     server.on("/api/devices", HTTP_GET, handleDevices);
     server.on("/api/details", HTTP_GET, handleDetails);
