@@ -86,6 +86,19 @@ bool readLine(File& file, String& lineOut) {
     return false;
 }
 
+String formatIso8601Utc(time_t epoch) {
+    struct tm utcTime;
+    if (gmtime_r(&epoch, &utcTime) == nullptr) {
+        return "";
+    }
+
+    char buffer[32];
+    if (strftime(buffer, sizeof(buffer), "%Y-%m-%dT%H:%M:%SZ", &utcTime) == 0) {
+        return "";
+    }
+    return String(buffer);
+}
+
 bool serializeEntry(JsonObjectConst entry, String& lineOut, String& error) {
     lineOut = "";
     lineOut.reserve(measureJson(entry) + 8);
@@ -417,6 +430,7 @@ bool loadPage(const String& serial,
         }
         JsonObject item = entriesOut.createNestedObject();
         item.set(lineDoc.as<JsonObjectConst>());
+        item["entryId"] = static_cast<uint32_t>(index - 1);
     }
     return true;
 }
@@ -489,6 +503,167 @@ String recipeFingerprint(JsonObjectConst recipe) {
     return fingerprintHex(canonicalRecipe);
 }
 
+bool applyTimestampPatch(JsonObject target, JsonObjectConst patch, String& error) {
+    error = "";
+
+    int64_t timeUnix = 0;
+    if (!patch["timeUnixMs"].isNull()) {
+        const int64_t timeUnixMs = patch["timeUnixMs"].as<int64_t>();
+        if (timeUnixMs <= 0) {
+            error = "timeUnixMs must be positive";
+            return false;
+        }
+        timeUnix = timeUnixMs / 1000;
+    } else if (!patch["timeUnix"].isNull()) {
+        timeUnix = patch["timeUnix"].as<int64_t>();
+        if (timeUnix <= 0) {
+            error = "timeUnix must be positive";
+            return false;
+        }
+    } else {
+        error = "timeUnix or timeUnixMs is required";
+        return false;
+    }
+
+    const String timeSource = sanitizeMetadataText(patch["timeSource"], 16);
+    const String timeIsoUtc = sanitizeMetadataText(patch["timeIsoUtc"], 32);
+
+    target["timeUnix"] = timeUnix;
+    target["timeIsoUtc"] = !timeIsoUtc.isEmpty() ? timeIsoUtc : formatIso8601Utc(static_cast<time_t>(timeUnix));
+    target["timeSource"] = timeSource.isEmpty() ? "patched" : timeSource;
+    target["timeSynced"] = patch["timeSynced"].isNull() ? false : patch["timeSynced"].as<bool>();
+    return true;
+}
+
+bool patchTimestamp(const String& serial,
+                    size_t entryId,
+                    JsonObjectConst patch,
+                    JsonObject updatedOut,
+                    String& error) {
+    error = "";
+    if (serial.isEmpty()) {
+        error = "serial is required for brew history";
+        return false;
+    }
+
+    const String path = historyPath(serial);
+    File file = LittleFS.open(path, "r");
+    if (!file) {
+        error = "brew history entry not found";
+        return false;
+    }
+
+    std::vector<String> rewrittenLines;
+    rewrittenLines.reserve(64);
+    size_t totalBytes = 0;
+    size_t currentEntryId = 0;
+    bool found = false;
+    String line;
+    while (readLine(file, line)) {
+        DynamicJsonDocument lineDoc(4096);
+        DeserializationError parseError = deserializeJson(lineDoc, line);
+        if (parseError) {
+            file.close();
+            error = String("failed to parse brew history entry ") + currentEntryId;
+            return false;
+        }
+
+        JsonObject entry = lineDoc.as<JsonObject>();
+        if (currentEntryId == entryId) {
+            if (!applyTimestampPatch(entry, patch, error)) {
+                file.close();
+                return false;
+            }
+            updatedOut.set(entry);
+            updatedOut["entryId"] = static_cast<uint32_t>(entryId);
+            found = true;
+        }
+
+        String serialized;
+        if (!serializeEntry(entry, serialized, error)) {
+            file.close();
+            return false;
+        }
+        rewrittenLines.push_back(serialized);
+        totalBytes += serialized.length() + 1;
+        currentEntryId++;
+    }
+    file.close();
+
+    if (!found) {
+        error = "brew history entry not found";
+        return false;
+    }
+    if (totalBytes > budgetBytes()) {
+        error = "patched brew history exceeds the configured size limit";
+        return false;
+    }
+    return writeLines(path, rewrittenLines, error);
+}
+
+bool deleteEntry(const String& serial,
+                 size_t entryId,
+                 JsonObject deletedOut,
+                 String& error) {
+    error = "";
+    if (serial.isEmpty()) {
+        error = "serial is required for brew history";
+        return false;
+    }
+
+    const String path = historyPath(serial);
+    File file = LittleFS.open(path, "r");
+    if (!file) {
+        error = "brew history entry not found";
+        return false;
+    }
+
+    std::vector<String> rewrittenLines;
+    rewrittenLines.reserve(64);
+    size_t totalBytes = 0;
+    size_t currentEntryId = 0;
+    bool found = false;
+    String line;
+    while (readLine(file, line)) {
+        DynamicJsonDocument lineDoc(4096);
+        DeserializationError parseError = deserializeJson(lineDoc, line);
+        if (parseError) {
+            file.close();
+            error = String("failed to parse brew history entry ") + currentEntryId;
+            return false;
+        }
+
+        JsonObject entry = lineDoc.as<JsonObject>();
+        if (currentEntryId == entryId) {
+            deletedOut.set(entry);
+            deletedOut["entryId"] = static_cast<uint32_t>(entryId);
+            found = true;
+            currentEntryId++;
+            continue;
+        }
+
+        String serialized;
+        if (!serializeEntry(entry, serialized, error)) {
+            file.close();
+            return false;
+        }
+        rewrittenLines.push_back(serialized);
+        totalBytes += serialized.length() + 1;
+        currentEntryId++;
+    }
+    file.close();
+
+    if (!found) {
+        error = "brew history entry not found";
+        return false;
+    }
+    if (totalBytes > budgetBytes()) {
+        error = "rewritten brew history exceeds the configured size limit";
+        return false;
+    }
+    return writeLines(path, rewrittenLines, error);
+}
+
 void appendCompactRecipe(JsonObject target, JsonObjectConst recipe) {
     static const char* FIELDS[] = {
         "selector",
@@ -549,7 +724,7 @@ bool buildImportedEntry(JsonObjectConst request, JsonObject target, String& erro
     bool timeSynced = request["timeSynced"] | false;
     const bool hasTimeUnix = !request["timeUnix"].isNull();
     const String timeIsoUtc = sanitizeMetadataText(request["timeIsoUtc"], 32);
-    if (hasTimeUnix || !timeIsoUtc.isEmpty()) {
+    if ((hasTimeUnix || !timeIsoUtc.isEmpty()) && request["timeSynced"].isNull()) {
         timeSynced = true;
     }
     target["timeSynced"] = timeSynced;
@@ -559,6 +734,7 @@ bool buildImportedEntry(JsonObjectConst request, JsonObject target, String& erro
     if (!timeIsoUtc.isEmpty()) {
         target["timeIsoUtc"] = timeIsoUtc;
     }
+    copySanitizedStringField(target, request, "timeSource", 16);
 
     copySanitizedStringField(target, request, "actor", 48);
     copySanitizedStringField(target, request, "label", 80);
@@ -710,9 +886,16 @@ void buildAcceptedEntry(JsonVariantConst request,
     target["result"] = "accepted";
     target["source"] = source.isEmpty() ? "api" : source;
     target["timeSynced"] = timeStatus.synced;
-    if (timeStatus.synced) {
+    if (timeStatus.available) {
         target["timeUnix"] = static_cast<int64_t>(timeStatus.unixTime);
         target["timeIsoUtc"] = timeStatus.iso8601Utc;
+    }
+    if (timeStatus.synced) {
+        target["timeSource"] = "ntp";
+    } else if (timeStatus.restored) {
+        target["timeSource"] = "restored";
+    } else if (timeStatus.clientSeeded) {
+        target["timeSource"] = "client";
     }
 
     if (!actor.isEmpty()) {

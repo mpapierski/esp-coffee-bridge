@@ -752,6 +752,8 @@ static const char kPage[] PROGMEM = R"HTML(
       headers: { ...(options.headers || {}) }
     };
 
+    request.headers["X-Bridge-Time-Unix-Ms"] = String(Date.now());
+
     if (options.json !== undefined) {
       request.body = JSON.stringify(options.json);
       request.headers["Content-Type"] = "application/json";
@@ -926,6 +928,82 @@ static const char kPage[] PROGMEM = R"HTML(
       return `${(value / 1024).toFixed(value >= 10 * 1024 ? 0 : 1)} KiB`;
     }
     return `${Math.round(value)} B`;
+  }
+
+  function timeModeLabel(mode) {
+    return String(mode || "ntp") === "no_time" ? "No time" : "NTP";
+  }
+
+  function timeModeHelp(mode) {
+    if (String(mode || "ntp") === "no_time") {
+      return "No time mode disables NTP. The bridge will only learn time from an HTTP client request. After each boot, at least one HTTP request must reach the bridge before history can store real timestamps. If nothing seeds the clock, uptime values will be stored instead.";
+    }
+    return "NTP is requested whenever Wi-Fi connects. The saved server list is used in order until one answers.";
+  }
+
+  function timeSourceLabel(status) {
+    const source = String(status?.timeSource || "");
+    if (source === "ntp") {
+      return "NTP";
+    }
+    if (source === "client") {
+      return "Client request";
+    }
+    if (source === "restored") {
+      return "Warm reboot restore";
+    }
+    return status?.timeAvailable ? "Clock available" : "No clock yet";
+  }
+
+  function ntpAttemptLabel(status) {
+    if (String(status?.timeConfig?.mode || "ntp") === "no_time") {
+      return "disabled";
+    }
+    return status?.timeLastAttemptMs ? formatAgo(status.timeLastAttemptMs) : "not yet";
+  }
+
+  function ntpSuccessLabel(status) {
+    if (String(status?.timeConfig?.mode || "ntp") === "no_time") {
+      return "disabled";
+    }
+    if (status?.timeLastSuccessIsoUtc) {
+      return String(status.timeLastSuccessIsoUtc);
+    }
+    return "not yet";
+  }
+
+  function ntpDiagnosticLabel(status) {
+    if (String(status?.timeConfig?.mode || "ntp") === "no_time") {
+      return "NTP disabled";
+    }
+    return String(status?.ntpDiagnosticMessage || "Waiting for the first NTP attempt");
+  }
+
+  function ntpDiagnosticTargetLabel(status) {
+    const server = String(status?.ntpDiagnosticServer || "");
+    const address = String(status?.ntpDiagnosticAddress || "");
+    if (server && address) {
+      return `${server} (${address})`;
+    }
+    return server || address || "";
+  }
+
+  function applyTimeModeFormState(form, mode) {
+    if (!(form instanceof HTMLFormElement)) {
+      return;
+    }
+    const noTime = String(mode || "ntp") === "no_time";
+    ["ntpServerPrimary", "ntpServerSecondary", "ntpServerTertiary"].forEach((name) => {
+      const input = form.elements[name];
+      if (input instanceof HTMLInputElement) {
+        input.disabled = noTime;
+      }
+    });
+    const warning = form.querySelector('[data-role="time-mode-warning"]');
+    if (warning instanceof HTMLElement) {
+      warning.textContent = timeModeHelp(mode);
+      warning.className = noTime ? "empty" : "muted";
+    }
   }
 
   function percentOf(value, max) {
@@ -2404,6 +2482,9 @@ static const char kPage[] PROGMEM = R"HTML(
 
   function renderSystemPage() {
     const history = state.status?.historyStorage || {};
+    const timeConfig = state.status?.timeConfig || {};
+    const timeMode = String(timeConfig.mode || "ntp");
+    const ntpDisabled = timeMode === "no_time";
     const historyBudgetBytes = Math.max(0, Number(history.budgetBytes || 0));
     const historyBudgetMinBytes = Math.max(0, Number(history.budgetMinBytes || 0));
     const historyBudgetUpperBytes = Math.max(historyBudgetBytes, Number(history.budgetUpperBytes || 0));
@@ -2415,7 +2496,7 @@ static const char kPage[] PROGMEM = R"HTML(
     const littleFsUsagePercent = percentOf(littleFsUsedBytes, littleFsTotalBytes);
     return sectionShell(
       "System",
-      "Bridge-level controls stay separate from the coffee-machine dashboard: Wi-Fi, OTA, reboot, and store reset.",
+      "Bridge-level controls stay separate from the coffee-machine dashboard: Wi-Fi, time, OTA, reboot, and store reset.",
       `
         <section class="grid two">
           <article class="panel">
@@ -2445,6 +2526,58 @@ static const char kPage[] PROGMEM = R"HTML(
               </div>
             </form>
           </article>
+        </section>
+
+        <section class="panel">
+          <div class="row" style="justify-content:space-between;align-items:flex-start;">
+            <div>
+              <h2 class="section-title">Time</h2>
+              <div class="muted">Choose how the bridge should obtain wall-clock time for brew history and counter-history timestamps.</div>
+            </div>
+            <div class="badge-row">
+              <span class="badge">${escapeHtml(timeModeLabel(timeMode))}</span>
+              <span class="badge">${escapeHtml(timeSourceLabel(state.status))}</span>
+            </div>
+          </div>
+          <div class="grid two" style="margin-top:16px;">
+            <article class="setting-row">
+              <form data-action="save-time-config">
+                <label class="label">Mode
+                  <select name="mode" data-action="time-mode-select">
+                    <option value="ntp" ${timeMode === "ntp" ? "selected" : ""}>NTP</option>
+                    <option value="no_time" ${timeMode === "no_time" ? "selected" : ""}>No time</option>
+                  </select>
+                </label>
+                <div class="field-grid">
+                  <label class="label">Primary NTP server
+                    <input type="text" name="ntpServerPrimary" value="${escapeHtml(timeConfig.ntpServerPrimary || "pool.ntp.org")}" ${ntpDisabled ? "disabled" : ""}>
+                  </label>
+                  <label class="label">Secondary NTP server
+                    <input type="text" name="ntpServerSecondary" value="${escapeHtml(timeConfig.ntpServerSecondary || "time.google.com")}" ${ntpDisabled ? "disabled" : ""}>
+                  </label>
+                  <label class="label">Tertiary NTP server
+                    <input type="text" name="ntpServerTertiary" value="${escapeHtml(timeConfig.ntpServerTertiary || "time.cloudflare.com")}" ${ntpDisabled ? "disabled" : ""}>
+                  </label>
+                </div>
+                <div class="${ntpDisabled ? "empty" : "muted"}" data-role="time-mode-warning">${escapeHtml(timeModeHelp(timeMode))}</div>
+                <div class="row">
+                  <button type="submit">Save time settings</button>
+                </div>
+              </form>
+            </article>
+            <article class="setting-row">
+              <strong>Current clock</strong>
+              <div class="value-list">
+                <div class="value-item"><span>Source</span><span>${escapeHtml(timeSourceLabel(state.status))}</span></div>
+                <div class="value-item"><span>Current UTC</span><span>${escapeHtml(state.status?.timeIsoUtc || (state.status?.timeAvailable ? String(state.status?.timeUnix || "") : "unavailable"))}</span></div>
+                <div class="value-item"><span>Last NTP attempt</span><span>${escapeHtml(ntpAttemptLabel(state.status))}</span></div>
+                <div class="value-item"><span>Last NTP success</span><span>${escapeHtml(ntpSuccessLabel(state.status))}</span></div>
+                <div class="value-item"><span>NTP diagnostics</span><span>${escapeHtml(ntpDiagnosticLabel(state.status))}</span></div>
+                ${ntpDiagnosticTargetLabel(state.status) ? `<div class="value-item"><span>Probe target</span><span>${escapeHtml(ntpDiagnosticTargetLabel(state.status))}</span></div>` : ""}
+                ${state.status?.ntpDiagnosticRoundTripMs ? `<div class="value-item"><span>Probe RTT</span><span>${escapeHtml(String(state.status.ntpDiagnosticRoundTripMs))} ms</span></div>` : ""}
+              </div>
+            </article>
+          </div>
         </section>
 
         <section class="panel">
@@ -3006,12 +3139,13 @@ static const char kPage[] PROGMEM = R"HTML(
 
   document.body.addEventListener("change", async (event) => {
     const target = event.target;
-    if (!(target instanceof HTMLInputElement)) {
-      return;
-    }
-    if (target.dataset.action === "toggle-show-coffee-machines") {
+    if (target instanceof HTMLInputElement && target.dataset.action === "toggle-show-coffee-machines") {
       state.showCoffeeMachines = !!target.checked;
       await renderRoute();
+      return;
+    }
+    if (target instanceof HTMLSelectElement && target.dataset.action === "time-mode-select") {
+      applyTimeModeFormState(target.form, target.value);
     }
   });
 
@@ -3262,6 +3396,19 @@ static const char kPage[] PROGMEM = R"HTML(
             password: String(form.elements.password.value || "")
           }
         }), "Wi-Fi credentials saved.");
+        await refreshCore();
+        await renderRoute();
+      }
+
+      if (action === "save-time-config") {
+        await runWithFlash("Saving time settings…", () => api("/api/time/config", {
+          json: {
+            mode: String(form.elements.mode.value || "ntp").trim(),
+            ntpServerPrimary: String(form.elements.ntpServerPrimary?.value || "").trim(),
+            ntpServerSecondary: String(form.elements.ntpServerSecondary?.value || "").trim(),
+            ntpServerTertiary: String(form.elements.ntpServerTertiary?.value || "").trim()
+          }
+        }), "Time settings saved.");
         await refreshCore();
         await renderRoute();
       }

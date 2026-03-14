@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -52,6 +53,7 @@ constexpr char PREFS_HISTORY_MAX_BYTES[] = "hist_max";
 constexpr char PREFS_MACHINES[] = "machines";
 constexpr char PREFS_MACHINE_STORE[] = "store";
 constexpr char PREFS_MACHINE_SCHEMA[] = "schema";
+constexpr char CLIENT_TIME_HEADER[] = "X-Bridge-Time-Unix-Ms";
 
 struct ScanRecord {
     String address;
@@ -452,7 +454,27 @@ void sendError(int code, const String& error) {
     sendJson(doc, code);
 }
 
+void maybeApplyClientTimeHeader() {
+    if (!server.hasHeader(CLIENT_TIME_HEADER)) {
+        return;
+    }
+
+    const String value = server.header(CLIENT_TIME_HEADER);
+    if (value.isEmpty()) {
+        return;
+    }
+
+    char* end = nullptr;
+    const int64_t unixMs = strtoll(value.c_str(), &end, 10);
+    if (end == value.c_str() || (end != nullptr && *end != '\0') || unixMs <= 0) {
+        return;
+    }
+
+    bridge_time::seedFromUnixTime(static_cast<time_t>(unixMs / 1000), millis(), addTimeLog);
+}
+
 bool parseJsonBody(DynamicJsonDocument& doc, String& error) {
+    maybeApplyClientTimeHeader();
     if (!server.hasArg("plain")) {
         error = "missing request body";
         return false;
@@ -530,6 +552,21 @@ size_t parseOffsetArg(const char* name, size_t defaultValue) {
         return defaultValue;
     }
     return static_cast<size_t>(parsedValue);
+}
+
+bool parseUnsignedPathIndex(const String& value, size_t& parsedOut) {
+    parsedOut = 0;
+    if (value.isEmpty()) {
+        return false;
+    }
+
+    char* end = nullptr;
+    const unsigned long parsed = strtoul(value.c_str(), &end, 10);
+    if (end == value.c_str() || (end != nullptr && *end != '\0')) {
+        return false;
+    }
+    parsedOut = static_cast<size_t>(parsed);
+    return true;
 }
 
 bool initializeLittleFs(String& error) {
@@ -1605,6 +1642,18 @@ void connectWifi() {
     }
 
     bridge_time::tick(WiFi.status() == WL_CONNECTED, millis(), addTimeLog);
+    const bridge_time::ConfigSnapshot timeConfig = bridge_time::config();
+    if (WiFi.status() == WL_CONNECTED && timeConfig.mode == "ntp") {
+        const uint32_t syncStartedAt = millis();
+        while ((millis() - syncStartedAt) < 5000) {
+            bridge_time::tick(true, millis(), addTimeLog);
+            const bridge_time::StatusSnapshot timeStatus = bridge_time::snapshot();
+            if (timeStatus.synced || timeStatus.available) {
+                break;
+            }
+            delay(250);
+        }
+    }
 }
 
 bool resolveSessionKeyForRequest(const String& sessionHex,
@@ -3880,6 +3929,7 @@ void performScan() {
 
 void appendStatus(JsonDocument& doc) {
     const bridge_time::StatusSnapshot timeStatus = bridge_time::snapshot();
+    const bridge_time::ConfigSnapshot timeConfig = bridge_time::config();
     const size_t littleFsTotalBytes = littleFsReady ? LittleFS.totalBytes() : 0;
     const size_t littleFsUsedBytes = littleFsReady ? LittleFS.usedBytes() : 0;
 
@@ -3909,11 +3959,28 @@ void appendStatus(JsonDocument& doc) {
     doc["littleFsTotalBytes"] = littleFsTotalBytes;
     doc["littleFsUsedBytes"] = littleFsUsedBytes;
     doc["timeConfigured"] = timeStatus.configured;
+    doc["timeAvailable"] = timeStatus.available;
     doc["timeSynced"] = timeStatus.synced;
+    doc["timeRestored"] = timeStatus.restored;
+    doc["timeClientSeeded"] = timeStatus.clientSeeded;
     doc["timeLastAttemptMs"] = timeStatus.lastAttemptMs;
     doc["timeLastSuccessMs"] = timeStatus.lastSuccessMs;
+    doc["timeLastSuccessUnix"] = static_cast<int64_t>(timeStatus.lastSuccessUnix);
+    doc["timeLastSuccessIsoUtc"] = timeStatus.lastSuccessIsoUtc;
+    doc["ntpDiagnosticAtMs"] = timeStatus.ntpDiagnosticAtMs;
+    doc["ntpDiagnosticRoundTripMs"] = timeStatus.ntpDiagnosticRoundTripMs;
+    doc["ntpDiagnosticCode"] = timeStatus.ntpDiagnosticCode;
+    doc["ntpDiagnosticMessage"] = timeStatus.ntpDiagnosticMessage;
+    doc["ntpDiagnosticServer"] = timeStatus.ntpDiagnosticServer;
+    doc["ntpDiagnosticAddress"] = timeStatus.ntpDiagnosticAddress;
     doc["timeUnix"] = static_cast<int64_t>(timeStatus.unixTime);
     doc["timeIsoUtc"] = timeStatus.iso8601Utc;
+    doc["timeSource"] = timeStatus.synced ? "ntp" : (timeStatus.restored ? "restored" : (timeStatus.clientSeeded ? "client" : ""));
+    JsonObject timeConfigJson = doc.createNestedObject("timeConfig");
+    timeConfigJson["mode"] = timeConfig.mode;
+    timeConfigJson["ntpServerPrimary"] = timeConfig.ntpServerPrimary;
+    timeConfigJson["ntpServerSecondary"] = timeConfig.ntpServerSecondary;
+    timeConfigJson["ntpServerTertiary"] = timeConfig.ntpServerTertiary;
 
     size_t supportedCount = 0;
     for (const auto& record : scannedDevices) {
@@ -5033,6 +5100,94 @@ void handleMachineHistoryImport(const String& serial) {
     sendJson(response);
 }
 
+void handleMachineHistoryPatch(const String& serial, const String& entryIdRaw) {
+    SavedMachine* machine = findSavedMachineBySerial(serial);
+    if (machine == nullptr) {
+        sendError(404, "saved machine not found");
+        return;
+    }
+    if (!littleFsReady) {
+        lastError = "LittleFS is unavailable";
+        sendError(503, lastError);
+        return;
+    }
+
+    size_t entryId = 0;
+    if (!parseUnsignedPathIndex(entryIdRaw, entryId)) {
+        sendError(400, "history entry id must be an unsigned integer");
+        return;
+    }
+
+    DynamicJsonDocument requestDoc(2048);
+    String error;
+    if (!parseJsonBody(requestDoc, error)) {
+        sendError(400, error);
+        return;
+    }
+
+    DynamicJsonDocument response(4096);
+    JsonObject entry = response.createNestedObject("entry");
+    if (!brew_history::patchTimestamp(machine->serial, entryId, requestDoc.as<JsonObjectConst>(), entry, error)) {
+        if (error == "brew history entry not found") {
+            sendError(404, error);
+            return;
+        }
+        if (error == "patched brew history exceeds the configured size limit") {
+            sendError(409, error);
+            return;
+        }
+        lastError = error;
+        sendError(400, error);
+        return;
+    }
+
+    response["ok"] = true;
+    response["serial"] = machine->serial;
+    response["alias"] = machine->alias;
+    response["entryId"] = static_cast<uint32_t>(entryId);
+    appendStatus(response);
+    sendJson(response);
+}
+
+void handleMachineHistoryDelete(const String& serial, const String& entryIdRaw) {
+    SavedMachine* machine = findSavedMachineBySerial(serial);
+    if (machine == nullptr) {
+        sendError(404, "saved machine not found");
+        return;
+    }
+    if (!littleFsReady) {
+        lastError = "LittleFS is unavailable";
+        sendError(503, lastError);
+        return;
+    }
+
+    size_t entryId = 0;
+    if (!parseUnsignedPathIndex(entryIdRaw, entryId)) {
+        sendError(400, "history entry id must be an unsigned integer");
+        return;
+    }
+
+    DynamicJsonDocument response(4096);
+    JsonObject entry = response.createNestedObject("entry");
+    String error;
+    if (!brew_history::deleteEntry(machine->serial, entryId, entry, error)) {
+        if (error == "brew history entry not found") {
+            sendError(404, error);
+            return;
+        }
+        lastError = error;
+        sendError(500, error);
+        return;
+    }
+
+    response["ok"] = true;
+    response["serial"] = machine->serial;
+    response["alias"] = machine->alias;
+    response["entryId"] = static_cast<uint32_t>(entryId);
+    appendStatus(response);
+    sendJson(response);
+}
+
 void handleMachinesList() {
     refreshAllSavedMachinePresence();
     DynamicJsonDocument doc(16384);
@@ -5521,6 +5676,7 @@ void handleMachineBrew(const String& serial) {
     history["timeSynced"] = historyEntry["timeSynced"] | false;
     history["timeUnix"] = historyEntry["timeUnix"] | static_cast<int64_t>(0);
     history["timeIsoUtc"] = historyEntry["timeIsoUtc"] | "";
+    history["timeSource"] = historyEntry["timeSource"] | "";
     if (!historyLogged) {
         if (historyError.isEmpty() && !littleFsReady) {
             historyError = "LittleFS is unavailable";
@@ -6239,6 +6395,14 @@ bool dispatchMachineApiRoute() {
         handleMachineHistoryImport(serial);
         return true;
     }
+    if (section == "history" && server.method() == HTTP_PATCH && !tail.isEmpty()) {
+        handleMachineHistoryPatch(serial, tail);
+        return true;
+    }
+    if (section == "history" && server.method() == HTTP_DELETE && !tail.isEmpty()) {
+        handleMachineHistoryDelete(serial, tail);
+        return true;
+    }
     if (section == "stats" && server.method() == HTTP_GET && tail == "history") {
         handleMachineStatsHistory(serial);
         return true;
@@ -6284,6 +6448,7 @@ void handleRoot() {
 }
 
 void handleStatus() {
+    maybeApplyClientTimeHeader();
     DynamicJsonDocument doc(6144);
     doc["ok"] = true;
     appendStatus(doc);
@@ -6336,6 +6501,32 @@ void handleWifiSave() {
     WiFi.disconnect(true, false);
     delay(250);
     connectWifi();
+
+    DynamicJsonDocument response(2048);
+    response["ok"] = true;
+    appendStatus(response);
+    sendJson(response);
+}
+
+void handleTimeConfigSave() {
+    DynamicJsonDocument request(1024);
+    String error;
+    if (!parseJsonBody(request, error)) {
+        sendError(400, error);
+        return;
+    }
+
+    if (!bridge_time::saveConfig(request["mode"] | "ntp",
+                                 request["ntpServerPrimary"] | "",
+                                 request["ntpServerSecondary"] | "",
+                                 request["ntpServerTertiary"] | "",
+                                 error,
+                                 addTimeLog)) {
+        sendError(400, error.isEmpty() ? String("failed to save time configuration") : error);
+        return;
+    }
+
+    bridge_time::tick(WiFi.status() == WL_CONNECTED, millis(), addTimeLog);
 
     DynamicJsonDocument response(2048);
     response["ok"] = true;
@@ -7606,6 +7797,7 @@ void handleReboot() {
     doc["ok"] = true;
     doc["message"] = "rebooting";
     sendJson(doc);
+    bridge_time::persist(millis(), addTimeLog);
     delay(250);
     ESP.restart();
 }
@@ -7618,6 +7810,7 @@ void handleOtaFinished() {
     sendJson(doc, ok ? 200 : 500);
     if (ok) {
         addLog("ota", "OTA update complete, rebooting");
+        bridge_time::persist(millis(), addTimeLog);
         delay(250);
         ESP.restart();
     }
@@ -7657,6 +7850,8 @@ void handleOtaUpload() {
 }
 
 void registerRoutes() {
+    const char* trackedHeaders[] = {CLIENT_TIME_HEADER};
+    server.collectHeaders(trackedHeaders, 1);
     server.on("/", HTTP_GET, handleRoot);
     server.on("/api/status", HTTP_GET, handleStatus);
     server.on("/api/devices", HTTP_GET, handleDevices);
@@ -7671,6 +7866,7 @@ void registerRoutes() {
     server.on("/api/backup/export", HTTP_GET, handleBackupExport);
     server.on("/api/backup/restore", HTTP_POST, handleBackupRestoreFinished, handleBackupRestoreUpload);
     server.on("/api/wifi/save", HTTP_POST, handleWifiSave);
+    server.on("/api/time/config", HTTP_POST, handleTimeConfigSave);
     server.on("/api/history/config", HTTP_POST, handleHistoryConfigSave);
     server.on("/api/scan", HTTP_POST, handleScan);
     server.on("/api/connect", HTTP_POST, handleConnect);
@@ -7725,7 +7921,7 @@ void setup() {
 
     preferences.begin(PREFS_WIFI, false);
     machinePreferences.begin(PREFS_MACHINES, false);
-    bridge_time::begin();
+    bridge_time::begin(addTimeLog);
     if (!initializeLittleFs(lastError)) {
         addLog("fs", String("Failed to initialize LittleFS: ") + lastError);
     } else {

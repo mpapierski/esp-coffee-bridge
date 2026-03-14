@@ -338,9 +338,16 @@ bool recordSnapshotIfChanged(const String& serial,
     currentEntry["loggedAtMs"] = loggedAtMs;
     currentEntry["source"] = sanitizeText(source, 24).isEmpty() ? "stats" : sanitizeText(source, 24);
     currentEntry["timeSynced"] = timeStatus.synced;
-    if (timeStatus.synced) {
+    if (timeStatus.available) {
         currentEntry["timeUnix"] = static_cast<int64_t>(timeStatus.unixTime);
         currentEntry["timeIsoUtc"] = timeStatus.iso8601Utc;
+    }
+    if (timeStatus.synced) {
+        currentEntry["timeSource"] = "ntp";
+    } else if (timeStatus.restored) {
+        currentEntry["timeSource"] = "restored";
+    } else if (timeStatus.clientSeeded) {
+        currentEntry["timeSource"] = "client";
     }
     JsonObject currentValues = currentEntry.createNestedObject("values");
     buildCompactValues(currentValues, liveValues);

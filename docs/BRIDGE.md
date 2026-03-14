@@ -32,6 +32,7 @@ Current embedded bridge UI is now organized around remembered machines rather th
   - `POST /api/machines/{serial}/brew`
     - current implementation first reads the live standard recipe, applies request overrides, uploads a temporary recipe snapshot into the machine scratch namespace, and only then sends the standard selector-based `HE` payload
     - successful accepted brews are appended to a bounded per-machine JSONL history in LittleFS
+    - history timestamps use UTC from the active bridge time mode: `ntp` requests fresh network time on every Wi-Fi connect, while `no_time` disables NTP and relies on client-seeded HTTP requests plus the restored last-known clock
     - the per-machine history budget is runtime-configurable from the system page and persisted in controller preferences
     - optional request metadata fields:
       - `source`
@@ -63,15 +64,33 @@ Current embedded bridge UI is now organized around remembered machines rather th
   - `GET /api/machines/{serial}/history`
     - returns newest brew log entries first
     - supports optional `limit` and `offset` query parameters for pagination from newest to oldest
-    - each entry stores the final applied compact recipe snapshot plus a stable recipe fingerprint and UTC timestamp when NTP is synced
+    - each entry stores the final applied compact recipe snapshot plus a stable recipe fingerprint and UTC timestamp whenever the bridge has a usable wall clock
+    - each returned entry also includes `entryId`, a stable oldest-first line index that can be used with the patch endpoint
   - `POST /api/machines/{serial}/history/import`
     - accepts a single entry object, `{ "entry": { ... } }`, or `{ "entries": [ ... ] }`
     - recomputes `recipeFingerprint` on the bridge from the imported `recipe` object instead of trusting caller input
     - stores only the compact supported recipe fields in the persisted history entry
+  - `PATCH /api/machines/{serial}/history/{entryId}`
+    - updates the timestamp metadata for one persisted brew-history entry without rewriting recipe fields
+    - accepts `timeUnix` in seconds or `timeUnixMs` in milliseconds
+    - optional fields: `timeIsoUtc`, `timeSource`, `timeSynced`
+    - defaults `timeSource` to `patched` and generates `timeIsoUtc` automatically when omitted
+  - `DELETE /api/machines/{serial}/history/{entryId}`
+    - deletes one persisted brew-history entry by `entryId`
+    - returns the deleted entry payload for confirmation
   - `POST /api/history/config`
     - updates the runtime per-machine brew-history budget in bytes
     - clamps the cap between the configured minimum and the mounted LittleFS size
     - compacts existing history files immediately if the new cap is lower than the current file size
+  - `POST /api/time/config`
+    - persists the bridge time mode and NTP server list
+    - default mode is `ntp` with `pool.ntp.org`, `time.google.com`, and `time.cloudflare.com`
+    - `ntp` mode requests UTC after every Wi-Fi connect and keeps retrying until sync succeeds
+    - `no_time` mode stops SNTP and accepts UTC only from client HTTP requests
+    - warm-reboot time restore only uses RTC-retained state; cold boots after power loss no longer reuse the old flash-persisted wall clock
+  - `GET /api/status`
+    - includes `ntpDiagnosticCode`, `ntpDiagnosticMessage`, `ntpDiagnosticServer`, `ntpDiagnosticAddress`, and `ntpDiagnosticRoundTripMs`
+    - the system page uses those fields to tell DNS failure apart from a missing UDP/123 reply
   - `GET /api/backup/export`
     - streams an NDJSON backup bundle with saved machines, the configured brew-history budget, all persisted brew-history entries, and all persisted counter-history snapshots
     - excludes Wi-Fi credentials, protocol-session cache, and LittleFS recipe caches

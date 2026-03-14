@@ -67,6 +67,15 @@ bool buildImportedLines(JsonVariantConst payload,
                         std::vector<String>& linesOut,
                         size_t& importedCount,
                         String& error);
+bool patchTimestamp(const String& serial,
+                    size_t entryId,
+                    JsonObjectConst patch,
+                    JsonObject updatedOut,
+                    String& error);
+bool deleteEntry(const String& serial,
+                 size_t entryId,
+                 JsonObject deletedOut,
+                 String& error);
 bool loadPage(const String& serial,
               size_t offset,
               size_t limit,

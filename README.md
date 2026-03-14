@@ -51,13 +51,13 @@ The intended workflow is:
 - `Live machine summary`: shows current status summary, process label/code, operator message label/code, progress, and whether the APK-backed `HY` host-confirm path is currently suggested.
 - `Standard drinks`: lists the built-in drink selectors, supports quick brew, and opens a per-drink customization view.
 - `Temporary brew customization`: refreshes current standard drink values from the machine, can warm the full standard-drink cache from the machine, and sends temporary overrides such as strength, aroma, temperature, cup mode, and amount fields without overwriting the machine's saved recipe.
-- `Brew history`: stores a bounded per-machine history in LittleFS with the final applied recipe snapshot, a stable recipe fingerprint, optional source or actor metadata, UTC timestamps when NTP is available, and a runtime-adjustable cap from the system page.
+- `Brew history`: stores a bounded per-machine history in LittleFS with the final applied recipe snapshot, a stable recipe fingerprint, optional source or actor metadata, UTC timestamps from either NTP or the fallback client-seeded clock, and a runtime-adjustable cap from the system page.
 - `Counter history`: stores a separate bounded per-machine timeline of beverage and maintenance counters, snapshots only when live values change, and captures local machine use started from the front panel.
 - `MyCoffee / saved recipes`: stores saved custom recipe snapshots in LittleFS too, exposes explicit refresh buttons, shows recipe details, and edits persisted custom recipes where the machine family supports them.
 - `Statistics`: reads beverage counters, maintenance counters, and serial or firmware details.
 - `Settings`: reads supported machine settings, writes updated values, and exposes factory reset actions for settings and recipe defaults.
 - `Diagnostics`: manages cached session keys, raw characteristic reads and writes, encrypted frame send, app-style probes, settings probe, stats probe, bridge logs, and the last raw diagnostics response.
-- `Bridge admin`: saves Wi-Fi credentials, adjusts the brew-history cap, downloads or restores bridge backups, uploads OTA firmware, reboots the bridge, resets the remembered-machine store, and exposes raw bridge status.
+- `Bridge admin`: saves Wi-Fi credentials, configures bridge time mode (`ntp` by default or `no time` fallback), shows NTP diagnostics from the live bridge, adjusts the brew-history cap, downloads or restores bridge backups, uploads OTA firmware, reboots the bridge, resets the remembered-machine store, and exposes raw bridge status.
 
 ## Build
 
@@ -182,10 +182,19 @@ Temporary overrides issued through `/brew` only apply to the started drink. They
 - `GET /api/machines/{serial}/history`
   - returns the newest stored brew entries first
   - optional `?limit=20&offset=40` style query supports pagination from newest to oldest
+  - each returned entry includes `entryId`, a stable oldest-first line index for patching one persisted entry later
 - `POST /api/machines/{serial}/history/import`
   - accepts either a single entry object, an `{ "entry": { ... } }` body, or an `{ "entries": [ ... ] }` batch
   - recomputes `recipeFingerprint` server-side from the submitted compacted `recipe` snapshot and ignores any caller-supplied fingerprint
 - `POST /api/machines/{serial}/history/clear`
+- `PATCH /api/machines/{serial}/history/{entryId}`
+  - updates timestamp metadata for one persisted brew-history entry
+  - accepts `timeUnix` in seconds or `timeUnixMs` in milliseconds
+  - optional fields: `timeIsoUtc`, `timeSource`, `timeSynced`
+  - defaults `timeSource` to `patched` and auto-generates `timeIsoUtc` when it is omitted
+- `DELETE /api/machines/{serial}/history/{entryId}`
+  - deletes one persisted brew-history entry identified by `entryId`
+  - returns the deleted entry body for confirmation
 - `POST /api/history/config`
   - updates the runtime per-machine brew-history cap in bytes
   - clamps the requested value between the configured minimum and the mounted LittleFS size
@@ -224,6 +233,28 @@ Body:
   "password": "your-password"
 }
 ```
+
+### Time
+
+- `POST /api/time/config`
+
+Body:
+
+```json
+{
+  "mode": "ntp",
+  "ntpServerPrimary": "pool.ntp.org",
+  "ntpServerSecondary": "time.google.com",
+  "ntpServerTertiary": "time.cloudflare.com"
+}
+```
+
+Notes:
+
+- `mode: "ntp"` is the default and causes the bridge to request UTC from NTP whenever Wi-Fi connects.
+- `mode: "no_time"` disables NTP completely. In that mode the bridge only learns UTC from an HTTP request carrying the client time header, so each boot needs at least one HTTP request before history can store real timestamps.
+- warm-reboot time restore is only taken from RTC-retained state; a cold boot after power loss no longer reuses an old persisted wall clock
+- `/api/status` also reports `ntpDiagnostic*` fields so the System page can distinguish DNS failure from a missing UDP/123 reply.
 
 ### BLE lifecycle
 
