@@ -1026,6 +1026,19 @@ void refreshSavedMachinePresence(SavedMachine& machine) {
     }
 }
 
+void markSavedMachineReachableFromLiveSession(SavedMachine& machine) {
+    refreshSavedMachinePresence(machine);
+    if (machine.lastSeenAtMs > 0) {
+        return;
+    }
+
+    machine.lastSeenAtMs = millis();
+    machine.lastSeenRssi = 0;
+    if (machine.address.equalsIgnoreCase(selectedAddress)) {
+        machine.addressType = selectedAddressType;
+    }
+}
+
 void refreshAllSavedMachinePresence() {
     for (auto& machine : savedMachines) {
         refreshSavedMachinePresence(machine);
@@ -3602,11 +3615,10 @@ bool runCommunicationVerify(uint32_t waitMs,
 }
 
 void updateSavedMachineFromCachedDetails(SavedMachine& machine) {
-    if (cachedDetails.serial.isEmpty()) {
-        return;
+    if (!cachedDetails.serial.isEmpty()) {
+        populateSavedMachine(machine, machine.alias, machine.address, machine.addressType, cachedDetails);
     }
-    populateSavedMachine(machine, machine.alias, machine.address, machine.addressType, cachedDetails);
-    refreshSavedMachinePresence(machine);
+    markSavedMachineReachableFromLiveSession(machine);
     syncProtocolSessionTarget(machine);
     persistSavedMachines();
 }
@@ -3875,6 +3887,7 @@ void appendStatus(JsonDocument& doc) {
     doc["appVersion"]    = APP_VERSION;
     doc["buildTime"]     = APP_BUILD_TIME;
     doc["hostname"]      = APP_HOSTNAME;
+    doc["uptimeMs"]      = millis();
     doc["apSsid"]        = AP_SSID;
     doc["apPassword"]    = AP_PASSWORD;
     doc["apIp"]          = WiFi.softAPIP().toString();
@@ -4037,7 +4050,7 @@ bool probeMachineAddress(const String& address, SavedMachine& machineOut, String
         return false;
     }
     populateSavedMachine(machineOut, "", address, selectedAddressType, cachedDetails);
-    refreshSavedMachinePresence(machineOut);
+    markSavedMachineReachableFromLiveSession(machineOut);
     String disconnectError;
     disconnectFromDevice(disconnectError);
     return true;
@@ -6055,6 +6068,7 @@ void handleMachineSettingsGet(const String& serial) {
         sendJson(response, 500);
         return;
     }
+    updateSavedMachineFromCachedDetails(*machine);
     response["supported"] = true;
     sendJson(response);
 }
@@ -7161,6 +7175,11 @@ void handleStatsProbe() {
         return;
     }
 
+    if (SavedMachine* machine = !selectedMachineSerial.isEmpty() ? findSavedMachineBySerial(selectedMachineSerial)
+                                                                 : findSavedMachineByAddress(selectedAddress);
+        machine != nullptr) {
+        updateSavedMachineFromCachedDetails(*machine);
+    }
     appendStatus(response);
     sendJson(response);
 }
@@ -7217,6 +7236,11 @@ void handleSettingsProbe() {
         return;
     }
 
+    if (SavedMachine* machine = !selectedMachineSerial.isEmpty() ? findSavedMachineBySerial(selectedMachineSerial)
+                                                                 : findSavedMachineByAddress(selectedAddress);
+        machine != nullptr) {
+        updateSavedMachineFromCachedDetails(*machine);
+    }
     appendStatus(response);
     sendJson(response);
 }

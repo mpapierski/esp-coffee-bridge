@@ -50,6 +50,10 @@ static const char kPage[] PROGMEM = R"HTML(
       linear-gradient(145deg, var(--bg), var(--bg-deep));
   }
 
+  body.modal-open {
+    overflow: hidden;
+  }
+
   a {
     color: inherit;
     text-decoration: none;
@@ -533,6 +537,52 @@ static const char kPage[] PROGMEM = R"HTML(
     font-weight: 600;
   }
 
+  .modal-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 40;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+    background: rgba(27, 22, 18, 0.34);
+    backdrop-filter: blur(10px);
+  }
+
+  .modal-card {
+    width: min(680px, 100%);
+    display: grid;
+    gap: 18px;
+    padding: 24px;
+    border-radius: 30px;
+    background: rgba(255, 249, 241, 0.97);
+    border: 1px solid rgba(255, 255, 255, 0.76);
+    box-shadow: 0 28px 60px rgba(45, 31, 21, 0.22);
+  }
+
+  .modal-card h2 {
+    margin: 0;
+    font-size: clamp(26px, 4vw, 34px);
+    line-height: 0.98;
+    letter-spacing: -0.04em;
+  }
+
+  .modal-card p {
+    margin: 0;
+  }
+
+  .modal-body {
+    display: grid;
+    gap: 14px;
+  }
+
+  .modal-actions {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    gap: 10px;
+  }
+
   @media (max-width: 1100px) {
     .layout {
       grid-template-columns: 1fr;
@@ -551,6 +601,16 @@ static const char kPage[] PROGMEM = R"HTML(
   @media (max-width: 720px) {
     .shell {
       padding: 16px;
+    }
+
+    .modal-backdrop {
+      align-items: flex-end;
+      padding: 16px;
+    }
+
+    .modal-card {
+      padding: 20px;
+      border-radius: 26px;
     }
 
     .grid.two,
@@ -585,6 +645,7 @@ static const char kPage[] PROGMEM = R"HTML(
       <main class="content" id="app"></main>
     </div>
   </div>
+  <div id="modal-root"></div>
 
 <script>
   const SETTING_OPTIONS = {
@@ -633,6 +694,7 @@ static const char kPage[] PROGMEM = R"HTML(
     scanResults: [],
     showCoffeeMachines: true,
     probedMachine: null,
+    modal: null,
     machineCache: {},
     diagnostics: {
       output: null,
@@ -644,6 +706,7 @@ static const char kPage[] PROGMEM = R"HTML(
   const sidebar = document.getElementById("sidebar");
   const flash = document.getElementById("flash");
   const headerBadges = document.getElementById("header-badges");
+  const modalRoot = document.getElementById("modal-root");
 
   function escapeHtml(value) {
     return String(value ?? "")
@@ -715,6 +778,71 @@ static const char kPage[] PROGMEM = R"HTML(
     flash.textContent = message;
   }
 
+  function renderModal() {
+    if (!modalRoot) {
+      return;
+    }
+    if (!state.modal) {
+      document.body.classList.remove("modal-open");
+      modalRoot.innerHTML = "";
+      return;
+    }
+
+    document.body.classList.add("modal-open");
+    const modal = state.modal;
+    const confirmClassName = modal.confirmClass ? ` ${modal.confirmClass}` : "";
+    modalRoot.innerHTML = `
+      <div class="modal-backdrop" role="presentation">
+        <section class="modal-card" role="dialog" aria-modal="true" aria-labelledby="modal-title" aria-describedby="modal-body">
+          <div class="stack" style="gap:8px;">
+            <h2 id="modal-title">${escapeHtml(modal.title || "Confirm action")}</h2>
+            ${modal.subtitle ? `<p class="muted" id="modal-subtitle">${escapeHtml(modal.subtitle)}</p>` : ""}
+          </div>
+          <div class="modal-body" id="modal-body">${modal.bodyHtml || ""}</div>
+          <div class="modal-actions">
+            <button type="button" class="secondary" data-action="modal-cancel">${escapeHtml(modal.cancelLabel || "Cancel")}</button>
+            <button type="button" class="${`modal-confirm${confirmClassName}`.trim()}" data-action="modal-confirm" data-role="modal-confirm">${escapeHtml(modal.confirmLabel || "Confirm")}</button>
+          </div>
+        </section>
+      </div>
+    `;
+
+    const focusTarget = modalRoot.querySelector('[data-role="modal-confirm"]');
+    if (focusTarget && typeof focusTarget.focus === "function") {
+      setTimeout(() => focusTarget.focus(), 0);
+    }
+  }
+
+  function closeModal(result = false) {
+    if (!state.modal) {
+      return;
+    }
+    const resolve = state.modal.resolve;
+    state.modal = null;
+    renderModal();
+    if (typeof resolve === "function") {
+      resolve(result);
+    }
+  }
+
+  function openConfirmModal(options = {}) {
+    return new Promise((resolve) => {
+      if (state.modal && typeof state.modal.resolve === "function") {
+        state.modal.resolve(false);
+      }
+      state.modal = {
+        title: options.title || "Confirm action",
+        subtitle: options.subtitle || "",
+        bodyHtml: options.bodyHtml || "",
+        confirmLabel: options.confirmLabel || "Confirm",
+        cancelLabel: options.cancelLabel || "Cancel",
+        confirmClass: options.confirmClass || "",
+        resolve
+      };
+      renderModal();
+    });
+  }
+
   function route() {
     const cleaned = location.hash.replace(/^#\/?/, "");
     const parts = cleaned ? cleaned.split("/").filter(Boolean) : [];
@@ -770,9 +898,9 @@ static const char kPage[] PROGMEM = R"HTML(
     if (!ms) {
       return "offline";
     }
-    const base = Number(state.status?.lastScanAtMs || 0);
+    const base = Number(state.status?.uptimeMs || state.status?.lastScanAtMs || 0);
     if (!base || ms > base) {
-      return "seen";
+      return "just now";
     }
     const seconds = Math.max(0, Math.round((base - ms) / 1000));
     if (seconds < 15) {
@@ -1853,19 +1981,27 @@ static const char kPage[] PROGMEM = R"HTML(
     return lines;
   }
 
-  function historyReplayConfirmMessage(entry) {
+  function renderHistoryReplayConfirmBody(entry) {
     const title = String(entry?.label || entry?.recipeTitle || entry?.recipeName || "Logged brew");
     const drink = String(entry?.recipeTitle || entry?.recipeName || entry?.recipe?.title || entry?.recipe?.name || title);
-    const lines = [`Brew this recipe again?`, "", `Drink: ${drink}`];
-    if (title && title !== drink) {
-      lines.push(`Label: ${title}`);
-    }
-    lines.push(`Original brew: ${formatHistoryTimestamp(entry)}`);
-    historyReplaySummaryLines(entry).forEach((line) => lines.push(line));
-    if (entry?.recipeFingerprint) {
-      lines.push(`Fingerprint: ${entry.recipeFingerprint}`);
-    }
-    return lines.join("\n");
+    const summaryLines = historyReplaySummaryLines(entry);
+    return `
+      <p class="muted">This replays the saved brew values from the selected history entry back to the machine.</p>
+      <div class="value-list">
+        <div class="value-item"><span>Drink</span><span>${escapeHtml(drink)}</span></div>
+        ${title && title !== drink ? `<div class="value-item"><span>Label</span><span>${escapeHtml(title)}</span></div>` : ""}
+        <div class="value-item"><span>Original brew</span><span>${escapeHtml(formatHistoryTimestamp(entry))}</span></div>
+        ${entry?.recipeFingerprint ? `<div class="value-item"><span>Fingerprint</span><span>${escapeHtml(entry.recipeFingerprint)}</span></div>` : ""}
+      </div>
+      ${summaryLines.length ? `
+        <div class="stack">
+          <div class="muted tiny">Saved brew values</div>
+          <div class="badge-row">
+            ${summaryLines.map((line) => `<span class="badge">${escapeHtml(line)}</span>`).join("")}
+          </div>
+        </div>
+      ` : ""}
+    `;
   }
 
   function renderHistorySection(machine, data) {
@@ -2592,6 +2728,14 @@ static const char kPage[] PROGMEM = R"HTML(
     }
 
     const action = button.dataset.action;
+    if (action === "modal-cancel") {
+      closeModal(false);
+      return;
+    }
+    if (action === "modal-confirm") {
+      closeModal(true);
+      return;
+    }
     try {
       if (action === "scan-devices") {
         const response = await runWithFlash("Scanning for nearby BLE devices…", () => api("/api/scan", { method: "POST", json: {} }), "Scan completed.");
@@ -2662,7 +2806,14 @@ static const char kPage[] PROGMEM = R"HTML(
           throw new Error("History entry is no longer available. Refresh history and try again.");
         }
         const payload = buildHistoryReplayPayload(entry);
-        if (!window.confirm(historyReplayConfirmMessage(entry))) {
+        const confirmed = await openConfirmModal({
+          title: "Brew again?",
+          subtitle: "Replay this logged brew with the same saved values.",
+          bodyHtml: renderHistoryReplayConfirmBody(entry),
+          confirmLabel: "Brew again",
+          cancelLabel: "Keep browsing"
+        });
+        if (!confirmed) {
           return;
         }
         const response = await runWithFlash(
@@ -2843,6 +2994,13 @@ static const char kPage[] PROGMEM = R"HTML(
       }
     } catch (error) {
       console.error(error);
+    }
+  });
+
+  window.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && state.modal) {
+      event.preventDefault();
+      closeModal(false);
     }
   });
 
@@ -3158,6 +3316,7 @@ static const char kPage[] PROGMEM = R"HTML(
   });
 
   window.addEventListener("hashchange", () => {
+    closeModal(false);
     void renderRoute();
   });
 
