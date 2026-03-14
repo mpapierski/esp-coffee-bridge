@@ -43,7 +43,7 @@ Confidence score is a working shorthand, not a statistical measure:
 
 | Packet | Meaning | Payload summary | Status / confidence |
 | --- | --- | --- | --- |
-| `Hp` | Ping / liveness probe | Request: `00 00`. Response: built-in parser expects `24` bytes; fields are not fully documented here. | Request vector confirmed; response meaning still partial, `0.70` |
+| `Hp` | Ping / liveness probe | Request: `00 00`. Response: exactly `24` bytes, but APK `3.8.6` treats that body as opaque and only validates that the reply command is `Hp`. | Wire shape confirmed; payload semantics still unresolved, `0.80` |
 | `HU` | Session setup | Request: `seed4 || verifier2`. Response: `echoed_seed4 || session_key2 || verifier2`. | Fully reversed and live-validated, `0.98` |
 | `HV` | Read software version | Request: empty in the normal app read flow. Response: `11`-byte software-version payload. | APK-traced and live-validated, `0.95` |
 | `HL` | Read serial number | Request: empty in the normal app read flow. Response: `20`-byte serial payload. | APK-traced and live-validated, `0.95` |
@@ -390,6 +390,7 @@ Background task thread behavior:
 - On the queued-task wake, the worker dequeues one `ICoffeeMachineTask` under a monitor lock and executes it.
 - If a queued task throws, the worker stores that exception onto the task and then signals the task-completion event.
 - There is no observed pre-`HU` `Hp` ping.
+- No `CoffeeMachineTaskPing` constructor call site was found in the analyzed worker/startup path.
 - There is no observed `AD01` control-point write before `HU`.
 - There is no explicit delay inserted between notification enable and `HU`.
 - `a.r` uses a 2500 ms request/response timeout.
@@ -400,6 +401,39 @@ Request/response task sequencing:
 
 - `CoffeeMachineTask.RequestResponse(...)` installs the `FrameReceived` waiter before transmitting the request frame.
 - So this library path is not relying on a post-write subscribe race to receive `HU` / `HV` / `HR` replies.
+
+### `Hp` Ping Task (`CoffeeMachineTaskPing`)
+
+Recovered exact APK behavior from `Eugster.EFLibrary.CoffeeMachineTaskPing` in APK `3.8.6`:
+
+- Constructor:
+  - builds plain request frame `Frame("Hp", new byte[2], false, false)`
+  - the `new byte[2]` payload is zero-initialized, so the exact request body is `00 00`
+  - uses the standard request/response timeout path with `2500 ms`
+  - registers one expected reply frame definition: `FrameDefinition("Hp", 24, false, false)`
+- Execute path:
+  - delegates to `CoffeeMachineTaskRequestResponse::Execute(...)`
+  - fetches the returned frame
+  - checks only that `frame.Command == "Hp"`
+  - throws if the command does not match
+- No app-side decoder for the returned `24`-byte payload was found in the shipped library or app assemblies.
+  - the task does not read any payload offsets
+  - no other `Hp`-specific parser or consumer was found in the decompiled APK artifacts
+
+Practical interpretation:
+
+- The APK proves the exact wire contract for `Hp`:
+  - request payload: `00 00`
+  - response payload length: `24`
+  - plain/plain frame flags on both request and expected response definition
+- The APK does not assign semantic meaning to any byte positions inside the `24`-byte response.
+- In the analyzed startup/session flow, `Hp` is not part of the required handshake.
+  - the worker path is `Ready -> HU -> HV -> queued tasks`
+  - no `CoffeeMachineTaskPing` call site was found in that path
+- Current best interpretation is therefore:
+  - `Hp` is a library-level liveness / probe command
+  - it may be useful operationally because live machines answer it immediately on `AD02`
+  - but its response-body field meanings will need live differential captures, not more APK tracing
 
 ## Android Connector Behavior
 
@@ -2250,6 +2284,9 @@ So current live evidence says:
   - still complete the per-item `HD` reset target tables for recipe-item defaults by family
 - Extend live validation to additional command families
   - especially `HA`, `HS`, and any additional `HI` feature bits beyond `ImageTransfer`
+- Map the `Hp` 24-byte response body from live captures
+  - APK `3.8.6` confirms the exact frame shape and that the official code does not parse the payload
+  - remaining work is to correlate byte changes with machine state across controlled before/after experiments
 - Fully document the EFLibrary internal `z.d()` derivation path from the installed 64-byte `customer_key`
   - the exact final 32-byte RC4 key is now recovered and documented above
   - the remaining gap is the full symbolic explanation of the internal derivation helper chain, not the resulting key material
