@@ -14,6 +14,12 @@ Core pieces:
 - JSON API for pairing, remembered machines, recipes, settings, stats, and diagnostics
 - HTTP OTA upload for remote firmware updates
 
+## Home Assistant
+
+Home Assistant integration for this bridge is available here:
+
+- [esp-coffee-bridge-ha](https://github.com/mpapierski/esp-coffee-bridge-ha/)
+
 ## Why This Exists
 
 - The vendor app is limited by BLE range, so it still expects somebody to be physically close to the machine.
