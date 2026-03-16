@@ -153,6 +153,7 @@ Temporary overrides issued through `/brew` only apply to the started drink. They
 ### General
 
 - `GET /api/status`
+  - includes a stable `bridgeId` derived from the ESP32 eFuse MAC and an integer `apiVersion` for client compatibility checks
 - `GET /api/devices`
 - `GET /api/details`
 - `GET /api/logs`
@@ -219,6 +220,7 @@ Temporary overrides issued through `/brew` only apply to the started drink. They
   - optional `?limit=20&offset=40` style query supports pagination from newest to oldest
 - `POST /api/machines/{serial}/stats/history/clear`
 - `GET /api/machines/{serial}/settings`
+  - each `values.<key>` item now includes an `options` array of `{ "code", "label" }` pairs derived from the bridge's setting descriptors
 - `POST /api/machines/{serial}/settings`
 
 ### Wi-Fi

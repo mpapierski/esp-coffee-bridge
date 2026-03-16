@@ -89,6 +89,7 @@ Current embedded bridge UI is now organized around remembered machines rather th
     - `no_time` mode stops SNTP and accepts UTC only from client HTTP requests
     - warm-reboot time restore only uses RTC-retained state; cold boots after power loss no longer reuse the old flash-persisted wall clock
   - `GET /api/status`
+    - includes a stable `bridgeId` derived from the ESP32 eFuse MAC and an integer `apiVersion`
     - includes `ntpDiagnosticCode`, `ntpDiagnosticMessage`, `ntpDiagnosticServer`, `ntpDiagnosticAddress`, and `ntpDiagnosticRoundTripMs`
     - the system page uses those fields to tell DNS failure apart from a missing UDP/123 reply
   - `GET /api/backup/export`
@@ -128,6 +129,7 @@ Current embedded bridge UI is now organized around remembered machines rather th
     - all remaining non-zero bits are surfaced as raw unknowns so the web UI can expose them without overclaiming meaning
     - live observation on March 13, 2026: a `NICR 756` (`EF_1.00R4__386`) stayed silent on `HI` even though `HU` and `HX` succeeded, so this endpoint can legitimately return a timeout on models that do not answer `HI`
   - `GET /api/machines/{serial}/settings`
+    - each `values.<key>` item includes an `options` array of `{ "code", "label" }` pairs from the active family descriptor table
   - `POST /api/machines/{serial}/settings`
 - diagnostics page
   - the new dashboard scopes diagnostics and protocol-session cache to the saved machine, but it still uses the existing low-level routes:

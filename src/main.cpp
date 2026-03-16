@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdio>
 #include <cstdlib>
 #include <string>
 #include <vector>
@@ -30,6 +31,7 @@ constexpr char APP_HOSTNAME[]   = "esp-coffee-bridge";
 constexpr char AP_SSID[]        = "esp-coffee-maker";
 constexpr char AP_PASSWORD[]    = "coffee-setup";
 constexpr char APP_BUILD_TIME[] = __DATE__ " " __TIME__;
+constexpr uint32_t API_VERSION  = 1;
 constexpr uint32_t SCAN_MS      = 5000;
 constexpr uint32_t HTTP_TIMEOUT = 10000;
 constexpr uint32_t DEFAULT_RECONNECT_DELAY_MS = 750;
@@ -1303,6 +1305,21 @@ String formatByteHex(uint8_t value) {
     return String("0x") + text;
 }
 
+String bridgeId() {
+    const uint64_t efuseMac = ESP.getEfuseMac() & 0xFFFFFFFFFFFFULL;
+    char suffix[13];
+    std::snprintf(suffix, sizeof(suffix), "%012llX", static_cast<unsigned long long>(efuseMac));
+    return String(APP_NAME) + "-" + suffix;
+}
+
+void appendSettingOptions(JsonArray options, const nivona::SettingProbeDescriptor& probe) {
+    for (size_t index = 0; index < probe.optionCount; ++index) {
+        JsonObject option = options.createNestedObject();
+        option["code"] = probe.options[index].code;
+        option["label"] = probe.options[index].label != nullptr ? probe.options[index].label : "";
+    }
+}
+
 void appendMachineFeaturesJson(JsonObject target, const nivona::MachineFeatures& features) {
     target["ok"] = features.ok;
     target["payloadSize"] = features.payload.size();
@@ -2511,6 +2528,8 @@ bool runSettingsFlowProbe(uint32_t waitMs,
             valueItem["rawValue"] = result["rawValue"];
             valueItem["valueCodeHex"] = result["valueCodeHex"];
             valueItem["valueLabel"] = result["valueLabel"];
+            JsonArray options = valueItem.createNestedArray("options");
+            appendSettingOptions(options, *probe);
         } else {
             overallOk = false;
         }
@@ -3953,6 +3972,8 @@ void appendStatus(JsonDocument& doc) {
 
     doc["appName"]       = APP_NAME;
     doc["appVersion"]    = APP_VERSION;
+    doc["apiVersion"]    = API_VERSION;
+    doc["bridgeId"]      = bridgeId();
     doc["buildTime"]     = APP_BUILD_TIME;
     doc["hostname"]      = APP_HOSTNAME;
     doc["uptimeMs"]      = millis();
