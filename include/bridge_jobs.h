@@ -42,6 +42,10 @@ struct Submission {
     std::string targetAddress;
     uint8_t targetAddressType{0};
     std::string coalesceKey;
+    // At most one queued or running job may hold a non-empty admission key.
+    // Unlike coalescing, a duplicate submission is rejected and retains its
+    // own request semantics.
+    std::string admissionKey;
     std::string resultUrl;
     Priority priority{Priority::StaleRefresh};
     uint32_t deadlineMs{12000};
@@ -63,6 +67,7 @@ struct Job {
     std::string targetAddress;
     uint8_t targetAddressType{0};
     std::string coalesceKey;
+    std::string admissionKey;
     std::string resultUrl;
     std::string resultPath;
     std::string resultBody;
@@ -94,6 +99,7 @@ struct Counters {
 enum class SubmitStatus : uint8_t {
     Accepted,
     Coalesced,
+    Conflict,
     Rejected,
 };
 

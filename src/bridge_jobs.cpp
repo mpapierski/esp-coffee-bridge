@@ -119,6 +119,7 @@ void Scheduler::makeTerminal(Job& job, State state, uint32_t nowMs) {
     std::string{}.swap(job.targetAddress);
     std::string{}.swap(job.argument);
     std::string{}.swap(job.coalesceKey);
+    std::string{}.swap(job.admissionKey);
 }
 
 void Scheduler::rememberDiscardedPath(const Job& job) {
@@ -139,6 +140,17 @@ void Scheduler::rememberDiscardedPath(const Job& job) {
 
 SubmitResult Scheduler::submit(const Submission& submission, uint32_t nowMs) {
     expire(nowMs);
+
+    if (!submission.admissionKey.empty()) {
+        for (size_t index = 0; jobs_ && index < RECORD_CAPACITY; ++index) {
+            const Job& job = jobs_[index];
+            if (job.occupied && (job.state == State::Queued || job.state == State::Running) &&
+                job.admissionKey == submission.admissionKey) {
+                counters_.rejected++;
+                return {SubmitStatus::Conflict, job.id, {}};
+            }
+        }
+    }
 
     if (!submission.coalesceKey.empty() && submission.priority != Priority::Mutation) {
         for (size_t index = 0; jobs_ && index < RECORD_CAPACITY; ++index) {
@@ -192,6 +204,7 @@ SubmitResult Scheduler::submit(const Submission& submission, uint32_t nowMs) {
     job.targetAddress = submission.targetAddress;
     job.targetAddressType = submission.targetAddressType;
     job.coalesceKey = submission.coalesceKey;
+    job.admissionKey = submission.admissionKey;
     job.resultUrl = submission.resultUrl;
     job.priority = submission.priority;
     job.state = State::Queued;

@@ -120,6 +120,8 @@ A persistent Bridge activity strip and header badge read only `/api/status`. Whi
 
 Standard, customized, and replayed brews explicitly refresh summary with `?refresh=1` before rerendering. A failed follow-up read warns that the brew was already sent and never retries the mutation. The worker invalidates the previous summary after an acknowledged brew or confirmation, including an acknowledged action whose final result was incomplete.
 
+Only one brew job per machine may be queued or running. A second `POST /api/machines/{serial}/brew` during that window returns `409 Conflict` with `code: "brew_job_active"`, a `Location` header for the existing job, and that job's metadata. The guard is released when the existing job succeeds, fails, or is cancelled. It prevents overlapping bridge brew commands; it does not represent a physical drink backlog or keep the guard until the machine finishes dispensing.
+
 The editable UI source is [`../web/index.html`](../web/index.html). PlatformIO deterministically gzips it into a generated build header and the root route serves it with `Content-Encoding: gzip`; the generated payload must decompress byte-for-byte to the source.
 
 Manual NTP UDP probing runs in a separate low-priority task. `bridge_time::tick()` only schedules asynchronous SNTP/diagnostic work and coalesces its one-minute retry; DNS and UDP waits are not performed in the HTTP loop.

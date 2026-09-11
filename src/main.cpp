@@ -11881,6 +11881,19 @@ void sendAcceptedJob(const bridge_jobs::Job& job) {
     sendJson(response, 202);
 }
 
+void sendActiveJobConflict(const bridge_jobs::Job& job) {
+    const String location = String("/api/jobs/") + job.id.c_str();
+    server.sendHeader("Location", location);
+    DynamicJsonDocument response(1536);
+    response["ok"] = false;
+    response["pending"] = true;
+    response["code"] = "brew_job_active";
+    response["error"] = "a brew request is already queued or running for this machine";
+    JsonObject jobJson = response.createNestedObject("job");
+    appendJobJson(jobJson, job);
+    sendJson(response, 409);
+}
+
 bool submitJob(const bridge_jobs::Submission& submission,
                bridge_jobs::Job& jobOut,
                bool sendFailureResponse = true) {
@@ -11908,9 +11921,19 @@ bool submitJob(const bridge_jobs::Submission& submission,
         return false;
     }
     const bridge_jobs::SubmitResult result = jobScheduler.submit(submission, millis());
-    const bool available = result.status != bridge_jobs::SubmitStatus::Rejected &&
+    const bool conflict = result.status == bridge_jobs::SubmitStatus::Conflict &&
+        jobScheduler.get(result.id, jobOut);
+    const bool available =
+        (result.status == bridge_jobs::SubmitStatus::Accepted ||
+         result.status == bridge_jobs::SubmitStatus::Coalesced) &&
         jobScheduler.get(result.id, jobOut);
     xSemaphoreGive(jobMutex);
+    if (conflict) {
+        if (sendFailureResponse) {
+            sendActiveJobConflict(jobOut);
+        }
+        return false;
+    }
     if (!available) {
         if (sendFailureResponse) {
             server.sendHeader("Retry-After", "1");
@@ -11967,6 +11990,9 @@ void enqueueMachineOperation(const String& serial,
     submission.deadlineMs = deadlineMs;
     submission.resource = resource;
     submission.resultUrl = resultUrl.c_str();
+    if (operation == BleOperation::MachineBrew) {
+        submission.admissionKey = (String("brew:") + canonicalSerial).c_str();
+    }
     if (!coalesceKey.isEmpty()) {
         submission.coalesceKey = coalesceKey.c_str();
     } else if (priority != bridge_jobs::Priority::Mutation) {
@@ -13225,12 +13251,12 @@ BackgroundSubmitResult submitBackgroundJob(const bridge_jobs::Submission& submis
     }
     const bridge_jobs::SubmitResult result = jobScheduler.submit(submission, millis());
     xSemaphoreGive(jobMutex);
-    if (result.status != bridge_jobs::SubmitStatus::Rejected && bleWorkerTaskHandle != nullptr) {
+    const bool accepted = result.status == bridge_jobs::SubmitStatus::Accepted ||
+        result.status == bridge_jobs::SubmitStatus::Coalesced;
+    if (accepted && bleWorkerTaskHandle != nullptr) {
         xTaskNotifyGive(bleWorkerTaskHandle);
     }
-    return result.status == bridge_jobs::SubmitStatus::Rejected
-        ? BackgroundSubmitResult::Deferred
-        : BackgroundSubmitResult::Accepted;
+    return accepted ? BackgroundSubmitResult::Accepted : BackgroundSubmitResult::Deferred;
 }
 
 bool backgroundStatsDue(const SavedMachine& machine, uint32_t nowMs) {

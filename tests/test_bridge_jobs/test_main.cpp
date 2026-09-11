@@ -63,6 +63,43 @@ void test_reads_coalesce_but_mutations_do_not() {
     TEST_ASSERT_NOT_EQUAL(0, writeOne.id.compare(writeTwo.id));
 }
 
+void test_admission_key_rejects_duplicate_until_job_is_terminal() {
+    Scheduler scheduler(15);
+    Submission firstBrew = job("brew", Priority::Mutation, "machine-a");
+    firstBrew.admissionKey = "brew:machine-a";
+    const auto first = scheduler.submit(firstBrew, 1);
+    TEST_ASSERT_EQUAL(static_cast<int>(SubmitStatus::Accepted), static_cast<int>(first.status));
+
+    Submission duplicate = job("brew", Priority::Mutation, "machine-a");
+    duplicate.admissionKey = "brew:machine-a";
+    const auto queuedConflict = scheduler.submit(duplicate, 2);
+    TEST_ASSERT_EQUAL(static_cast<int>(SubmitStatus::Conflict),
+                      static_cast<int>(queuedConflict.status));
+    TEST_ASSERT_EQUAL_STRING(first.id.c_str(), queuedConflict.id.c_str());
+
+    Submission otherMachine = job("brew", Priority::Mutation, "machine-b");
+    otherMachine.admissionKey = "brew:machine-b";
+    TEST_ASSERT_EQUAL(static_cast<int>(SubmitStatus::Accepted),
+                      static_cast<int>(scheduler.submit(otherMachine, 2).status));
+
+    Job running;
+    TEST_ASSERT_TRUE(scheduler.startNext(3, running));
+    const auto runningConflict = scheduler.submit(duplicate, 4);
+    TEST_ASSERT_EQUAL(static_cast<int>(SubmitStatus::Conflict),
+                      static_cast<int>(runningConflict.status));
+    TEST_ASSERT_EQUAL_STRING(first.id.c_str(), runningConflict.id.c_str());
+
+    TEST_ASSERT_TRUE(scheduler.finish(running.id, true, 5));
+    const auto afterCompletion = scheduler.submit(duplicate, 6);
+    TEST_ASSERT_EQUAL(static_cast<int>(SubmitStatus::Accepted),
+                      static_cast<int>(afterCompletion.status));
+    TEST_ASSERT_NOT_EQUAL(0, first.id.compare(afterCompletion.id));
+    TEST_ASSERT_TRUE(scheduler.cancel(afterCompletion.id, 7));
+    TEST_ASSERT_EQUAL(static_cast<int>(SubmitStatus::Accepted),
+                      static_cast<int>(scheduler.submit(duplicate, 8).status));
+    TEST_ASSERT_EQUAL_UINT32(2, scheduler.counters().rejected);
+}
+
 void test_pressure_evicts_only_queued_background() {
     Scheduler scheduler(2);
     for (size_t index = 0; index < bridge_jobs::ACTIVE_CAPACITY; ++index) {
@@ -321,6 +358,7 @@ int main(int, char**) {
     UNITY_BEGIN();
     RUN_TEST(test_priority_and_fifo);
     RUN_TEST(test_reads_coalesce_but_mutations_do_not);
+    RUN_TEST(test_admission_key_rejects_duplicate_until_job_is_terminal);
     RUN_TEST(test_pressure_evicts_only_queued_background);
     RUN_TEST(test_cancelled_running_job_cannot_complete);
     RUN_TEST(test_running_progress_is_published_and_bounded);
