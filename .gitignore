@@ -1,4 +1,5 @@
 .pio
 .analysis
 .tmp
+.playwright-cli
 .DS_Store
