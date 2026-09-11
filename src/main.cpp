@@ -4,7 +4,6 @@
 #include <LittleFS.h>
 #include <Preferences.h>
 #include <Update.h>
-#include <WebServer.h>
 #include <WiFi.h>
 #include <esp_attr.h>
 #include <esp_heap_caps.h>
@@ -26,6 +25,7 @@
 
 #include "backup_staging.h"
 #include "brew_history.h"
+#include "bridge_http_server.h"
 #include "bridge_json_object.h"
 #include "bridge_jobs.h"
 #include "bridge_runtime_policy.h"
@@ -379,9 +379,10 @@ private:
 constexpr uint32_t RTC_WATCHDOG_MAGIC = 0x42574447;
 RTC_DATA_ATTR RtcWatchdogMarker rtcWatchdogMarker;
 
-WebServer server(80);
+bridge_http::BridgeHttpServer server(80);
 Preferences preferences;
 Preferences machinePreferences;
+uint32_t bootNonce = 0;
 
 SemaphoreHandle_t logMutex          = nullptr;
 SemaphoreHandle_t notifyDataMutex   = nullptr;
@@ -6524,6 +6525,9 @@ void appendStatus(JsonDocument& doc) {
     doc["littleFsUsedBytes"] = health.littleFsUsedBytes;
     JsonObject capabilities = doc.createNestedObject("capabilities");
     capabilities["asyncBleJobs"] = true;
+    capabilities["websocketEvents"] = true;
+    capabilities["eventProtocolVersion"] = 1;
+    capabilities["eventsUrl"] = "/api/events";
     doc["timeConfigured"] = timeStatus.configured;
     doc["timeAvailable"] = timeStatus.available;
     doc["timeSynced"] = timeStatus.synced;
@@ -6619,6 +6623,7 @@ void appendStatus(JsonDocument& doc) {
     JsonObject http = doc.createNestedObject("http");
     http["lastDurationUs"] = health.httpLastDurationUs;
     http["maxDurationUs"] = health.httpMaxDurationUs;
+    http["websocketClients"] = server.websocketClientCount();
 }
 
 bool parseAddressTypeRequest(JsonVariantConst value, uint8_t& addressType) {
@@ -12269,6 +12274,34 @@ void appendJobJson(JsonObject target, const bridge_jobs::Job& job) {
     }
 }
 
+void appendJobJson(JsonObject target, const bridge_jobs::PublicJob& job) {
+    target["id"] = job.id.c_str();
+    target["state"] = bridge_jobs::Scheduler::stateName(job.state);
+    target["kind"] = job.kind.c_str();
+    target["target"] = job.target.c_str();
+    target["pollAfterMs"] = JOB_POLL_AFTER_MS;
+    target["submittedAtMs"] = job.submittedAtMs;
+    if (job.startedAtMs != 0) {
+        target["startedAtMs"] = job.startedAtMs;
+    }
+    if (job.finishedAtMs != 0) {
+        target["finishedAtMs"] = job.finishedAtMs;
+    }
+    target["progress"] = job.progress;
+    if (job.state == bridge_jobs::State::Succeeded) {
+        const String resultUrl = !job.resultUrl.empty()
+            ? String(job.resultUrl.c_str())
+            : String("/api/jobs/") + job.id.c_str() + "/result";
+        target["resultUrl"] = resultUrl;
+    }
+    if (!job.errorCode.empty() || !job.errorMessage.empty()) {
+        JsonObject diagnostic = target.createNestedObject(
+            job.state == bridge_jobs::State::Succeeded ? "warning" : "error");
+        diagnostic["code"] = job.errorCode.c_str();
+        diagnostic["message"] = job.errorMessage.c_str();
+    }
+}
+
 enum class JobLookupResult : uint8_t {
     Found,
     Missing,
@@ -13810,6 +13843,66 @@ void scheduleBackgroundBleJobs(uint32_t nowMs) {
     nextBackgroundStatsDispatchAtMs = nowMs + 1000;
 }
 
+bool beginHttpRequest(void*) {
+    return machineMutex == nullptr ||
+        xSemaphoreTake(machineMutex, pdMS_TO_TICKS(100)) == pdTRUE;
+}
+
+void finishHttpRequest(uint32_t durationUs, void*) {
+    if (machineMutex != nullptr) {
+        xSemaphoreGive(machineMutex);
+    }
+    if (healthMutex != nullptr && xSemaphoreTake(healthMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+        bridgeHealth.httpLastDurationUs = durationUs;
+        bridgeHealth.httpMaxDurationUs = std::max(bridgeHealth.httpMaxDurationUs, durationUs);
+        xSemaphoreGive(healthMutex);
+    }
+}
+
+bool renderStatusEvent(String& jsonOut, void*) {
+    DynamicJsonDocument status(STATUS_JSON_CAPACITY);
+    status["ok"] = true;
+    appendStatus(status);
+    if (status.overflowed()) {
+        return false;
+    }
+    jsonOut = "";
+    return serializeJson(status, jsonOut) != 0;
+}
+
+bridge_http::EventJobLookup renderJobEvent(const String& id,
+                                           String& jsonOut,
+                                           bool& terminalOut,
+                                           void*) {
+    terminalOut = false;
+    if (jobMutex == nullptr || xSemaphoreTake(jobMutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+        return bridge_http::EventJobLookup::Busy;
+    }
+    jobScheduler.expire(millis());
+    bridge_jobs::PublicJob job;
+    const bool found = jobScheduler.getPublic(std::string(id.c_str()), job);
+    xSemaphoreGive(jobMutex);
+    if (!found) {
+        return bridge_http::EventJobLookup::Missing;
+    }
+    terminalOut = bridge_jobs::Scheduler::terminal(job.state);
+    DynamicJsonDocument document(2048);
+    JsonObject jobJson = document.to<JsonObject>();
+    appendJobJson(jobJson, job);
+    if (document.overflowed()) {
+        return bridge_http::EventJobLookup::Busy;
+    }
+    jsonOut = "";
+    if (serializeJson(document, jsonOut) == 0) {
+        return bridge_http::EventJobLookup::Busy;
+    }
+    return bridge_http::EventJobLookup::Found;
+}
+
+void publishJobEvent(const char* id, void*) {
+    server.notifyJobChanged(id);
+}
+
 void registerRoutes() {
     const char* trackedHeaders[] = {CLIENT_TIME_HEADER};
     server.collectHeaders(trackedHeaders, 1);
@@ -13941,7 +14034,11 @@ void setup() {
     healthMutex       = xSemaphoreCreateMutex();
     machineMutex      = xSemaphoreCreateMutex();
     machineGenerationMutex = xSemaphoreCreateRecursiveMutex();
-    jobScheduler.reset(esp_random());
+    bootNonce = esp_random();
+    jobScheduler.reset(bootNonce);
+    jobScheduler.setChangeCallback(publishJobEvent);
+    server.setRequestLifecycle(beginHttpRequest, finishHttpRequest);
+    server.configureEvents(bootNonce, renderStatusEvent, renderJobEvent);
 
     preferences.begin(PREFS_WIFI, false);
     machinePreferences.begin(PREFS_MACHINES, false);
@@ -13966,7 +14063,10 @@ void setup() {
     setupMdns();
 
     registerRoutes();
-    server.begin();
+    if (!server.begin()) {
+        lastError = "failed to start ESP-IDF HTTP server";
+        addLog("http", lastError.snapshot());
+    }
     if (xTaskCreatePinnedToCore(bleWorkerTask,
                                 "ble-worker",
                                 12 * 1024,
@@ -13990,23 +14090,16 @@ void setup() {
 }
 
 void loop() {
-    const uint32_t httpStartedAtUs = micros();
-    if (machineMutex == nullptr || xSemaphoreTake(machineMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-        server.handleClient();
-        if (machineMutex != nullptr) {
-            xSemaphoreGive(machineMutex);
-        }
-    }
-    const uint32_t httpDurationUs = micros() - httpStartedAtUs;
-    if (healthMutex != nullptr && xSemaphoreTake(healthMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
-        bridgeHealth.httpLastDurationUs = httpDurationUs;
-        bridgeHealth.httpMaxDurationUs = std::max(bridgeHealth.httpMaxDurationUs, httpDurationUs);
-        xSemaphoreGive(healthMutex);
-    }
     const uint32_t nowMs = millis();
     tickWifiConnection(nowMs);
     bridge_time::tick(WiFi.status() == WL_CONNECTED, nowMs, addTimeLog);
     scheduleBackgroundBleJobs(nowMs);
     publishBridgeHealth();
+    bool eventActivity = workerJobActive.load(std::memory_order_acquire);
+    if (healthMutex != nullptr && xSemaphoreTake(healthMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+        eventActivity = eventActivity || bridgeHealth.queuedJobs != 0;
+        xSemaphoreGive(healthMutex);
+    }
+    server.tickEvents(nowMs, eventActivity);
     delay(2);
 }
