@@ -10349,11 +10349,13 @@ bool processBackupHistory(const String& path,
                           size_t& bundleBytes,
                           String& error) {
     error = "";
-    DynamicJsonDocument recordDoc(256);
-    recordDoc["kind"] = kind;
-    recordDoc["serial"] = serial;
     String prefix;
-    serializeJson(recordDoc, prefix);
+    {
+        DynamicJsonDocument recordDoc(256);
+        recordDoc["kind"] = kind;
+        recordDoc["serial"] = serial;
+        serializeJson(recordDoc, prefix);
+    }
     if (!prefix.endsWith("}")) {
         error = "failed to serialize backup record prefix";
         return false;
@@ -10361,31 +10363,11 @@ bool processBackupHistory(const String& path,
     prefix.remove(prefix.length() - 1);
     prefix += ",\"entry\":";
 
-    // Keep the output buffer bounded, but do not build and reparse a second
-    // multi-entry JSON document. On fragmented ESP32 heaps that duplicate
-    // 12 KiB allocation could fail and make every otherwise-valid history
-    // line look unexportable.
-    String outputBatch;
-    if (emit && !outputBatch.reserve(MAX_BACKUP_JSON_LINE_BYTES + 1)) {
-        error = "insufficient memory for the backup output buffer";
-        return false;
-    }
     DynamicJsonDocument sourceEntryDoc(12288);
     if (sourceEntryDoc.capacity() == 0) {
         error = "insufficient memory for the backup history parser";
         return false;
     }
-    auto flushOutput = [&]() -> bool {
-        if (!emit || outputBatch.isEmpty()) {
-            return true;
-        }
-        if (!server.sendContent(outputBatch)) {
-            error = "backup client disconnected";
-            return false;
-        }
-        outputBatch = "";
-        return true;
-    };
 
     if (!LittleFS.exists(path)) {
         return true;
@@ -10451,7 +10433,7 @@ bool processBackupHistory(const String& path,
                 : normalizationError;
             return false;
         }
-        entry = normalizedLines.front();
+        entry = std::move(normalizedLines.front());
 
         String record;
         const size_t recordBytes = prefix.length() + entry.length() + 2;
@@ -10474,22 +10456,14 @@ bool processBackupHistory(const String& path,
             return false;
         }
         bundleBytes += record.length();
-        if (emit) {
-            if (!outputBatch.isEmpty() &&
-                outputBatch.length() + record.length() > MAX_BACKUP_JSON_LINE_BYTES &&
-                !flushOutput()) {
-                source.close();
-                return false;
-            }
-            if (!outputBatch.concat(record)) {
-                source.close();
-                error = "insufficient memory while buffering backup output";
-                return false;
-            }
+        if (emit && !server.sendContent(record)) {
+            source.close();
+            error = "backup client disconnected";
+            return false;
         }
     }
     source.close();
-    return flushOutput();
+    return true;
 }
 
 void handleBackupExport() {
@@ -10518,48 +10492,51 @@ void handleBackupExport() {
         return;
     }
 
-    DynamicJsonDocument metaDoc(2048);
-    metaDoc["kind"] = "meta";
-    metaDoc["schema"] = BACKUP_BUNDLE_SCHEMA;
-    metaDoc["appName"] = APP_NAME;
-    metaDoc["appVersion"] = APP_VERSION;
-    metaDoc["buildTime"] = APP_BUILD_TIME;
-    metaDoc["historyBudgetBytes"] = brew_history::budgetBytes();
-    metaDoc["statsHistoryBudgetBytes"] = stats_history::budgetBytes();
-    metaDoc["writableAggregateLimitBytes"] =
-        history_storage::writableHistoryLimit(LittleFS.totalBytes());
-    metaDoc["savedMachineCount"] = exportMachines.size();
-    metaDoc["littleFsReady"] = littleFsReady;
-    metaDoc["exportedAtMs"] = millis();
-    const bridge_time::StatusSnapshot timeStatus = bridge_time::snapshot();
-    metaDoc["timeSynced"] = timeStatus.synced;
-    if (timeStatus.synced) {
-        metaDoc["exportedAtUnix"] = static_cast<int64_t>(timeStatus.unixTime);
-        metaDoc["exportedAtIsoUtc"] = timeStatus.iso8601Utc;
-    }
-    JsonObject includes = metaDoc.createNestedObject("includes");
-    includes["savedMachines"] = true;
-    includes["historyBudget"] = true;
-    includes["brewHistory"] = littleFsReady;
-    includes["statsHistory"] = littleFsReady;
-    includes["wifi"] = false;
-    includes["protocolSessions"] = false;
-    includes["standardRecipeCaches"] = false;
-    includes["savedRecipeCaches"] = false;
-
     String metaLine;
-    serializeJson(metaDoc, metaLine);
+    {
+        DynamicJsonDocument metaDoc(2048);
+        metaDoc["kind"] = "meta";
+        metaDoc["schema"] = BACKUP_BUNDLE_SCHEMA;
+        metaDoc["appName"] = APP_NAME;
+        metaDoc["appVersion"] = APP_VERSION;
+        metaDoc["buildTime"] = APP_BUILD_TIME;
+        metaDoc["historyBudgetBytes"] = brew_history::budgetBytes();
+        metaDoc["statsHistoryBudgetBytes"] = stats_history::budgetBytes();
+        metaDoc["writableAggregateLimitBytes"] =
+            history_storage::writableHistoryLimit(LittleFS.totalBytes());
+        metaDoc["savedMachineCount"] = exportMachines.size();
+        metaDoc["littleFsReady"] = littleFsReady;
+        metaDoc["exportedAtMs"] = millis();
+        const bridge_time::StatusSnapshot timeStatus = bridge_time::snapshot();
+        metaDoc["timeSynced"] = timeStatus.synced;
+        if (timeStatus.synced) {
+            metaDoc["exportedAtUnix"] = static_cast<int64_t>(timeStatus.unixTime);
+            metaDoc["exportedAtIsoUtc"] = timeStatus.iso8601Utc;
+        }
+        JsonObject includes = metaDoc.createNestedObject("includes");
+        includes["savedMachines"] = true;
+        includes["historyBudget"] = true;
+        includes["brewHistory"] = littleFsReady;
+        includes["statsHistory"] = littleFsReady;
+        includes["wifi"] = false;
+        includes["protocolSessions"] = false;
+        includes["standardRecipeCaches"] = false;
+        includes["savedRecipeCaches"] = false;
+        serializeJson(metaDoc, metaLine);
+    }
     metaLine += '\n';
 
     size_t bundleBytes = metaLine.length();
     String preflightError;
     for (const SavedMachine& machine : exportMachines) {
-        DynamicJsonDocument machineDoc(4096);
-        machineDoc["kind"] = "machine";
-        JsonObject item = machineDoc.createNestedObject("machine");
-        appendBackupMachineJson(item, machine);
         String machineLine;
-        serializeJson(machineDoc, machineLine);
+        {
+            DynamicJsonDocument machineDoc(4096);
+            machineDoc["kind"] = "machine";
+            JsonObject item = machineDoc.createNestedObject("machine");
+            appendBackupMachineJson(item, machine);
+            serializeJson(machineDoc, machineLine);
+        }
         machineLine += '\n';
         if (machineLine.length() > history_capacity::MAX_GENERATED_BACKUP_BYTES -
                 std::min(bundleBytes, history_capacity::MAX_GENERATED_BACKUP_BYTES)) {
@@ -10610,12 +10587,14 @@ void handleBackupExport() {
     size_t emittedBytes = metaLine.length();
     String emitError;
     for (const SavedMachine& machine : exportMachines) {
-        DynamicJsonDocument machineDoc(4096);
-        machineDoc["kind"] = "machine";
-        JsonObject item = machineDoc.createNestedObject("machine");
-        appendBackupMachineJson(item, machine);
         String machineLine;
-        serializeJson(machineDoc, machineLine);
+        {
+            DynamicJsonDocument machineDoc(4096);
+            machineDoc["kind"] = "machine";
+            JsonObject item = machineDoc.createNestedObject("machine");
+            appendBackupMachineJson(item, machine);
+            serializeJson(machineDoc, machineLine);
+        }
         machineLine += '\n';
         emittedBytes += machineLine.length();
         if (!server.sendContent(machineLine)) {
