@@ -94,6 +94,25 @@ void test_cancelled_running_job_cannot_complete() {
     TEST_ASSERT_EQUAL(static_cast<int>(State::Cancelled), static_cast<int>(snapshot.state));
 }
 
+void test_running_progress_is_published_and_bounded() {
+    Scheduler scheduler(14);
+    const auto submitted = scheduler.submit(job("stats", Priority::ForcedRead), 1);
+    Job running;
+    TEST_ASSERT_TRUE(scheduler.startNext(2, running));
+    TEST_ASSERT_EQUAL_UINT8(1, running.progress);
+    TEST_ASSERT_TRUE(scheduler.setProgress(running.id, 40));
+    Job snapshot;
+    TEST_ASSERT_TRUE(scheduler.get(submitted.id, snapshot));
+    TEST_ASSERT_EQUAL_UINT8(40, snapshot.progress);
+    TEST_ASSERT_TRUE(scheduler.setProgress(running.id, 100));
+    TEST_ASSERT_TRUE(scheduler.get(submitted.id, snapshot));
+    TEST_ASSERT_EQUAL_UINT8(99, snapshot.progress);
+    TEST_ASSERT_TRUE(scheduler.finish(running.id, true, 3));
+    TEST_ASSERT_TRUE(scheduler.get(submitted.id, snapshot));
+    TEST_ASSERT_EQUAL_UINT8(100, snapshot.progress);
+    TEST_ASSERT_FALSE(scheduler.setProgress(running.id, 50));
+}
+
 void test_terminal_expiry_and_wraparound() {
     Scheduler scheduler(5);
     const uint32_t nearWrap = UINT32_MAX - 100;
@@ -304,6 +323,7 @@ int main(int, char**) {
     RUN_TEST(test_reads_coalesce_but_mutations_do_not);
     RUN_TEST(test_pressure_evicts_only_queued_background);
     RUN_TEST(test_cancelled_running_job_cannot_complete);
+    RUN_TEST(test_running_progress_is_published_and_bounded);
     RUN_TEST(test_terminal_expiry_and_wraparound);
     RUN_TEST(test_terminal_records_are_never_evicted_before_retention);
     RUN_TEST(test_terminal_expiry_recovers_registry_capacity);

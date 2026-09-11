@@ -215,6 +215,70 @@
     background: rgba(252, 234, 225, 0.96);
   }
 
+  .bridge-activity {
+    display: grid;
+    gap: 10px;
+    margin-bottom: 18px;
+    padding: 13px 16px;
+    border-radius: 18px;
+    background: rgba(255, 249, 241, 0.82);
+    border: 1px solid var(--line);
+    box-shadow: var(--shadow);
+  }
+
+  .bridge-activity.busy {
+    border-color: rgba(44, 106, 75, 0.3);
+    background: rgba(235, 245, 237, 0.94);
+  }
+
+  .activity-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 14px;
+  }
+
+  .activity-heading {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    min-width: 0;
+  }
+
+  .activity-copy {
+    margin-top: 2px;
+    color: var(--muted);
+    font-size: 13px;
+    overflow-wrap: anywhere;
+  }
+
+  .activity-pulse {
+    width: 9px;
+    height: 9px;
+    flex: 0 0 auto;
+    border-radius: 50%;
+    background: rgba(31, 27, 23, 0.28);
+  }
+
+  .busy .activity-pulse,
+  .badge.activity-busy::before {
+    background: var(--accent);
+    animation: activity-pulse 1.35s ease-in-out infinite;
+  }
+
+  .badge.activity-busy::before {
+    content: "";
+    width: 7px;
+    height: 7px;
+    display: inline-block;
+    margin-right: 6px;
+    border-radius: 50%;
+  }
+
+  @keyframes activity-pulse {
+    50% { opacity: 0.35; transform: scale(0.78); }
+  }
+
   .layout {
     display: grid;
     grid-template-columns: 320px minmax(0, 1fr);
@@ -674,6 +738,14 @@
       </div>
     </header>
 
+    <section id="bridge-activity" class="bridge-activity" aria-live="polite">
+      <div class="activity-head">
+        <div class="activity-heading"><span class="activity-pulse"></span><strong>Bridge activity</strong></div>
+        <span class="badge">Loading</span>
+      </div>
+      <div class="activity-copy">Reading worker status…</div>
+    </section>
+
     <div id="flash" class="flash">Loading bridge status…</div>
 
     <div class="layout">
@@ -743,6 +815,7 @@
   const sidebar = document.getElementById("sidebar");
   const flash = document.getElementById("flash");
   const headerBadges = document.getElementById("header-badges");
+  const bridgeActivity = document.getElementById("bridge-activity");
   const modalRoot = document.getElementById("modal-root");
 
   function escapeHtml(value) {
@@ -1289,9 +1362,108 @@
     const items = [
       status.staConnected ? `<span class="badge good">Wi-Fi ${escapeHtml(status.staSsid || "")}</span>` : `<span class="badge warn">AP only</span>`,
       `<span class="badge">${status.savedMachineCount || 0} saved</span>`,
-      `<span class="badge">${status.supportedDeviceCount || 0} nearby supported</span>`
+      `<span class="badge">${status.supportedDeviceCount || 0} nearby supported</span>`,
+      bridgeActivityBadge(status)
     ];
     return items.join("");
+  }
+
+  function bridgeJobLabel(kind) {
+    const labels = {
+      machine_summary: "Reading machine status",
+      machine_stats: "Reading statistics",
+      machine_settings: "Reading settings",
+      machine_features: "Reading features",
+      machine_refresh: "Refreshing machine",
+      brew: "Brewing coffee",
+      confirm: "Confirming machine prompt",
+      recipes_refresh: "Refreshing recipes",
+      recipe: "Reading recipe",
+      mycoffee: "Reading MyCoffee recipes",
+      mycoffee_slot: "Reading MyCoffee recipe",
+      mycoffee_write: "Updating MyCoffee recipe",
+      settings_write: "Updating settings",
+      scan: "Scanning for machines",
+      machine_probe: "Probing machine",
+      machine_create: "Saving machine",
+      connect: "Connecting",
+      disconnect: "Disconnecting",
+      pair: "Pairing machine",
+      notifications: "Updating notifications",
+      details: "Reading device details",
+      gatt_services: "Discovering GATT services",
+      gatt_read: "Reading GATT value",
+      gatt_write: "Writing GATT value"
+    };
+    if (labels[kind]) {
+      return labels[kind];
+    }
+    const words = String(kind || "bridge work").replace(/^protocol_/, "Protocol ").replace(/_/g, " ");
+    return words.charAt(0).toUpperCase() + words.slice(1);
+  }
+
+  function bridgeActivityTarget(target) {
+    if (!target || target === "bridge") {
+      return "";
+    }
+    const machine = findMachine(target);
+    if (machine) {
+      const model = machine.modelName || machine.model || machine.alias || machine.serial;
+      return machine.alias && machine.alias !== model ? `${model} (${machine.alias})` : model;
+    }
+    return String(target).replace(/^address:/, "");
+  }
+
+  function bridgeActivityView(status) {
+    const worker = status?.bleWorker || {};
+    const queue = status?.bleQueue || {};
+    const queued = Math.max(0, Number(queue.queued || 0));
+    const busy = !!worker.busy || Number(queue.running || 0) > 0;
+    const progress = busy ? Math.max(1, Math.min(99, Number(worker.progress || 1))) : 0;
+    if (!busy) {
+      return {
+        busy: false,
+        progress: 0,
+        queued,
+        summary: queued ? "Waiting for the worker" : "Ready for requests"
+      };
+    }
+    const parts = [bridgeJobLabel(worker.currentKind)];
+    const target = bridgeActivityTarget(worker.currentTarget);
+    if (target) {
+      parts.push(target);
+    }
+    const ageSeconds = Math.max(0, Math.floor(Number(worker.currentJobAgeMs || 0) / 1000));
+    parts.push(`${ageSeconds}s`);
+    parts.push(`${Math.round(progress)}%`);
+    return { busy: true, progress, queued, summary: parts.join(" · ") };
+  }
+
+  function bridgeActivityBadge(status) {
+    const activity = bridgeActivityView(status);
+    if (activity.busy) {
+      return `<span class="badge activity-busy">${escapeHtml(bridgeJobLabel(status?.bleWorker?.currentKind))}${activity.queued ? ` · ${activity.queued} queued` : ""}</span>`;
+    }
+    if (activity.queued) {
+      return `<span class="badge warn">${activity.queued} queued</span>`;
+    }
+    return '<span class="badge good">Bridge idle</span>';
+  }
+
+  function renderBridgeActivity() {
+    const activity = bridgeActivityView(state.status);
+    bridgeActivity.classList.toggle("busy", activity.busy);
+    const queueLabel = activity.queued === 1 ? "1 queued" : `${activity.queued} queued`;
+    bridgeActivity.innerHTML = `
+      <div class="activity-head">
+        <div>
+          <div class="activity-heading"><span class="activity-pulse"></span><strong>Bridge activity</strong></div>
+          <div class="activity-copy">${escapeHtml(activity.summary)}</div>
+        </div>
+        <span class="badge ${activity.queued ? "warn" : (activity.busy ? "good" : "")}">${escapeHtml(queueLabel)}</span>
+      </div>
+      ${activity.busy ? `<div class="progress" title="${Math.round(activity.progress)}% complete"><span style="width:${activity.progress}%"></span></div>` : ""}
+    `;
   }
 
   function findMachine(serial) {
@@ -1581,6 +1753,7 @@
     `;
 
     headerBadges.innerHTML = statusBadges(state.status);
+    renderBridgeActivity();
   }
 
   function sectionShell(title, subtitle, body) {
@@ -3770,6 +3943,24 @@
     void renderRoute();
   });
 
+  async function pollBridgeActivity() {
+    let nextPollMs = 2000;
+    try {
+      const result = await fetchJson("/api/status", {}, 5000);
+      if (result.data && typeof result.data === "object") {
+        state.status = result.data;
+        const activity = bridgeActivityView(state.status);
+        nextPollMs = activity.busy || activity.queued ? 1000 : 2000;
+        headerBadges.innerHTML = statusBadges(state.status);
+        renderBridgeActivity();
+      }
+    } catch (error) {
+      console.error(error);
+    } finally {
+      setTimeout(pollBridgeActivity, nextPollMs);
+    }
+  }
+
   async function boot() {
     try {
       await refreshCore();
@@ -3796,6 +3987,7 @@
       }
     };
     setTimeout(pollAfterCompletion, 15000);
+    setTimeout(pollBridgeActivity, 1000);
   }
 
   void boot();

@@ -467,6 +467,7 @@ std::atomic<uint32_t> workerHeartbeatAtMs{0};
 std::atomic<uint32_t> workerLastBleCallDurationMs{0};
 std::atomic<uint32_t> workerCurrentStartedAtMs{0};
 std::atomic<uint32_t> workerCurrentDeadlineAtMs{0};
+std::atomic<uint8_t> workerCurrentProgress{0};
 std::atomic<bool> workerResetRequested{false};
 std::atomic<bool> clientDisconnectedEvent{false};
 std::atomic<bool> clientDisconnectPending{false};
@@ -729,11 +730,26 @@ bool workerTargetStillCurrent() {
     return machineGenerationCurrentLocked(execution->machine.serial, execution->machine.generation);
 }
 
-void noteWorkerProgress() {
-    if (currentWorkerExecution() == nullptr) {
+void noteWorkerProgress(uint8_t progress = 0) {
+    WorkerExecutionContext* execution = currentWorkerExecution();
+    if (execution == nullptr) {
         return;
     }
     workerHeartbeatAtMs.store(millis(), std::memory_order_release);
+    if (progress == 0) {
+        return;
+    }
+    progress = std::min<uint8_t>(progress, 99);
+    uint8_t current = workerCurrentProgress.load(std::memory_order_acquire);
+    while (progress > current &&
+           !workerCurrentProgress.compare_exchange_weak(
+               current, progress, std::memory_order_acq_rel, std::memory_order_acquire)) {
+    }
+    if (progress > current && jobMutex != nullptr &&
+        xSemaphoreTake(jobMutex, 0) == pdTRUE) {
+        jobScheduler.setProgress(execution->jobId.c_str(), progress);
+        xSemaphoreGive(jobMutex);
+    }
 }
 
 bool workerDeadlineExceeded() {
@@ -6159,7 +6175,9 @@ void performScan() {
             addLog("scan", "Background scan yielded to interactive BLE work");
             break;
         }
-        noteWorkerProgress();
+        const uint32_t elapsedMs = static_cast<uint32_t>(millis() - startedAt);
+        noteWorkerProgress(static_cast<uint8_t>(10 +
+            (std::min<uint32_t>(elapsedMs, SCAN_MS) * 80U) / SCAN_MS));
         delay(50);
     }
 
@@ -6289,6 +6307,7 @@ void appendStatus(JsonDocument& doc) {
     worker["currentKind"] = health.currentJobKind;
     worker["currentTarget"] = health.currentJobTarget;
     worker["currentJobAgeMs"] = health.currentJobAgeMs;
+    worker["progress"] = health.currentProgress;
     worker["heartbeatAgeMs"] = health.workerHeartbeatAgeMs;
     worker["stackHighWaterBytes"] = health.workerStackHighWaterMark;
 
@@ -8253,11 +8272,13 @@ void handleMachineSummary(const String& serial) {
         sendError(500, error);
         return;
     }
+    noteWorkerProgress(45);
     if (!readMachineProcessStatus(processStatus, processError)) {
         lastError = processError;
         sendError(500, processError.isEmpty() ? String("failed to read machine status") : processError);
         return;
     }
+    noteWorkerProgress(90);
 
     DynamicJsonDocument response(8192);
     response["ok"] = true;
@@ -8447,6 +8468,7 @@ void handleMachineBrew(const String& serial) {
         sendError(500, error);
         return;
     }
+    noteWorkerProgress(20);
 
     const nivona::ModelInfo modelInfo = nivona::detectModelInfo(toNivonaDetails(*machine));
     nivona::StandardRecipeLayout layout;
@@ -8466,6 +8488,7 @@ void handleMachineBrew(const String& serial) {
         sendError(400, error);
         return;
     }
+    noteWorkerProgress(50);
     JsonObjectConst recipeView = recipe;
 
     if (littleFsReady) {
@@ -8509,6 +8532,7 @@ void handleMachineBrew(const String& serial) {
         sendError(500, error);
         return;
     }
+    noteWorkerProgress(75);
 
     const ByteVector* sessionKey = resolveStoredSessionIfAvailable();
     bool brewCommandSent = false;
@@ -8526,6 +8550,7 @@ void handleMachineBrew(const String& serial) {
         sendError(500, error);
         return;
     }
+    noteWorkerProgress(90);
 
     nivona::ProcessStatus processStatus;
     String processError;
@@ -8873,6 +8898,7 @@ bool buildCompactStatsSnapshot(SavedMachine& machine,
         error = "statistics are not supported for this machine family";
         return false;
     }
+    noteWorkerProgress(15);
 
     response["ok"] = true;
     response["supported"] = true;
@@ -8880,6 +8906,7 @@ bool buildCompactStatsSnapshot(SavedMachine& machine,
     appendCompactMachineDetails(response.createNestedObject("details"), machine);
     JsonObject values = response.createNestedObject("values");
     const ByteVector* sessionKey = resolveStoredSessionIfAvailable(machine.serial, machine.address);
+    size_t metricIndex = 0;
     for (const nivona::RegisterProbe* metric : metrics) {
         if (workerDeadlineExceeded()) {
             error = "job deadline exceeded while reading statistics";
@@ -8910,7 +8937,8 @@ bool buildCompactStatsSnapshot(SavedMachine& machine,
         item["unit"] = metric->unit != nullptr ? metric->unit : "count";
         item["registerId"] = metric->id;
         item["rawValue"] = rawValue;
-        noteWorkerProgress();
+        ++metricIndex;
+        noteWorkerProgress(static_cast<uint8_t>(15 + (metricIndex * 75) / metrics.size()));
     }
     return true;
 }
@@ -8932,6 +8960,7 @@ bool buildCompactSettingsSnapshot(SavedMachine& machine,
         error = String("settings family \"") + context.familyKey + "\" is not supported yet";
         return false;
     }
+    noteWorkerProgress(15);
 
     response["ok"] = true;
     response["supported"] = true;
@@ -8943,6 +8972,7 @@ bool buildCompactSettingsSnapshot(SavedMachine& machine,
     appendCompactMachineDetails(response.createNestedObject("details"), machine);
     JsonObject values = response.createNestedObject("values");
     const ByteVector* sessionKey = resolveStoredSessionIfAvailable(machine.serial, machine.address);
+    size_t probeIndex = 0;
     for (const nivona::SettingProbeDescriptor* probe : probes) {
         if (workerDeadlineExceeded()) {
             error = "job deadline exceeded while reading settings";
@@ -8976,7 +9006,8 @@ bool buildCompactSettingsSnapshot(SavedMachine& machine,
         const char* label = nivona::findSettingValueLabel(*probe, code);
         item["valueLabel"] = label != nullptr ? label : "";
         appendSettingOptions(item.createNestedArray("options"), *probe);
-        noteWorkerProgress();
+        ++probeIndex;
+        noteWorkerProgress(static_cast<uint8_t>(15 + (probeIndex * 75) / probes.size()));
     }
     return true;
 }
@@ -12510,6 +12541,7 @@ bool runCombinedRefresh(const bridge_jobs::Job& job, WorkerExecutionContext& con
         return false;
     }
     JsonArrayConst resources = request["resources"].as<JsonArrayConst>();
+    size_t resourceIndex = 0;
     for (JsonVariantConst value : resources) {
         if (workerDeadlineExceeded() || !workerTargetStillCurrent()) {
             context.responseStatus = workerDeadlineExceeded() ? 504 : 409;
@@ -12524,7 +12556,9 @@ bool runCombinedRefresh(const bridge_jobs::Job& job, WorkerExecutionContext& con
         if (copyResourceCache(context.target, resource, existingCache) &&
             existingCache.sampledAtMs != 0 &&
             bridge_runtime_policy::deadlineReached(existingCache.sampledAtMs, job.submittedAtMs)) {
-            noteWorkerProgress();
+            ++resourceIndex;
+            noteWorkerProgress(static_cast<uint8_t>(5 +
+                (resourceIndex * 90) / resources.size()));
             continue;
         }
         context.operation = operationForResource(resource);
@@ -12561,7 +12595,9 @@ bool runCombinedRefresh(const bridge_jobs::Job& job, WorkerExecutionContext& con
             context.errorMessage = publishError;
             return false;
         }
-        noteWorkerProgress();
+        ++resourceIndex;
+        noteWorkerProgress(static_cast<uint8_t>(5 +
+            (resourceIndex * 90) / resources.size()));
     }
     context.resource = false;
     context.resultPath = combinedResultPath;
@@ -12725,7 +12761,9 @@ void bleWorkerTask(void*) {
         workerCurrentStartedAtMs.store(millis(), std::memory_order_release);
         workerCurrentDeadlineAtMs.store(context.deadlineAtMs, std::memory_order_release);
         workerHeartbeatAtMs.store(millis(), std::memory_order_release);
+        workerCurrentProgress.store(1, std::memory_order_release);
         updateWorkerOwnedHealth();
+        noteWorkerProgress(5);
 
         bool operationOk = false;
         bool resetClientAfterCompletion = false;
@@ -12749,6 +12787,7 @@ void bleWorkerTask(void*) {
                 context.errorMessage = "job deadline expired during mutation preflight";
             } else {
                 invokeQueuedHandler(context);
+                noteWorkerProgress(90);
                 operationOk = context.responded && context.responseStatus < 400;
             }
         } else if (context.operation == BleOperation::MachineRefresh) {
@@ -12772,6 +12811,7 @@ void bleWorkerTask(void*) {
                 noteWorkerProgress();
             } else {
                 invokeQueuedHandler(context);
+                noteWorkerProgress(90);
                 operationOk = context.responded && context.responseStatus < 400;
             }
             if (operationOk && workerDeadlineExceeded() && !context.mutationCommitted) {
@@ -12928,6 +12968,7 @@ void bleWorkerTask(void*) {
         workerBleCallActive.store(false, std::memory_order_release);
         workerMaintenanceCallActive.store(false, std::memory_order_release);
         workerJobActive.store(false, std::memory_order_release);
+        workerCurrentProgress.store(0, std::memory_order_release);
         workerExecution.store(nullptr, std::memory_order_release);
         refreshCachedStorageTotals();
         updateWorkerOwnedHealth();
@@ -12977,6 +13018,9 @@ void publishBridgeHealth() {
     }
     const bool workerBusy = workerJobActive.load(std::memory_order_acquire);
     next.workerBusy = workerBusy;
+    next.currentProgress = workerBusy
+        ? workerCurrentProgress.load(std::memory_order_acquire)
+        : 0;
     next.currentJobAgeMs = workerBusy
         ? static_cast<uint32_t>(millis() - workerCurrentStartedAtMs.load(std::memory_order_acquire))
         : 0;
