@@ -1,4 +1,4 @@
-# ESP Coffee Bridge Implementation Notes
+# ESP Coffee Bridge API and Implementation Reference
 
 This document covers the ESP32 bridge firmware, saved-machine API, embedded web UI, and bridge-side probe coverage.
 

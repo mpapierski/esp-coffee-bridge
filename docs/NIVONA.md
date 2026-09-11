@@ -6,7 +6,7 @@ Reverse-engineering artifacts from the APK now live under [`../.analysis/researc
 
 The real APK used here was [`../.analysis/research/downloads/de.nivona.mobileapp-3.8.6.apk`](../.analysis/research/downloads/de.nivona.mobileapp-3.8.6.apk), package `de.nivona.mobileapp`, version `3.8.6`.
 
-ESP32 bridge firmware and webapp notes live in [BRIDGE.md](BRIDGE.md).
+The ESP32 bridge HTTP API, firmware, and webapp reference lives in [API.md](API.md).
 
 ## Confidence
 
