@@ -7966,15 +7966,21 @@ bool streamHistoryEntry(JsonObjectConst entry, size_t, void* opaque, String& err
         return false;
     }
     if (!context->first) {
-        server.sendContent(",", 1);
+        if (!server.sendContent(",", 1)) {
+            error = "history client disconnected";
+            return false;
+        }
     }
-    server.sendContent(serialized.c_str(), serialized.length());
+    if (!server.sendContent(serialized.c_str(), serialized.length())) {
+        error = "history client disconnected";
+        return false;
+    }
     context->first = false;
     context->returned++;
     return true;
 }
 
-void beginHistoryStream(const String& serial, const String& alias = "", const String& familyKey = "") {
+bool beginHistoryStream(const String& serial, const String& alias = "", const String& familyKey = "") {
     DynamicJsonDocument prefixDoc(768);
     prefixDoc["ok"] = true;
     prefixDoc["serial"] = serial;
@@ -7992,7 +7998,7 @@ void beginHistoryStream(const String& serial, const String& alias = "", const St
     server.sendHeader("Access-Control-Allow-Origin", "*");
     server.setContentLength(CONTENT_LENGTH_UNKNOWN);
     server.send(200, "application/json", "");
-    server.sendContent(prefix.c_str(), prefix.length());
+    return server.sendContent(prefix.c_str(), prefix.length());
 }
 
 template <typename StatsType, typename PageType>
@@ -8019,8 +8025,12 @@ void finishHistoryStream(const StatsType& stats,
     String suffix;
     serializeJson(suffixDoc, suffix);
     suffix.remove(0, 1);
-    server.sendContent("],", 2);
-    server.sendContent(suffix.c_str(), suffix.length());
+    if (!server.sendContent("],", 2)) {
+        return;
+    }
+    if (!server.sendContent(suffix.c_str(), suffix.length())) {
+        return;
+    }
     server.sendContent("");
 }
 
@@ -8037,7 +8047,9 @@ void handleMachineHistory(const String& serial) {
     brew_history::Page page;
     String error;
     HistoryStreamContext stream;
-    beginHistoryStream(machine->serial, machine->alias, machine->familyKey);
+    if (!beginHistoryStream(machine->serial, machine->alias, machine->familyKey)) {
+        return;
+    }
     if (!brew_history::visitPage(machine->serial,
                                  offset,
                                  limit,
@@ -9590,7 +9602,9 @@ void handleMachineStatsHistory(const String& serial) {
     stats_history::Page page;
     String error;
     HistoryStreamContext stream;
-    beginHistoryStream(machine->serial);
+    if (!beginHistoryStream(machine->serial)) {
+        return;
+    }
     if (!stats_history::visitPage(machine->serial,
                                   offset,
                                   limit,
@@ -10271,6 +10285,63 @@ void handleHistoryConfigSave() {
     sendJson(response);
 }
 
+class BufferedBackupLineReader {
+public:
+    BufferedBackupLineReader(File& source, const String& path)
+        : source_(source), path_(path) {}
+
+    bool next(String& line, bool& available, String& error) {
+        line = "";
+        available = false;
+        while (true) {
+            if (bufferOffset_ >= bufferLength_) {
+                const int remaining = source_.available();
+                if (remaining <= 0) {
+                    available = !line.isEmpty();
+                    return true;
+                }
+                bufferLength_ = source_.read(
+                    buffer_, std::min(sizeof(buffer_), static_cast<size_t>(remaining)));
+                bufferOffset_ = 0;
+                if (bufferLength_ == 0) {
+                    error = String("failed to read backup source ") + path_;
+                    return false;
+                }
+                bytesSinceYield_ += bufferLength_;
+                if (bytesSinceYield_ >= 4096) {
+                    // Backup generation runs on the HTTP task. Give the
+                    // core's idle task a scheduling window while scanning a
+                    // large file so an export cannot trip the task watchdog.
+                    vTaskDelay(1);
+                    bytesSinceYield_ = 0;
+                }
+            }
+
+            const char value = static_cast<char>(buffer_[bufferOffset_++]);
+            if (value == '\n') {
+                available = true;
+                return true;
+            }
+            if (line.length() >= history_storage::MAX_JSON_LINE_BYTES) {
+                error = String("backup source line exceeds limit in ") + path_;
+                return false;
+            }
+            if (!line.concat(value)) {
+                error = "insufficient memory for a backup source line";
+                return false;
+            }
+        }
+    }
+
+private:
+    File& source_;
+    const String& path_;
+    uint8_t buffer_[512]{};
+    size_t bufferOffset_{0};
+    size_t bufferLength_{0};
+    size_t bytesSinceYield_{0};
+};
+
 bool processBackupHistory(const String& path,
                           const String& kind,
                           const String& serial,
@@ -10308,7 +10379,10 @@ bool processBackupHistory(const String& path,
         if (!emit || outputBatch.isEmpty()) {
             return true;
         }
-        server.sendContent(outputBatch);
+        if (!server.sendContent(outputBatch)) {
+            error = "backup client disconnected";
+            return false;
+        }
         outputBatch = "";
         return true;
     };
@@ -10322,29 +10396,21 @@ bool processBackupHistory(const String& path,
         return false;
     }
 
-    while (source.available()) {
-        String entry;
-        if (!entry.reserve(512)) {
+    BufferedBackupLineReader reader(source, path);
+    String entry;
+    if (!entry.reserve(512)) {
+        source.close();
+        error = "insufficient memory for a backup source line";
+        return false;
+    }
+    while (true) {
+        bool lineAvailable = false;
+        if (!reader.next(entry, lineAvailable, error)) {
             source.close();
-            error = "insufficient memory for a backup source line";
             return false;
         }
-        while (source.available()) {
-            const int value = source.read();
-            if (value < 0) {
-                source.close();
-                error = String("failed to read backup source ") + path;
-                return false;
-            }
-            if (value == '\n') {
-                break;
-            }
-            if (entry.length() >= history_storage::MAX_JSON_LINE_BYTES) {
-                source.close();
-                error = String("backup source line exceeds limit in ") + path;
-                return false;
-            }
-            entry += static_cast<char>(value);
+        if (!lineAvailable) {
+            break;
         }
         if (entry.endsWith("\r")) {
             entry.remove(entry.length() - 1);
@@ -10536,7 +10602,10 @@ void handleBackupExport() {
     server.sendHeader("Content-Disposition", String("attachment; filename=\"") + backupDownloadFilename() + "\"");
     server.setContentLength(bundleBytes);
     server.send(200, "application/x-ndjson", "");
-    server.sendContent(metaLine);
+    if (!server.sendContent(metaLine)) {
+        addLog("backup", "Backup client disconnected before history export");
+        return;
+    }
 
     size_t emittedBytes = metaLine.length();
     String emitError;
@@ -10549,7 +10618,10 @@ void handleBackupExport() {
         serializeJson(machineDoc, machineLine);
         machineLine += '\n';
         emittedBytes += machineLine.length();
-        server.sendContent(machineLine);
+        if (!server.sendContent(machineLine)) {
+            emitError = "backup client disconnected";
+            break;
+        }
 
         if (!littleFsReady) {
             continue;
@@ -10566,15 +10638,23 @@ void handleBackupExport() {
                                   true,
                                   emittedBytes,
                                   emitError)) {
-            lastError = emitError;
-            addLog("backup", String("Backup stream failed after preflight: ") + emitError);
             break;
         }
     }
 
-    if (emitError.isEmpty() && emittedBytes != bundleBytes) {
+    if (!emitError.isEmpty()) {
+        if (emitError != "backup client disconnected") {
+            lastError = emitError;
+        }
+        addLog("backup", String("Backup stream aborted: ") + emitError);
+        server.client().stop();
+        return;
+    }
+    if (emittedBytes != bundleBytes) {
         lastError = "backup snapshot size changed after immutable preflight";
         addLog("backup", lastError.snapshot());
+        server.client().stop();
+        return;
     }
 
     server.sendContent("");
@@ -12810,7 +12890,10 @@ bool streamJsonFileResponse(const String& path,
             server.client().stop();
             return false;
         }
-        server.sendContent(reinterpret_cast<const char*>(buffer), readCount);
+        if (!server.sendContent(reinterpret_cast<const char*>(buffer), readCount)) {
+            error = "JSON client disconnected while streaming the stored file";
+            return false;
+        }
         offset += readCount;
     }
     return true;

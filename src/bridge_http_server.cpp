@@ -534,37 +534,46 @@ void BridgeHttpServer::send_P(int code,
     httpd_resp_send(current_->request, body, length);
 }
 
-void BridgeHttpServer::sendContent(const String& content) {
-    sendContent(content.c_str(), content.length());
+bool BridgeHttpServer::sendContent(const String& content) {
+    return sendContent(content.c_str(), content.length());
 }
 
-void BridgeHttpServer::sendContent(const char* content) {
-    sendContent(content, content != nullptr ? std::strlen(content) : 0);
+bool BridgeHttpServer::sendContent(const char* content) {
+    return sendContent(content, content != nullptr ? std::strlen(content) : 0);
 }
 
-void BridgeHttpServer::sendContent(const char* content, size_t length) {
-    if (current_ == nullptr || current_->responseFinished || !current_->responseStarted) return;
-    if (!current_->chunked) return;
+bool BridgeHttpServer::sendContent(const char* content, size_t length) {
+    if (current_ == nullptr || current_->responseFinished ||
+        !current_->responseStarted || current_->closeRequested ||
+        !current_->chunked) {
+        return false;
+    }
     if (length == 0) {
-        finishChunked(*current_);
-        return;
+        return finishChunked(*current_);
     }
     if (httpd_resp_send_chunk(current_->request, content, length) != ESP_OK) {
         current_->closeRequested = true;
-        return;
+        return false;
     }
     current_->streamedBytes += length;
     if (current_->contentLength != CONTENT_LENGTH_UNKNOWN &&
         current_->streamedBytes >= current_->contentLength) {
-        finishChunked(*current_);
+        return finishChunked(*current_);
     }
+    return true;
 }
 
-void BridgeHttpServer::finishChunked(RequestContext& context) {
-    if (!context.responseFinished) {
-        httpd_resp_send_chunk(context.request, nullptr, 0);
-        context.responseFinished = true;
+bool BridgeHttpServer::finishChunked(RequestContext& context) {
+    if (context.responseFinished) {
+        return !context.closeRequested;
     }
+    if (context.closeRequested ||
+        httpd_resp_send_chunk(context.request, nullptr, 0) != ESP_OK) {
+        context.closeRequested = true;
+        return false;
+    }
+    context.responseFinished = true;
+    return true;
 }
 
 BridgeHttpClient BridgeHttpServer::client() {

@@ -109,9 +109,11 @@ public:
                 const char* contentType,
                 PGM_P body,
                 size_t length = 0);
-    void sendContent(const String& content);
-    void sendContent(const char* content);
-    void sendContent(const char* content, size_t length);
+    // Returns false once the response can no longer be written. Streaming
+    // handlers must stop producing data immediately in that case.
+    bool sendContent(const String& content);
+    bool sendContent(const char* content);
+    bool sendContent(const char* content, size_t length);
     BridgeHttpClient client();
 
     void notifyJobChanged(const char* id);
@@ -173,7 +175,7 @@ private:
     Route* findRoute(const String& uri, HTTPMethod method);
     void parseQuery(httpd_req_t* request, RequestContext& context);
     void applyResponseMetadata(RequestContext& context, int code, const char* contentType);
-    void finishChunked(RequestContext& context);
+    bool finishChunked(RequestContext& context);
     void closeCurrentClient();
 
     EventClient* findEventClient(int fd);
