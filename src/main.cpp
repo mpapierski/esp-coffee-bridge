@@ -35,6 +35,7 @@
 #include "nivona.h"
 #include "recipe_icons.h"
 #include "stats_history.h"
+#include "wifi_runtime_policy.h"
 #include "web_ui_gzip.h"
 
 namespace {
@@ -61,6 +62,8 @@ constexpr uint32_t SUMMARY_CACHE_TTL_MS = 60 * 1000;
 constexpr uint32_t DEEP_CACHE_TTL_MS = 15 * 60 * 1000;
 constexpr uint32_t FEATURES_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 constexpr uint32_t CACHE_FAILURE_BACKOFF_MS = 5000;
+constexpr uint32_t WIFI_CONNECT_TIMEOUT_MS = 15000;
+constexpr uint32_t WIFI_RECONNECT_DELAY_MS = 5000;
 constexpr size_t MACHINE_GENERATION_CAPACITY = 16;
 constexpr size_t CACHEABLE_RESOURCE_COUNT = 4;
 constexpr size_t RESOURCE_CACHE_CAPACITY = MACHINE_GENERATION_CAPACITY * CACHEABLE_RESOURCE_COUNT;
@@ -444,6 +447,9 @@ size_t backupRestoreUploadBytes = 0;
 bool backupRestoreUploadComplete = false;
 bool wifiConnectionAttemptActive = false;
 uint32_t wifiConnectionAttemptStartedAtMs = 0;
+uint32_t wifiNextReconnectAtMs = 0;
+bool wifiAccessPointActive = false;
+bool wifiStationWasConnected = false;
 String lastPersistedMachinePayload;
 bool machinePersistenceDirty = false;
 uint32_t durableMachineWriteCount = 0;
@@ -3370,22 +3376,36 @@ void appendStandardRecipeDiscovery(JsonObject target,
     }
 }
 
+void startWifiStationAttempt(uint32_t nowMs) {
+    const String wifiPass = loadPrefString(PREFS_PASS);
+    WiFi.begin(wifiStaSsid.c_str(), wifiPass.c_str());
+    wifiConnectionAttemptStartedAtMs = nowMs;
+    wifiConnectionAttemptActive = true;
+    wifiNextReconnectAtMs = 0;
+    addLog("wifi", String("Started nonblocking connection to ") + wifiStaSsid);
+}
+
 void connectWifi() {
     wifiStaSsid = loadPrefString(PREFS_SSID);
-    const String wifiPass = loadPrefString(PREFS_PASS);
+    wifiConnectionAttemptActive = false;
+    wifiNextReconnectAtMs = 0;
+    wifiStationWasConnected = false;
 
-    WiFi.mode(WIFI_AP_STA);
-    WiFi.softAP(AP_SSID, AP_PASSWORD);
-
-    if (wifiStaSsid.isEmpty()) {
-        addLog("wifi", "No saved STA credentials, AP mode only");
+    const bool configured = !wifiStaSsid.isEmpty();
+    if (wifi_runtime_policy::shouldRunSetupAccessPoint(configured)) {
+        WiFi.mode(WIFI_AP);
+        wifiAccessPointActive = WiFi.softAP(AP_SSID, AP_PASSWORD);
+        addLog("wifi", wifiAccessPointActive
+            ? String("No saved STA credentials; setup AP started")
+            : String("No saved STA credentials; failed to start setup AP"));
         return;
     }
 
-    WiFi.begin(wifiStaSsid.c_str(), wifiPass.c_str());
-    wifiConnectionAttemptStartedAtMs = millis();
-    wifiConnectionAttemptActive = true;
-    addLog("wifi", String("Started nonblocking connection to ") + wifiStaSsid);
+    WiFi.softAPdisconnect(true);
+    wifiAccessPointActive = false;
+    WiFi.mode(WIFI_STA);
+    WiFi.setAutoReconnect(true);
+    startWifiStationAttempt(millis());
     bridge_time::tick(WiFi.status() == WL_CONNECTED, millis(), addTimeLog);
 }
 
@@ -3393,18 +3413,47 @@ void tickWifiConnection(uint32_t nowMs) {
     if (wifiReconnectRequested.exchange(false, std::memory_order_acq_rel)) {
         WiFi.disconnect(true, false);
         connectWifi();
-    }
-    if (!wifiConnectionAttemptActive) {
         return;
     }
-    if (WiFi.status() == WL_CONNECTED) {
+    if (wifiStaSsid.isEmpty()) {
+        return;
+    }
+
+    const bool connected = WiFi.status() == WL_CONNECTED;
+    if (connected) {
+        const bool newlyConnected = !wifiStationWasConnected;
         wifiConnectionAttemptActive = false;
-        addLog("wifi", String("Connected to ") + wifiStaSsid + " as " + WiFi.localIP().toString());
-        bridge_time::tick(true, nowMs, addTimeLog);
-    } else if (bridge_runtime_policy::elapsedAtLeast(
-                   nowMs, wifiConnectionAttemptStartedAtMs, 15000)) {
+        wifiNextReconnectAtMs = 0;
+        wifiStationWasConnected = true;
+        if (newlyConnected) {
+            addLog("wifi", String("Connected to ") + wifiStaSsid + " as " + WiFi.localIP().toString());
+            bridge_time::tick(true, nowMs, addTimeLog);
+        }
+        return;
+    }
+
+    if (wifiStationWasConnected) {
+        wifiStationWasConnected = false;
         wifiConnectionAttemptActive = false;
-        addLog("wifi", String("Failed to connect to ") + wifiStaSsid + ", AP remains active");
+        wifiNextReconnectAtMs = nowMs;
+        addLog("wifi", String("Lost connection to ") + wifiStaSsid +
+            "; retrying without setup AP");
+    }
+    if (wifiConnectionAttemptActive) {
+        if (!bridge_runtime_policy::elapsedAtLeast(
+                nowMs, wifiConnectionAttemptStartedAtMs, WIFI_CONNECT_TIMEOUT_MS)) {
+            return;
+        }
+        wifiConnectionAttemptActive = false;
+        wifiNextReconnectAtMs = nowMs + WIFI_RECONNECT_DELAY_MS;
+        addLog("wifi", String("Failed to connect to ") + wifiStaSsid +
+            "; setup AP is disabled and station retry is scheduled");
+        return;
+    }
+    if (wifi_runtime_policy::shouldStartStationAttempt(
+            !wifiStaSsid.isEmpty(), connected, wifiConnectionAttemptActive,
+            nowMs, wifiNextReconnectAtMs)) {
+        startWifiStationAttempt(nowMs);
     }
 }
 
@@ -6215,12 +6264,19 @@ void appendStatus(JsonDocument& doc) {
     doc["buildTime"]     = APP_BUILD_TIME;
     doc["hostname"]      = APP_HOSTNAME;
     doc["uptimeMs"]      = millis();
-    doc["apSsid"]        = AP_SSID;
-    doc["apPassword"]    = AP_PASSWORD;
-    doc["apIp"]          = WiFi.softAPIP().toString();
-    doc["staConnected"]  = WiFi.status() == WL_CONNECTED;
+    const bool staConnected = WiFi.status() == WL_CONNECTED;
+    const bool wifiConfigured = !wifiStaSsid.isEmpty();
+    doc["wifiConfigured"] = wifiConfigured;
+    doc["wifiMode"] = wifiAccessPointActive
+        ? "setup_ap"
+        : (wifiConfigured ? "station" : "unavailable");
+    doc["apActive"]      = wifiAccessPointActive;
+    doc["apSsid"]        = wifiAccessPointActive ? AP_SSID : "";
+    doc["apPassword"]    = wifiAccessPointActive ? AP_PASSWORD : "";
+    doc["apIp"]          = wifiAccessPointActive ? WiFi.softAPIP().toString() : String("");
+    doc["staConnected"]  = staConnected;
     doc["staSsid"]       = wifiStaSsid;
-    doc["staIp"]         = WiFi.localIP().toString();
+    doc["staIp"]         = staConnected ? WiFi.localIP().toString() : String("");
     doc["selectedAddress"] = health.selectedAddress;
     doc["notificationsEnabled"] = String(health.notificationMode) != "off";
     doc["notificationMode"] = health.notificationMode;

@@ -116,6 +116,8 @@ BLE-backed routes return jobs, including scans and probes; connect, disconnect, 
 
 The browser UI resolves `202` jobs through one helper, validates same-origin result URLs, honors `pollAfterMs`, and applies per-request abort timeouts within a 60-second logical deadline. Stale resources render immediately with refresh/error state. Periodic refreshes are scheduled only after the preceding request completes, so slow requests cannot accumulate overlapping polls.
 
+Wi-Fi uses mutually exclusive modes. With no saved station SSID, the bridge exposes the password-protected setup AP. Once credentials are saved it disables the AP and runs station-only, retrying the configured network after a bounded connection attempt instead of exposing a fallback hotspot. `/api/status` reports `wifiConfigured`, `wifiMode`, and `apActive` so the UI can distinguish setup mode from a temporary station outage.
+
 A persistent Bridge activity strip and header badge read only `/api/status`. While work is active they show a human-readable operation, machine model/alias, elapsed time, worker progress, and queued-job count. The completion-scheduled status-only poll runs once per second while active or queued and every two seconds while idle; it never initiates BLE work.
 
 Standard, customized, and replayed brews explicitly refresh summary with `?refresh=1` before rerendering. A failed follow-up read warns that the brew was already sent and never retries the mutation. The worker invalidates the previous summary after an acknowledged brew or confirmation, including an acknowledged action whose final result was incomplete.

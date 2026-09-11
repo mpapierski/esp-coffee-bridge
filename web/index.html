@@ -1360,12 +1360,29 @@
       return "";
     }
     const items = [
-      status.staConnected ? `<span class="badge good">Wi-Fi ${escapeHtml(status.staSsid || "")}</span>` : `<span class="badge warn">AP only</span>`,
+      wifiStatusBadge(status),
       `<span class="badge">${status.savedMachineCount || 0} saved</span>`,
       `<span class="badge">${status.supportedDeviceCount || 0} nearby supported</span>`,
       bridgeActivityBadge(status)
     ];
     return items.join("");
+  }
+
+  function wifiModeLabel(status) {
+    if (status?.staConnected) {
+      return "Wi-Fi";
+    }
+    if (status?.apActive) {
+      return "Setup AP";
+    }
+    return status?.wifiConfigured ? "Wi-Fi reconnecting" : "Network unavailable";
+  }
+
+  function wifiStatusBadge(status) {
+    if (status?.staConnected) {
+      return `<span class="badge good">Wi-Fi ${escapeHtml(status.staSsid || "")}</span>`;
+    }
+    return `<span class="badge warn">${escapeHtml(wifiModeLabel(status))}</span>`;
   }
 
   function bridgeJobLabel(kind) {
@@ -1720,7 +1737,7 @@
           </a>
           <a class="nav-link ${isRouteActive("system") ? "active" : ""}" href="#/system">
             <span>System</span>
-            <span class="muted tiny">${state.status?.staConnected ? "Wi-Fi" : "AP"}</span>
+            <span class="muted tiny">${escapeHtml(wifiModeLabel(state.status))}</span>
           </a>
         </div>
       </section>
@@ -1745,7 +1762,7 @@
         <h2 class="sidebar-title">Live bridge</h2>
         <div class="value-list">
           <div class="value-item"><span>Station</span><span>${state.status?.staConnected ? escapeHtml(state.status.staIp || state.status.staSsid || "connected") : "offline"}</span></div>
-          <div class="value-item"><span>AP</span><span>${escapeHtml(state.status?.apIp || "")}</span></div>
+          <div class="value-item"><span>Setup AP</span><span>${state.status?.apActive ? escapeHtml(state.status.apIp || state.status.apSsid || "active") : "disabled"}</span></div>
           <div class="value-item"><span>Scan</span><span>${state.status?.lastScanResultCount ?? 0} devices</span></div>
           <div class="value-item"><span>Protocol sessions</span><span>${state.status?.protocolSessionCount ?? 0}</span></div>
         </div>
@@ -2989,6 +3006,7 @@
               <div class="row">
                 <button type="submit">Save Wi-Fi</button>
               </div>
+              <div class="muted tiny" style="margin-top:10px;">The setup hotspot is available only while Wi-Fi is unconfigured. Saving credentials disables it, and the bridge retries station mode if the network is temporarily unavailable.</div>
             </form>
           </article>
 

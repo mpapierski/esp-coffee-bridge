@@ -81,7 +81,7 @@ pio run -t upload
 
 ## Network / Access
 
-The firmware always starts an AP for fallback access:
+The firmware starts a setup AP only when no station credentials are saved:
 
 - SSID: `esp-coffee-maker`
 - password: `coffee-setup`
@@ -90,7 +90,7 @@ If no STA credentials are saved, open:
 
 - `http://192.168.4.1/`
 
-From the UI, save your Wi-Fi credentials. The bridge will try to join your network and keep the AP up as fallback.
+From the UI, save your Wi-Fi credentials. The bridge disables the setup AP, switches to station-only mode, and keeps retrying the configured network if it is temporarily unavailable. It does not expose a fallback hotspot once configured.
 
 If STA connect succeeds, the bridge also advertises:
 
@@ -112,7 +112,7 @@ curl -f \
   http://esp-coffee-bridge.local/api/ota
 ```
 
-Or against the AP address:
+On an unconfigured bridge, uploads can also use the setup AP address:
 
 ```bash
 curl -f \
