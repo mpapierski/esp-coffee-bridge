@@ -75,7 +75,9 @@ constexpr uint16_t TEMP_RECIPE_TYPE_REGISTER = 9001;
 constexpr char STANDARD_RECIPE_CACHE_PREFIX[] = "/stdrec-";
 constexpr uint32_t STANDARD_RECIPE_CACHE_SCHEMA = 2;
 constexpr char SAVED_RECIPE_CACHE_PREFIX[] = "/mycoffee-";
-constexpr uint32_t SAVED_RECIPE_CACHE_SCHEMA = 3;
+constexpr uint32_t SAVED_RECIPE_CACHE_SCHEMA = 4;
+constexpr uint32_t SAVED_RECIPE_SLOT_CACHE_SCHEMA = 1;
+constexpr size_t SAVED_RECIPE_ITEM_JSON_CAPACITY = 12 * 1024;
 constexpr uint32_t BACKUP_BUNDLE_SCHEMA = 1;
 constexpr char BACKUP_RESTORE_UPLOAD_PATH[] = "/restore-upload.ndjson";
 constexpr char BACKUP_RESTORE_ACTIVE_MARKER[] = "/restore-active.marker";
@@ -501,6 +503,11 @@ void requestBleWorkerReset();
 size_t jobSpoolBytesLocked(const String& replacingPath);
 bool littleFsCanAllocateLocked(size_t incomingBytes);
 void invalidateResourceCache(const String& serial, const String& resource);
+bool streamJsonFileResponse(const String& path,
+                            size_t maximumBytes,
+                            int status,
+                            bool& responseStarted,
+                            String& error);
 
 ScanRecord recordFromAdvertisedDevice(const NimBLEAdvertisedDevice* device) {
     ScanRecord record;
@@ -1344,6 +1351,11 @@ String savedRecipeCachePath(const String& serial) {
     return String(SAVED_RECIPE_CACHE_PREFIX) + cacheSafeToken(serial) + ".json";
 }
 
+String savedRecipeSlotCachePath(const String& serial, uint8_t slotNumber) {
+    return String(SAVED_RECIPE_CACHE_PREFIX) + cacheSafeToken(serial) + "-slot-" +
+        slotNumber + ".json";
+}
+
 bool parseRefreshArg() {
     WorkerExecutionContext* execution = currentWorkerExecution();
     if (execution != nullptr) {
@@ -2062,11 +2074,8 @@ void clearSavedRecipeCachesForMachine(const String& serial) {
     if (!littleFsReady || serial.isEmpty()) {
         return;
     }
-    history_storage::Guard filesystem;
-    if (!filesystem) {
-        return;
-    }
-    LittleFS.remove(savedRecipeCachePath(serial));
+    clearStandardRecipeCachesByPrefix(
+        String(SAVED_RECIPE_CACHE_PREFIX) + cacheSafeToken(serial));
 }
 
 void clearAllSavedRecipeCaches() {
@@ -2298,11 +2307,14 @@ bool persistStandardRecipeCache(const SavedMachine& machine,
     return true;
 }
 
-bool loadSavedRecipeCache(const SavedMachine& machine,
-                          DynamicJsonDocument& cacheDoc,
-                          String& error) {
+bool writeGeneratedJsonLiteral(const String& path,
+                               const String& literal,
+                               bool truncate,
+                               size_t maximumBytes,
+                               bool countTowardJobSpool,
+                               String& error) {
     if (!littleFsReady) {
-        error = "saved recipe cache is unavailable";
+        error = "LittleFS is unavailable";
         return false;
     }
     history_storage::Guard filesystem;
@@ -2310,115 +2322,316 @@ bool loadSavedRecipeCache(const SavedMachine& machine,
         error = "filesystem is busy";
         return false;
     }
+    if (truncate) {
+        LittleFS.remove(path);
+    }
+    size_t currentBytes = 0;
+    if (!truncate && LittleFS.exists(path)) {
+        File existing = LittleFS.open(path, "r");
+        if (!existing) {
+            error = "failed to inspect generated JSON file";
+            return false;
+        }
+        currentBytes = existing.size();
+        existing.close();
+    }
+    const size_t projectedBytes = currentBytes + literal.length();
+    if (projectedBytes > maximumBytes) {
+        error = "generated JSON exceeds its bounded file size";
+        return false;
+    }
+    if (countTowardJobSpool &&
+        jobSpoolBytesLocked(path) + projectedBytes > MAX_JOB_SPOOL_TOTAL_BYTES) {
+        error = "retained job results reached the bounded spool budget";
+        return false;
+    }
+    if (!littleFsCanAllocateLocked(literal.length())) {
+        error = "generated JSON would consume reserved history headroom";
+        return false;
+    }
+    File output = LittleFS.open(path, truncate ? "w" : "a");
+    if (!output) {
+        error = "failed to open generated JSON file";
+        return false;
+    }
+    const size_t written = output.write(
+        reinterpret_cast<const uint8_t*>(literal.c_str()), literal.length());
+    output.close();
+    if (written != literal.length()) {
+        error = "failed to write generated JSON file";
+        return false;
+    }
+    return true;
+}
 
-    File cacheFile = LittleFS.open(savedRecipeCachePath(machine.serial), "r");
-    if (!cacheFile) {
+bool appendGeneratedJsonValue(const String& path,
+                              JsonVariantConst value,
+                              bool prependComma,
+                              size_t maximumBytes,
+                              bool countTowardJobSpool,
+                              String& error) {
+    const size_t jsonBytes = measureJson(value);
+    if (jsonBytes == 0) {
+        error = "generated JSON value is empty";
+        return false;
+    }
+    history_storage::Guard filesystem;
+    if (!filesystem) {
+        error = "filesystem is busy";
+        return false;
+    }
+    File existing = LittleFS.open(path, "r");
+    if (!existing) {
+        error = "generated JSON file is missing";
+        return false;
+    }
+    const size_t currentBytes = existing.size();
+    existing.close();
+    const size_t appendBytes = jsonBytes + (prependComma ? 1 : 0);
+    const size_t projectedBytes = currentBytes + appendBytes;
+    if (projectedBytes > maximumBytes) {
+        error = "generated JSON exceeds its bounded file size";
+        return false;
+    }
+    if (countTowardJobSpool &&
+        jobSpoolBytesLocked(path) + projectedBytes > MAX_JOB_SPOOL_TOTAL_BYTES) {
+        error = "retained job results reached the bounded spool budget";
+        return false;
+    }
+    if (!littleFsCanAllocateLocked(appendBytes)) {
+        error = "generated JSON would consume reserved history headroom";
+        return false;
+    }
+    File output = LittleFS.open(path, "a");
+    if (!output) {
+        error = "failed to append generated JSON file";
+        return false;
+    }
+    bool ok = true;
+    if (prependComma) {
+        ok = output.write(static_cast<uint8_t>(',')) == 1;
+    }
+    if (ok) {
+        ok = serializeJson(value, output) == jsonBytes;
+    }
+    output.close();
+    if (!ok) {
+        error = "failed to serialize generated JSON value";
+        return false;
+    }
+    return true;
+}
+
+bool installGeneratedCacheFile(const String& temporaryPath,
+                               const String& finalPath,
+                               size_t maximumBytes,
+                               String& error) {
+    history_storage::Guard filesystem;
+    if (!filesystem) {
+        error = "filesystem is busy";
+        return false;
+    }
+    File candidate = LittleFS.open(temporaryPath, "r");
+    if (!candidate || candidate.size() <= 2 || candidate.size() > maximumBytes) {
+        if (candidate) {
+            candidate.close();
+        }
+        error = "generated saved-recipe cache is empty or oversized";
+        return false;
+    }
+    const size_t expectedBytes = candidate.size();
+    const int first = candidate.read();
+    candidate.seek(expectedBytes - 1);
+    const int last = candidate.read();
+    candidate.close();
+    if (first != '{' || last != '}') {
+        error = "generated saved-recipe cache is not a JSON object";
+        return false;
+    }
+
+    const String backupPath = finalPath + ".bak";
+    LittleFS.remove(backupPath);
+    const bool hadOriginal = LittleFS.exists(finalPath);
+    if (hadOriginal && !LittleFS.rename(finalPath, backupPath)) {
+        error = "failed to preserve the previous saved-recipe cache";
+        return false;
+    }
+    if (!LittleFS.rename(temporaryPath, finalPath)) {
+        if (hadOriginal) {
+            LittleFS.rename(backupPath, finalPath);
+        }
+        error = "failed to publish the saved-recipe cache";
+        return false;
+    }
+    File installed = LittleFS.open(finalPath, "r");
+    const bool valid = installed && installed.size() == expectedBytes;
+    if (installed) {
+        installed.close();
+    }
+    if (!valid) {
+        LittleFS.remove(finalPath);
+        if (hadOriginal) {
+            LittleFS.rename(backupPath, finalPath);
+        }
+        error = "published saved-recipe cache failed validation";
+        return false;
+    }
+    LittleFS.remove(backupPath);
+    return true;
+}
+
+String savedRecipeListHeader(const SavedMachine& machine, bool cached, String& error) {
+    DynamicJsonDocument header(1024);
+    header["ok"] = true;
+    header["source"] = cached ? "cache" : "live";
+    header["cached"] = cached;
+    if (cached) {
+        header["schema"] = SAVED_RECIPE_CACHE_SCHEMA;
+        header["cacheKind"] = "mycoffee_list";
+        header["serial"] = machine.serial;
+        header["familyKey"] = machine.familyKey;
+    }
+    header.createNestedArray("recipes");
+    String serializedHeader;
+    serializeJson(header, serializedHeader);
+    if (header.overflowed() || !serializedHeader.endsWith("[]}")) {
+        error = "failed to build the bounded saved-recipe list header";
+        return "";
+    }
+    serializedHeader.remove(serializedHeader.length() - 2);
+    return serializedHeader;
+}
+
+String savedRecipeSlotHeader(const SavedMachine& machine,
+                             uint8_t slotNumber,
+                             String& error) {
+    DynamicJsonDocument header(1024);
+    header["ok"] = true;
+    header["source"] = "cache";
+    header["cached"] = true;
+    header["schema"] = SAVED_RECIPE_SLOT_CACHE_SCHEMA;
+    header["cacheKind"] = "mycoffee_slot";
+    header["serial"] = machine.serial;
+    header["familyKey"] = machine.familyKey;
+    header["slot"] = slotNumber;
+    String serializedHeader;
+    serializeJson(header, serializedHeader);
+    if (header.overflowed() || !serializedHeader.endsWith("}")) {
+        error = "failed to build the bounded saved-recipe slot header";
+        return "";
+    }
+    serializedHeader.remove(serializedHeader.length() - 1);
+    serializedHeader += ",\"recipe\":";
+    return serializedHeader;
+}
+
+bool writeSavedRecipeSlotCacheTemporary(const SavedMachine& machine,
+                                         JsonObjectConst recipe,
+                                         const String& temporaryPath,
+                                         String& error) {
+    const int slotNumber = recipe["slot"] | 0;
+    if (slotNumber <= 0 || slotNumber > 255) {
+        error = "saved recipe cache entry is missing a valid slot number";
+        return false;
+    }
+    const String header = savedRecipeSlotHeader(
+        machine, static_cast<uint8_t>(slotNumber), error);
+    return !header.isEmpty() &&
+        writeGeneratedJsonLiteral(
+            temporaryPath, header, true, MAX_RESOURCE_CACHE_BYTES, false, error) &&
+        appendGeneratedJsonValue(
+            temporaryPath, recipe, false, MAX_RESOURCE_CACHE_BYTES, false, error) &&
+        writeGeneratedJsonLiteral(
+            temporaryPath, "}", false, MAX_RESOURCE_CACHE_BYTES, false, error);
+}
+
+bool validateSavedRecipeCache(const SavedMachine& machine,
+                              const String& path,
+                              const char* expectedKind,
+                              uint32_t expectedSchema,
+                              uint8_t expectedSlot,
+                              String& error) {
+    if (!littleFsReady) {
+        error = "saved recipe cache is unavailable";
+        return false;
+    }
+    history_storage::Guard filesystem(1000);
+    if (!filesystem) {
+        error = "filesystem is busy";
+        return false;
+    }
+    File cacheFile = LittleFS.open(path, "r");
+    if (!cacheFile || cacheFile.size() <= 2 || cacheFile.size() > MAX_JOB_RESULT_BYTES) {
+        if (cacheFile) {
+            cacheFile.close();
+        }
         error = "saved recipe cache miss";
         return false;
     }
-
-    DeserializationError parseError = deserializeJson(cacheDoc, cacheFile);
+    DynamicJsonDocument filter(384);
+    filter["schema"] = true;
+    filter["cacheKind"] = true;
+    filter["serial"] = true;
+    filter["familyKey"] = true;
+    filter["slot"] = true;
+    DynamicJsonDocument metadata(768);
+    const DeserializationError parseError = deserializeJson(
+        metadata, cacheFile, DeserializationOption::Filter(filter));
     cacheFile.close();
     if (parseError) {
-        LittleFS.remove(savedRecipeCachePath(machine.serial));
         error = String("failed to parse saved recipe cache: ") + parseError.c_str();
         return false;
     }
-
-    if ((cacheDoc["schema"] | 0U) != SAVED_RECIPE_CACHE_SCHEMA) {
-        LittleFS.remove(savedRecipeCachePath(machine.serial));
-        error = "saved recipe cache schema mismatch";
-        return false;
-    }
-    const String cachedSerial = cacheDoc["serial"] | "";
-    JsonArray cachedRecipes = cacheDoc["recipes"].as<JsonArray>();
-    if (!cachedSerial.equalsIgnoreCase(machine.serial) || cachedRecipes.isNull()) {
-        LittleFS.remove(savedRecipeCachePath(machine.serial));
+    const String cachedSerial = metadata["serial"] | "";
+    const String cachedFamily = metadata["familyKey"] | "";
+    const String cacheKind = metadata["cacheKind"] | "";
+    if ((metadata["schema"] | 0U) != expectedSchema ||
+        cacheKind != expectedKind ||
+        !cachedSerial.equalsIgnoreCase(machine.serial) ||
+        cachedFamily != machine.familyKey ||
+        (expectedSlot != 0 && (metadata["slot"] | 0U) != expectedSlot)) {
         error = "saved recipe cache contents mismatch";
         return false;
     }
     return true;
 }
 
-bool writeSavedRecipeCacheDoc(const SavedMachine& machine,
-                              DynamicJsonDocument& cacheDoc,
-                              String& error) {
-    if (!littleFsReady) {
-        error = "saved recipe cache is unavailable";
-        return false;
-    }
-    WorkerMachineWriteGuard machineGuard;
-    if (!machineGuard) {
-        error = "machine was deleted or replaced while the job was running";
-        return false;
-    }
-    history_storage::Guard filesystem;
-    if (!filesystem) {
-        error = "filesystem is busy";
-        return false;
-    }
-
-    File cacheFile = LittleFS.open(savedRecipeCachePath(machine.serial), "w");
-    if (!cacheFile) {
-        error = "failed to open saved recipe cache for writing";
-        return false;
-    }
-    if (serializeJson(cacheDoc, cacheFile) == 0) {
-        cacheFile.close();
-        error = "failed to write saved recipe cache";
-        return false;
-    }
-    cacheFile.close();
-    return true;
-}
-
-bool persistSavedRecipeCache(const SavedMachine& machine,
-                             JsonArrayConst recipes,
-                             String& error) {
-    if (!littleFsReady) {
-        error = "saved recipe cache is unavailable";
-        return false;
-    }
-
-    DynamicJsonDocument cacheDoc(65536);
-    cacheDoc["schema"] = SAVED_RECIPE_CACHE_SCHEMA;
-    cacheDoc["serial"] = machine.serial;
-    cacheDoc["familyKey"] = machine.familyKey;
-    JsonArray storedRecipes = cacheDoc.createNestedArray("recipes");
-    storedRecipes.set(recipes);
-    return writeSavedRecipeCacheDoc(machine, cacheDoc, error);
-}
-
 bool upsertSavedRecipeCacheEntry(const SavedMachine& machine,
                                  JsonObjectConst recipe,
                                  String& error) {
     const int slotNumber = recipe["slot"] | 0;
-    if (slotNumber <= 0) {
-        error = "saved recipe cache entry is missing a slot number";
+    if (slotNumber <= 0 || slotNumber > 255) {
+        error = "saved recipe cache entry is missing a valid slot number";
         return false;
     }
-
-    DynamicJsonDocument cacheDoc(65536);
-    String loadError;
-    if (!loadSavedRecipeCache(machine, cacheDoc, loadError)) {
-        // A single updated slot is not a complete MyCoffee list. Leaving the
-        // cache absent forces the next list GET to refresh all supported slots
-        // instead of presenting a one-slot snapshot as authoritative.
-        error = String("full saved recipe cache is unavailable: ") + loadError;
+    WorkerExecutionContext* execution = currentWorkerExecution();
+    const String token = execution != nullptr ? execution->jobId : String(millis());
+    const String finalPath = savedRecipeSlotCachePath(
+        machine.serial, static_cast<uint8_t>(slotNumber));
+    const String temporaryPath = finalPath + "." + token + ".tmp";
+    if (!writeSavedRecipeSlotCacheTemporary(machine, recipe, temporaryPath, error)) {
+        littleFsRemoveLocked(temporaryPath);
         return false;
     }
-
-    JsonArray recipes = cacheDoc["recipes"].as<JsonArray>();
-    for (size_t index = 0; index < recipes.size(); ++index) {
-        if ((recipes[index]["slot"] | 0) == slotNumber) {
-            recipes.remove(index);
-            break;
-        }
+    WorkerMachineWriteGuard machineGuard;
+    if (!machineGuard) {
+        littleFsRemoveLocked(temporaryPath);
+        error = "machine was deleted or replaced while the job was running";
+        return false;
     }
-
-    JsonObject storedRecipe = recipes.createNestedObject();
-    storedRecipe.set(recipe);
-    return writeSavedRecipeCacheDoc(machine, cacheDoc, error);
+    if (!installGeneratedCacheFile(
+            temporaryPath, finalPath, MAX_RESOURCE_CACHE_BYTES, error)) {
+        littleFsRemoveLocked(temporaryPath);
+        return false;
+    }
+    // A single changed slot cannot safely update the streamed full-list cache
+    // in place. Invalidate only that aggregate; the refreshed slot remains
+    // available from its independent bounded cache.
+    if (!littleFsRemoveLocked(savedRecipeCachePath(machine.serial))) {
+        error = "failed to invalidate the saved-recipe list cache";
+        return false;
+    }
+    return true;
 }
 
 nivona::DeviceDetails toNivonaDetails(const DeviceDetails& details) {
@@ -8726,22 +8939,6 @@ void handleMachineMyCoffeeList(const String& serial) {
         return;
     }
 
-    const bool forceRefresh = parseRefreshArg();
-    if (!forceRefresh) {
-        DynamicJsonDocument cachedResponse(65536);
-        String cacheError;
-        if (loadSavedRecipeCache(*machine, cachedResponse, cacheError)) {
-            DynamicJsonDocument response(65536);
-            response["ok"] = true;
-            response["source"] = "cache";
-            response["cached"] = true;
-            JsonArray items = response.createNestedArray("recipes");
-            items.set(cachedResponse["recipes"].as<JsonArray>());
-            sendJson(response);
-            return;
-        }
-    }
-
     String error;
     if (!beginMachineProtocolSession(*machine, error)) {
         lastError = error;
@@ -8749,37 +8946,188 @@ void handleMachineMyCoffeeList(const String& serial) {
         return;
     }
 
-    DynamicJsonDocument response(65536);
-    response["ok"] = true;
-    response["source"] = "live";
-    response["cached"] = false;
-    JsonArray items = response.createNestedArray("recipes");
+    WorkerExecutionContext* execution = currentWorkerExecution();
+    if (execution == nullptr || !execution->spoolResult || execution->resultPath.isEmpty()) {
+        sendError(500, "saved-recipe list requires bounded worker result storage");
+        return;
+    }
+
+    const String resultHeader = savedRecipeListHeader(*machine, false, error);
+    if (resultHeader.isEmpty() ||
+        !writeGeneratedJsonLiteral(execution->resultPath,
+                                   resultHeader,
+                                   true,
+                                   MAX_JOB_RESULT_BYTES,
+                                   true,
+                                   error)) {
+        lastError = error;
+        sendError(507, error);
+        return;
+    }
+
+    const String listCachePath = savedRecipeCachePath(machine->serial);
+    const String listCacheTemporaryPath =
+        listCachePath + "." + execution->jobId + ".tmp";
+    const String cacheHeader = savedRecipeListHeader(*machine, true, error);
+    bool cacheWritable = !cacheHeader.isEmpty() &&
+        writeGeneratedJsonLiteral(listCacheTemporaryPath,
+                                  cacheHeader,
+                                  true,
+                                  MAX_JOB_RESULT_BYTES,
+                                  false,
+                                  error);
+    String cacheWriteError = cacheWritable ? String("") : error;
+    error = "";
+    std::vector<String> slotTemporaryPaths;
+    std::vector<String> slotFinalPaths;
+    auto removeCacheTemporaries = [&]() {
+        littleFsRemoveLocked(listCacheTemporaryPath);
+        for (const String& path : slotTemporaryPaths) {
+            littleFsRemoveLocked(path);
+        }
+    };
+    auto failResult = [&](int status, const String& message) {
+        removeCacheTemporaries();
+        littleFsRemoveLocked(execution->resultPath);
+        lastError = message;
+        sendError(status, message);
+    };
+
+    bool firstRecipe = true;
     for (uint8_t slot = 0; slot < layout.slotCount; ++slot) {
-        JsonObject item = items.createNestedObject();
-        if (!appendMyCoffeeSlot(item, *machine, slot, true, error)) {
+        DynamicJsonDocument itemDocument(SAVED_RECIPE_ITEM_JSON_CAPACITY);
+        JsonObject item = itemDocument.to<JsonObject>();
+        const bool itemSucceeded = appendMyCoffeeSlot(item, *machine, slot, true, error);
+        if (!itemSucceeded) {
             if (isTransportReadFailure(error)) {
-                lastError = error;
-                sendError(500, error.isEmpty() ? String("saved recipe refresh timed out") : error);
+                failResult(500,
+                           error.isEmpty() ? String("saved recipe refresh timed out") : error);
                 return;
             }
             item["ok"] = false;
             item["error"] = error;
             error = "";
-            continue;
+        } else {
+            item["ok"] = true;
         }
-        item["ok"] = true;
+        if (itemDocument.overflowed()) {
+            failResult(507, "saved recipe slot JSON exceeded its bounded capacity");
+            return;
+        }
+        const JsonVariantConst itemValue = itemDocument.as<JsonVariantConst>();
+        if (!appendGeneratedJsonValue(execution->resultPath,
+                                      itemValue,
+                                      !firstRecipe,
+                                      MAX_JOB_RESULT_BYTES,
+                                      true,
+                                      error)) {
+            failResult(507, error);
+            return;
+        }
+        if (cacheWritable &&
+            !appendGeneratedJsonValue(listCacheTemporaryPath,
+                                      itemValue,
+                                      !firstRecipe,
+                                      MAX_JOB_RESULT_BYTES,
+                                      false,
+                                      error)) {
+            cacheWritable = false;
+            cacheWriteError = error;
+            removeCacheTemporaries();
+        }
+        if (cacheWritable && itemSucceeded) {
+            const String slotFinalPath = savedRecipeSlotCachePath(machine->serial, slot + 1);
+            const String slotTemporaryPath =
+                slotFinalPath + "." + execution->jobId + ".tmp";
+            if (!writeSavedRecipeSlotCacheTemporary(
+                    *machine, item, slotTemporaryPath, error)) {
+                cacheWritable = false;
+                cacheWriteError = error;
+                removeCacheTemporaries();
+            } else {
+                slotTemporaryPaths.push_back(slotTemporaryPath);
+                slotFinalPaths.push_back(slotFinalPath);
+            }
+        }
+        firstRecipe = false;
+        noteWorkerProgress(static_cast<uint8_t>(10 +
+            ((static_cast<uint32_t>(slot) + 1U) * 75U) / layout.slotCount));
     }
 
-    String cacheWriteError;
-    if (!persistSavedRecipeCache(*machine, items, cacheWriteError)) {
-        addLog("cache", String("Saved recipe cache write skipped: ") + cacheWriteError);
-        clearSavedRecipeCachesForMachine(machine->serial);
-        response["cachePersisted"] = false;
-        response["cacheError"] = cacheWriteError;
-    } else {
-        response["cachePersisted"] = true;
+    if (cacheWritable &&
+        !writeGeneratedJsonLiteral(listCacheTemporaryPath,
+                                   "]}",
+                                   false,
+                                   MAX_JOB_RESULT_BYTES,
+                                   false,
+                                   error)) {
+        cacheWritable = false;
+        cacheWriteError = error;
+        removeCacheTemporaries();
     }
-    sendJson(response);
+
+    bool cachePersisted = false;
+    if (cacheWritable) {
+        WorkerMachineWriteGuard machineGuard;
+        if (!machineGuard) {
+            cacheWriteError = "machine was deleted or replaced while the job was running";
+        } else if (!installGeneratedCacheFile(listCacheTemporaryPath,
+                                               listCachePath,
+                                               MAX_JOB_RESULT_BYTES,
+                                               cacheWriteError)) {
+            // The old aggregate cache remains in place on an installation
+            // failure. Slot caches are not published unless the aggregate is.
+        } else {
+            cachePersisted = true;
+            for (size_t index = 0; index < slotTemporaryPaths.size(); ++index) {
+                String slotError;
+                if (!installGeneratedCacheFile(slotTemporaryPaths[index],
+                                               slotFinalPaths[index],
+                                               MAX_RESOURCE_CACHE_BYTES,
+                                               slotError)) {
+                    cachePersisted = false;
+                    cacheWriteError = slotError;
+                    littleFsRemoveLocked(slotFinalPaths[index]);
+                }
+            }
+        }
+    }
+    removeCacheTemporaries();
+    if (!cachePersisted) {
+        addLog("cache", String("Saved recipe cache write skipped: ") + cacheWriteError);
+    }
+
+    DynamicJsonDocument trailer(768);
+    trailer["cachePersisted"] = cachePersisted;
+    if (!cachePersisted) {
+        trailer["cacheError"] = cacheWriteError;
+    }
+    String serializedTrailer;
+    serializeJson(trailer, serializedTrailer);
+    if (trailer.overflowed() || serializedTrailer.length() < 2 ||
+        serializedTrailer.charAt(0) != '{') {
+        failResult(507, "failed to build the bounded saved-recipe result trailer");
+        return;
+    }
+    serializedTrailer.remove(0, 1);
+    serializedTrailer = "]," + serializedTrailer;
+    if (!writeGeneratedJsonLiteral(execution->resultPath,
+                                   serializedTrailer,
+                                   false,
+                                   MAX_JOB_RESULT_BYTES,
+                                   true,
+                                   error)) {
+        failResult(507, error);
+        return;
+    }
+
+    // The result now exists as a complete bounded JSON file. The worker will
+    // retain that path in the terminal job and the HTTP task streams it in
+    // chunks without recreating the full response in heap memory.
+    execution->responded = true;
+    execution->responseStatus = 200;
+    execution->errorCode = "";
+    execution->errorMessage = "";
 }
 
 void handleMachineMyCoffeeDetail(const String& serial, const String& slotText, bool isUpdate) {
@@ -8804,30 +9152,6 @@ void handleMachineMyCoffeeDetail(const String& serial, const String& slotText, b
     if (slotIndex >= layout.slotCount) {
         sendError(400, "slot is out of range");
         return;
-    }
-
-    const bool forceRefresh = !isUpdate && parseRefreshArg();
-    if (!isUpdate && !forceRefresh) {
-        DynamicJsonDocument cachedResponse(65536);
-        String cacheError;
-        if (loadSavedRecipeCache(*machine, cachedResponse, cacheError)) {
-            JsonArray cachedRecipes = cachedResponse["recipes"].as<JsonArray>();
-            for (JsonVariant recipeVariant : cachedRecipes) {
-                JsonObject cachedRecipe = recipeVariant.as<JsonObject>();
-                if ((cachedRecipe["slot"] | 0) != slotNumber || !(cachedRecipe["ok"] | true)) {
-                    continue;
-                }
-
-                DynamicJsonDocument response(16384);
-                response["ok"] = true;
-                response["source"] = "cache";
-                response["cached"] = true;
-                JsonObject item = response.createNestedObject("recipe");
-                item.set(cachedRecipe);
-                sendJson(response);
-                return;
-            }
-        }
     }
 
     String error;
@@ -9520,45 +9844,64 @@ bool trySendCachedMyCoffeeList(const String& serial) {
     if (machine == nullptr) {
         return false;
     }
-    DynamicJsonDocument cachedResponse(65536);
+    const String cachePath = savedRecipeCachePath(machine->serial);
     String cacheError;
-    if (!loadSavedRecipeCache(*machine, cachedResponse, cacheError)) {
+    if (!validateSavedRecipeCache(*machine,
+                                  cachePath,
+                                  "mycoffee_list",
+                                  SAVED_RECIPE_CACHE_SCHEMA,
+                                  0,
+                                  cacheError)) {
+        if (cacheError == "filesystem is busy") {
+            server.sendHeader("Retry-After", "1");
+            sendError(503, cacheError);
+            return true;
+        }
+        littleFsRemoveLocked(cachePath);
         return false;
     }
-    DynamicJsonDocument response(65536);
-    response["ok"] = true;
-    response["source"] = "cache";
-    response["cached"] = true;
-    response.createNestedArray("recipes").set(cachedResponse["recipes"].as<JsonArray>());
-    sendJson(response);
+    bool responseStarted = false;
+    if (!streamJsonFileResponse(
+            cachePath, MAX_JOB_RESULT_BYTES, 200, responseStarted, cacheError) &&
+        !responseStarted) {
+        server.sendHeader("Retry-After", "1");
+        sendError(503, cacheError);
+    }
     return true;
 }
 
 bool trySendCachedMyCoffeeSlot(const String& serial, const String& slotText) {
     SavedMachine* machine = findSavedMachineBySerial(serial);
     size_t slot = 0;
-    if (machine == nullptr || !parseUnsignedPathIndex(slotText, slot) || slot == 0) {
+    if (machine == nullptr || !parseUnsignedPathIndex(slotText, slot) ||
+        slot == 0 || slot > 255) {
         return false;
     }
-    DynamicJsonDocument cachedResponse(65536);
+    const String cachePath = savedRecipeSlotCachePath(
+        machine->serial, static_cast<uint8_t>(slot));
     String cacheError;
-    if (!loadSavedRecipeCache(*machine, cachedResponse, cacheError)) {
+    if (!validateSavedRecipeCache(*machine,
+                                  cachePath,
+                                  "mycoffee_slot",
+                                  SAVED_RECIPE_SLOT_CACHE_SCHEMA,
+                                  static_cast<uint8_t>(slot),
+                                  cacheError)) {
+        if (cacheError == "filesystem is busy") {
+            server.sendHeader("Retry-After", "1");
+            sendError(503, cacheError);
+            return true;
+        }
+        littleFsRemoveLocked(cachePath);
         return false;
     }
-    for (JsonVariant recipeVariant : cachedResponse["recipes"].as<JsonArray>()) {
-        JsonObject cachedRecipe = recipeVariant.as<JsonObject>();
-        if ((cachedRecipe["slot"] | 0U) != slot || !(cachedRecipe["ok"] | true)) {
-            continue;
-        }
-        DynamicJsonDocument response(16384);
-        response["ok"] = true;
-        response["source"] = "cache";
-        response["cached"] = true;
-        response.createNestedObject("recipe").set(cachedRecipe);
-        sendJson(response);
-        return true;
+    bool responseStarted = false;
+    if (!streamJsonFileResponse(
+            cachePath, MAX_RESOURCE_CACHE_BYTES, 200, responseStarted, cacheError) &&
+        !responseStarted) {
+        server.sendHeader("Retry-After", "1");
+        sendError(503, cacheError);
     }
-    return false;
+    return true;
 }
 
 bool dispatchMachineApiRoute() {
@@ -12340,15 +12683,16 @@ void removeTargetResourceCacheFiles(const String& serial) {
     }
 }
 
-bool streamStoredJobResult(const String& path,
-                           int status,
-                           bool& responseStarted,
-                           String& error) {
+bool streamJsonFileResponse(const String& path,
+                            size_t maximumBytes,
+                            int status,
+                            bool& responseStarted,
+                            String& error) {
     responseStarted = false;
     error = "";
     size_t resultBytes = 0;
     {
-        history_storage::Guard filesystem(100);
+        history_storage::Guard filesystem(1000);
         if (!filesystem) {
             error = "filesystem is busy";
             return false;
@@ -12359,9 +12703,17 @@ bool streamStoredJobResult(const String& path,
             return false;
         }
         resultBytes = file.size();
+        if (resultBytes <= 2 || resultBytes > maximumBytes) {
+            file.close();
+            error = "JSON file is invalid or exceeds its bounded size";
+            return false;
+        }
+        const int first = file.read();
+        file.seek(resultBytes - 1);
+        const int last = file.read();
         file.close();
-        if (resultBytes < 2 || resultBytes > MAX_JOB_RESULT_BYTES) {
-            error = "job result is invalid or exceeds its bounded size";
+        if (first != '{' || last != '}') {
+            error = "JSON file is not a complete object";
             return false;
         }
     }
@@ -12378,13 +12730,13 @@ bool streamStoredJobResult(const String& path,
         size_t readCount = 0;
         String readError;
         {
-            history_storage::Guard filesystem(100);
+            history_storage::Guard filesystem(1000);
             if (!filesystem) {
                 readError = "filesystem became busy while streaming the job result";
             } else {
                 File file = LittleFS.open(path, "r");
                 if (!file || file.size() != resultBytes || !file.seek(offset)) {
-                    readError = "job result changed while it was being streamed";
+                    readError = "JSON file changed while it was being streamed";
                 } else {
                     readCount = file.read(buffer, std::min(sizeof(buffer), resultBytes - offset));
                 }
@@ -12394,7 +12746,7 @@ bool streamStoredJobResult(const String& path,
             }
         }
         if (!readError.isEmpty() || readCount == 0) {
-            error = !readError.isEmpty() ? readError : String("failed to read the stored job result");
+            error = !readError.isEmpty() ? readError : String("failed to read the stored JSON file");
             server.client().stop();
             return false;
         }
@@ -12402,6 +12754,14 @@ bool streamStoredJobResult(const String& path,
         offset += readCount;
     }
     return true;
+}
+
+bool streamStoredJobResult(const String& path,
+                           int status,
+                           bool& responseStarted,
+                           String& error) {
+    return streamJsonFileResponse(
+        path, MAX_JOB_RESULT_BYTES, status, responseStarted, error);
 }
 
 bool beginJobResultStream(const String& id, const String& path) {
