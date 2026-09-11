@@ -1539,6 +1539,8 @@
     "undefined": "Undefined"
   };
 
+  const RECIPE_ICON_ASSET_VERSION = "2";
+
   function normalizeRecipeIconToken(value) {
     return String(value ?? "")
       .toLowerCase()
@@ -1576,7 +1578,7 @@
   }
 
   function recipeIconUrl(key) {
-    return `/icons/recipe?name=${encodeURIComponent(key || "undefined")}`;
+    return `/icons/recipe?name=${encodeURIComponent(key || "undefined")}&v=${RECIPE_ICON_ASSET_VERSION}`;
   }
 
   function renderRecipeIcon(recipe, entry = null, size = "") {

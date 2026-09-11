@@ -10095,18 +10095,20 @@ void handleRoot() {
 }
 
 void handleRecipeIconAsset() {
-    // Keep the route stable without linking the full embedded WebP catalogue.
-    // The generic vector icon costs a few hundred bytes and preserves enough
-    // OTA headroom for the dual-slot partition layout.
-    static constexpr char ICON_SVG[] PROGMEM =
-        "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'>"
-        "<rect width='64' height='64' rx='16' fill='#f3eadf'/>"
-        "<path d='M15 23h30v14a13 13 0 0 1-13 13h-4a13 13 0 0 1-13-13V23z' fill='#2c6a4b'/>"
-        "<path d='M45 27h3a7 7 0 0 1 0 14h-5' fill='none' stroke='#2c6a4b' stroke-width='5'/>"
-        "<path d='M23 17c-4-5 5-6 1-11M34 17c-4-5 5-6 1-11' fill='none' stroke='#a5522a' stroke-width='3' stroke-linecap='round'/>"
-        "</svg>";
+    const String requestedKey = server.arg("name");
+    const recipe_icons::Asset* asset = recipe_icons::findAsset(requestedKey);
+    if (asset == nullptr) {
+        asset = recipe_icons::findAsset(recipe_icons::defaultKey());
+    }
+    if (asset == nullptr || asset->data == nullptr || asset->size == 0) {
+        sendError(404, "recipe icon not found");
+        return;
+    }
     server.sendHeader("Cache-Control", "public, max-age=604800");
-    server.send_P(200, "image/svg+xml", ICON_SVG);
+    server.send_P(200,
+                  "image/webp",
+                  reinterpret_cast<PGM_P>(asset->data),
+                  asset->size);
 }
 
 void handleStatus() {

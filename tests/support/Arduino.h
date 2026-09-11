@@ -62,6 +62,12 @@ public:
                value_.compare(value_.size() - suffixLength, suffixLength, suffix) == 0;
     }
 
+    void remove(size_t index) {
+        if (index < value_.size()) {
+            value_.erase(index);
+        }
+    }
+
     String substring(size_t start) const {
         return substring(start, value_.size());
     }
@@ -149,4 +155,3 @@ private:
 inline bool isDigit(int c) {
     return std::isdigit(static_cast<unsigned char>(c)) != 0;
 }
-
