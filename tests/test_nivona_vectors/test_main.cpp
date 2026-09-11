@@ -242,6 +242,20 @@ void test_model_detection_exposes_strength_and_profile_caps() {
     TEST_ASSERT_EQUAL_UINT8(3, advanced79xInfo.maxProfileCode);
 }
 
+void test_hi_feature_read_is_skipped_only_for_known_silent_model() {
+    nivona::DeviceDetails silent756;
+    silent756.serial = "756573071020106-----";
+    TEST_ASSERT_TRUE(nivona::isHiFeatureReadKnownUnavailable(nivona::detectModelInfo(silent756)));
+
+    nivona::DeviceDetails supported790;
+    supported790.serial = "790000000000000-----";
+    TEST_ASSERT_FALSE(nivona::isHiFeatureReadKnownUnavailable(nivona::detectModelInfo(supported790)));
+
+    nivona::DeviceDetails unknown;
+    unknown.serial = "999000000000000-----";
+    TEST_ASSERT_FALSE(nivona::isHiFeatureReadKnownUnavailable(nivona::detectModelInfo(unknown)));
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -262,5 +276,6 @@ int main(int argc, char** argv) {
     RUN_TEST(test_family_900_standard_recipe_layout_tracks_split_temperatures_and_scaled_fluids);
     RUN_TEST(test_standard_recipe_base_register_rejects_unknown_selector);
     RUN_TEST(test_model_detection_exposes_strength_and_profile_caps);
+    RUN_TEST(test_hi_feature_read_is_skipped_only_for_known_silent_model);
     return UNITY_END();
 }

@@ -910,6 +910,13 @@ ModelInfo detectModelInfo(const DeviceDetails& details) {
     return info;
 }
 
+bool isHiFeatureReadKnownUnavailable(const ModelInfo& modelInfo) {
+    // Live validation shows that NICR 756 completes HU and HX normally but
+    // never sends an HI notification. Keep this model-specific so unknown and
+    // untested models can still expose feature data when they implement HI.
+    return modelInfo.modelCode == "756";
+}
+
 bool resolveSettingsProbeContext(const DeviceDetails& details,
                                  SettingsFamily familyOverride,
                                  SettingsProbeContext& contextOut,

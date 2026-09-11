@@ -228,6 +228,7 @@ bool parseCommandString(const String& commandText, char commandOut[3], String& e
 const char* settingsFamilyKey(SettingsFamily family);
 SettingsFamily parseSettingsFamilyOverride(const String& familyText);
 ModelInfo detectModelInfo(const DeviceDetails& details);
+bool isHiFeatureReadKnownUnavailable(const ModelInfo& modelInfo);
 bool resolveSettingsProbeContext(const DeviceDetails& details,
                                  SettingsFamily familyOverride,
                                  SettingsProbeContext& contextOut,

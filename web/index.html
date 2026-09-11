@@ -2719,6 +2719,31 @@
   }
 
   function renderMachineFeaturesSection(machine, data) {
+    if (data?.supported === false) {
+      const reason = data?.reason || "This machine does not provide the HI capability response.";
+      return `
+        ${renderCacheNotice(data, "Machine features")}
+        <section class="panel">
+          <div class="row" style="justify-content:space-between;align-items:flex-start;">
+            <div>
+              <h2 class="section-title" style="margin:0;">Machine features</h2>
+              <div class="muted">The bridge has a validated compatibility rule for this machine and does not send an <code>HI</code> request that would only time out.</div>
+            </div>
+            <span class="badge warn">not available</span>
+          </div>
+          <div class="value-list" style="margin-top:16px;">
+            <div class="value-item"><span>Machine</span><span>${escapeHtml(machine.modelName || machine.modelCode || machine.serial)}</span></div>
+            <div class="value-item"><span>Capability command</span><span><code>${escapeHtml(data?.features?.command || "HI")}</code></span></div>
+            <div class="value-item"><span>Reason</span><span>${escapeHtml(reason)}</span></div>
+          </div>
+        </section>
+        <details>
+          <summary>Raw machine features JSON</summary>
+          <pre>${escapeHtml(pretty(data))}</pre>
+        </details>
+      `;
+    }
+
     const features = data?.features || {};
     const knownFlags = Array.isArray(features?.knownFlags) ? features.knownFlags : [];
     const bytes = Array.isArray(features?.bytes) ? features.bytes : [];

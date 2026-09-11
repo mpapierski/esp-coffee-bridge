@@ -1306,6 +1306,7 @@ Live observation on March 13, 2026 via the ESP bridge:
 - current interpretation:
   - `HI` is not guaranteed to answer on all model / firmware combinations
   - a timeout on `HI` should currently be treated as a real model-specific possibility, not automatically as a bridge parser failure
+  - the bridge treats model `756` as known unavailable and returns a cached `supported: false` feature resource without sending `HI`; other models remain probeable until live evidence says otherwise
 
 ### `HN` image-transfer block write
 

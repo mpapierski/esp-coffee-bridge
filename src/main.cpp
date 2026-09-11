@@ -9155,6 +9155,24 @@ void handleMachineFeaturesGet(const String& serial) {
         return;
     }
 
+    const nivona::ModelInfo modelInfo = nivona::detectModelInfo(toNivonaDetails(*machine));
+    if (nivona::isHiFeatureReadKnownUnavailable(modelInfo)) {
+        DynamicJsonDocument response(2048);
+        response["ok"] = true;
+        response["supported"] = false;
+        response["reasonCode"] = "hi_unavailable_for_model";
+        response["reason"] = "This machine model is known not to answer the HI capability request; the bridge skips the live probe.";
+        JsonObject machineJson = response.createNestedObject("machine");
+        appendSavedMachineJson(machineJson, *machine);
+        JsonObject featureJson = response.createNestedObject("features");
+        featureJson["ok"] = true;
+        featureJson["available"] = false;
+        featureJson["command"] = nivona::CMD_HI;
+        featureJson["source"] = "live-validation";
+        sendJson(response);
+        return;
+    }
+
     String error;
     if (!beginMachineProtocolSession(*machine, error)) {
         lastError = error;
