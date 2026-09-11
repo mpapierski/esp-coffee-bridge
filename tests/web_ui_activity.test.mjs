@@ -59,8 +59,11 @@ test("unknown diagnostic jobs and address targets remain readable", () => {
   assert.equal(activity.summary, "Protocol app probe · c8:b4:17:d8:a3:8c · 0s · 1%");
 });
 
-test("activity polling is completion-scheduled and status-only", () => {
-  assert.match(html, /await fetchJson\("\/api\/status", \{\}, 5000\)/);
-  assert.match(html, /setTimeout\(pollBridgeActivity, nextPollMs\)/);
-  assert.doesNotMatch(html, /setInterval\(pollBridgeActivity/);
+test("activity and jobs use WebSocket events without REST polling", () => {
+  assert.match(html, /new WebSocket\(bridgeEventSocketUrl\(\)\)/);
+  assert.match(html, /type: "watch_job", jobId/);
+  assert.match(html, /event\.type === "status"/);
+  assert.doesNotMatch(html, /function pollBridgeActivity/);
+  assert.doesNotMatch(html, /fetchJson\(pollPath/);
+  assert.equal((html.match(/fetchJson\("\/api\/status"/g) || []).length, 1);
 });

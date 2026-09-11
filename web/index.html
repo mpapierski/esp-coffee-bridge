@@ -794,6 +794,34 @@
   const PROTOCOL_API = "/api/protocol";
   const HISTORY_PAGE_SIZE = 20;
   const STATS_HISTORY_PAGE_SIZE = 20;
+  const EVENT_PROTOCOL_VERSION = 1;
+  const BLE_UI_ACTIONS = new Set([
+    "scan-devices",
+    "probe-device",
+    "brew-standard",
+    "brew-history-again",
+    "confirm-machine",
+    "refresh-standard-recipes",
+    "refresh-standard-recipe",
+    "refresh-saved-recipes",
+    "refresh-saved-recipe",
+    "refresh-machine-stats",
+    "refresh-machine-features",
+    "diag-session-clear",
+    "diag-settings-probe",
+    "diag-stats-probe",
+    "diag-raw-read",
+    "save-probed-machine",
+    "save-setting",
+    "factory-reset",
+    "save-recipe",
+    "brew-standard-custom",
+    "diag-session-set",
+    "diag-confirm-prompt",
+    "diag-raw-write",
+    "diag-send-frame",
+    "diag-app-probe"
+  ]);
 
   const state = {
     flash: { message: "Loading bridge status…", kind: "" },
@@ -808,6 +836,18 @@
     diagnostics: {
       output: null,
       logs: null
+    },
+    events: {
+      supported: false,
+      connected: false,
+      ready: false,
+      socket: null,
+      reconnectAttempt: 0,
+      reconnectTimer: null,
+      lastMessageAt: 0,
+      waiters: {},
+      readyWaiters: [],
+      recentJobs: {}
     }
   };
 
@@ -864,6 +904,312 @@
     return `${resolved.pathname}${resolved.search}${resolved.hash}`;
   }
 
+  function bridgeEventSocketUrl() {
+    const url = new URL(state.status?.capabilities?.eventsUrl || "/api/events", window.location.href);
+    if (url.origin !== window.location.origin) {
+      throw new Error("The bridge advertised an unsafe cross-origin event URL.");
+    }
+    url.protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+    return url.href;
+  }
+
+  function bridgeEventsReady() {
+    return state.events.ready && state.events.socket?.readyState === WebSocket.OPEN;
+  }
+
+  function sendBridgeEventCommand(command) {
+    if (!bridgeEventsReady()) {
+      return false;
+    }
+    state.events.socket.send(JSON.stringify(command));
+    return true;
+  }
+
+  function updateLiveActionState() {
+    const enabled = bridgeEventsReady();
+    document.querySelectorAll("[data-action]").forEach((element) => {
+      if (!BLE_UI_ACTIONS.has(element.dataset.action)) {
+        return;
+      }
+      const controls = element.matches("button, input[type=submit]")
+        ? [element]
+        : Array.from(element.querySelectorAll("button:not([type]), button[type=submit], input[type=submit]"));
+      controls.forEach((control) => {
+        if (!enabled) {
+          if (control.dataset.liveWasDisabled === undefined) {
+            control.dataset.liveWasDisabled = control.disabled ? "1" : "0";
+          }
+          control.disabled = true;
+          control.title = "Live bridge updates are disconnected.";
+        } else if (control.dataset.liveWasDisabled !== undefined) {
+          control.disabled = control.dataset.liveWasDisabled === "1";
+          delete control.dataset.liveWasDisabled;
+          if (control.title === "Live bridge updates are disconnected.") {
+            control.removeAttribute("title");
+          }
+        }
+      });
+    });
+  }
+
+  function requireLiveAction(action) {
+    if (BLE_UI_ACTIONS.has(action) && !bridgeEventsReady()) {
+      throw new Error("Live bridge updates are disconnected. BLE actions are temporarily disabled.");
+    }
+  }
+
+  function updateStatusFromEvent(status) {
+    if (!status || typeof status !== "object") {
+      return;
+    }
+    state.status = status;
+    headerBadges.innerHTML = statusBadges(status);
+    renderBridgeActivity();
+  }
+
+  function pruneRecentJobEvents() {
+    const cutoff = Date.now() - 5 * 60 * 1000;
+    Object.entries(state.events.recentJobs).forEach(([id, record]) => {
+      if (!record || Number(record.receivedAt || 0) < cutoff) {
+        delete state.events.recentJobs[id];
+      }
+    });
+  }
+
+  function settleJobWaiters(job) {
+    if (!job?.id || !job?.state) {
+      return;
+    }
+    state.events.recentJobs[job.id] = { job, receivedAt: Date.now() };
+    pruneRecentJobEvents();
+    if (job.state === "queued" || job.state === "running") {
+      return;
+    }
+    const waiters = state.events.waiters[job.id] || [];
+    delete state.events.waiters[job.id];
+    waiters.forEach((waiter) => {
+      clearTimeout(waiter.timer);
+      if (job.state === "succeeded") {
+        waiter.resolve(job);
+      } else {
+        const error = new Error(job.error?.message || `Bridge job ${job.state}.`);
+        error.data = { job };
+        waiter.reject(error);
+      }
+    });
+  }
+
+  function rejectJobWaiters(jobId, message) {
+    const waiters = state.events.waiters[jobId] || [];
+    delete state.events.waiters[jobId];
+    waiters.forEach((waiter) => {
+      clearTimeout(waiter.timer);
+      waiter.reject(new Error(message));
+    });
+  }
+
+  function resolveEventReadyWaiters() {
+    const waiters = state.events.readyWaiters.splice(0);
+    waiters.forEach((waiter) => {
+      clearTimeout(waiter.timer);
+      waiter.resolve();
+    });
+  }
+
+  function awaitBridgeEvents(deadlineAt) {
+    if (bridgeEventsReady()) {
+      return Promise.resolve();
+    }
+    const remainingMs = deadlineAt - Date.now();
+    if (remainingMs <= 0) {
+      return Promise.reject(new Error("Live bridge updates did not reconnect before the request deadline."));
+    }
+    return new Promise((resolve, reject) => {
+      const waiter = {
+        resolve,
+        reject,
+        timer: setTimeout(() => {
+          const index = state.events.readyWaiters.indexOf(waiter);
+          if (index >= 0) {
+            state.events.readyWaiters.splice(index, 1);
+          }
+          reject(new Error("Live bridge updates did not reconnect before the request deadline."));
+        }, remainingMs)
+      };
+      state.events.readyWaiters.push(waiter);
+      connectBridgeEvents();
+    });
+  }
+
+  function watchPendingJobs() {
+    Object.keys(state.events.waiters).forEach((jobId) => {
+      sendBridgeEventCommand({ type: "watch_job", jobId });
+    });
+  }
+
+  function handleBridgeEvent(rawData) {
+    let event;
+    try {
+      event = JSON.parse(rawData);
+    } catch (error) {
+      throw new Error("The bridge sent a malformed event message.");
+    }
+    if (!event || typeof event.type !== "string") {
+      throw new Error("The bridge sent an event without a type.");
+    }
+    state.events.lastMessageAt = Date.now();
+    if (event.type === "hello") {
+      if (Number(event.eventProtocolVersion) !== EVENT_PROTOCOL_VERSION || Number(event.apiVersion) !== 2) {
+        throw new Error("The bridge event protocol is not compatible with this UI.");
+      }
+      state.events.connected = true;
+      state.events.ready = true;
+      state.events.reconnectAttempt = 0;
+      updateStatusFromEvent(event.status);
+      resolveEventReadyWaiters();
+      watchPendingJobs();
+      updateLiveActionState();
+      if (state.flash.message === "Connecting live bridge updates…" ||
+          state.flash.message === "Live bridge updates disconnected.") {
+        setFlash("Bridge ready.", "ok");
+      }
+      return;
+    }
+    if (event.type === "status") {
+      updateStatusFromEvent(event.status);
+      return;
+    }
+    if (event.type === "job") {
+      settleJobWaiters(event.job);
+      return;
+    }
+    if (event.type === "resync") {
+      updateStatusFromEvent(event.status);
+      watchPendingJobs();
+      return;
+    }
+    if (event.type === "error" && event.jobId) {
+      if (event.code === "job_busy") {
+        setTimeout(() => {
+          if (state.events.waiters[event.jobId]) {
+            sendBridgeEventCommand({ type: "watch_job", jobId: event.jobId });
+          }
+        }, 250);
+        return;
+      }
+      rejectJobWaiters(event.jobId, event.message || "The bridge could not watch this job.");
+    }
+  }
+
+  function scheduleBridgeEventReconnect() {
+    if (!state.events.supported || state.events.reconnectTimer) {
+      return;
+    }
+    const delays = [500, 1000, 2000, 5000];
+    const delayMs = delays[Math.min(state.events.reconnectAttempt, delays.length - 1)];
+    state.events.reconnectAttempt++;
+    state.events.reconnectTimer = setTimeout(() => {
+      state.events.reconnectTimer = null;
+      connectBridgeEvents();
+    }, delayMs);
+  }
+
+  function disconnectBridgeEvents() {
+    state.events.connected = false;
+    state.events.ready = false;
+    state.events.socket = null;
+    headerBadges.innerHTML = statusBadges(state.status);
+    renderBridgeActivity();
+    updateLiveActionState();
+    if (!state.flash.kind || state.flash.kind === "ok") {
+      setFlash("Live bridge updates disconnected.", "error");
+    }
+    scheduleBridgeEventReconnect();
+  }
+
+  function connectBridgeEvents() {
+    if (!state.events.supported ||
+        state.events.socket?.readyState === WebSocket.OPEN ||
+        state.events.socket?.readyState === WebSocket.CONNECTING) {
+      return;
+    }
+    let socket;
+    try {
+      socket = new WebSocket(bridgeEventSocketUrl());
+    } catch (error) {
+      scheduleBridgeEventReconnect();
+      return;
+    }
+    state.events.socket = socket;
+    socket.addEventListener("message", (message) => {
+      try {
+        handleBridgeEvent(message.data);
+      } catch (error) {
+        console.error(error);
+        socket.close();
+      }
+    });
+    socket.addEventListener("close", () => {
+      if (state.events.socket === socket) {
+        disconnectBridgeEvents();
+      }
+    });
+    socket.addEventListener("error", () => socket.close());
+  }
+
+  function checkBridgeEventLiveness() {
+    if (bridgeEventsReady() && Date.now() - state.events.lastMessageAt > 12000) {
+      state.events.socket.close();
+    }
+    setTimeout(checkBridgeEventLiveness, 5000);
+  }
+
+  async function awaitBridgeJob(initialJob, deadlineAt) {
+    if (!initialJob?.id) {
+      throw new Error("The bridge returned a malformed accepted-job response.");
+    }
+    const recent = state.events.recentJobs[initialJob.id]?.job;
+    const current = recent || initialJob;
+    if (current.state === "succeeded") {
+      return current;
+    }
+    if (current.state === "failed" || current.state === "cancelled") {
+      const error = new Error(current.error?.message || `Bridge job ${current.state}.`);
+      error.data = { job: current };
+      throw error;
+    }
+    const remainingMs = deadlineAt - Date.now();
+    if (remainingMs <= 0) {
+      throw new Error("The bridge job did not finish within 60 seconds.");
+    }
+    const terminal = new Promise((resolve, reject) => {
+      const waiter = {
+        resolve,
+        reject,
+        timer: setTimeout(() => {
+          const waiters = state.events.waiters[initialJob.id] || [];
+          const index = waiters.indexOf(waiter);
+          if (index >= 0) {
+            waiters.splice(index, 1);
+          }
+          if (waiters.length === 0) {
+            delete state.events.waiters[initialJob.id];
+            sendBridgeEventCommand({ type: "unwatch_job", jobId: initialJob.id });
+          }
+          reject(new Error("The bridge job did not finish within 60 seconds."));
+        }, remainingMs)
+      };
+      (state.events.waiters[initialJob.id] ||= []).push(waiter);
+    });
+    try {
+      await awaitBridgeEvents(deadlineAt);
+      sendBridgeEventCommand({ type: "watch_job", jobId: initialJob.id });
+    } catch (error) {
+      rejectJobWaiters(initialJob.id, error.message);
+    }
+    return terminal;
+  }
+
   async function fetchJson(path, options = {}, timeoutMs = 10000) {
     const request = {
       method: options.method || (options.json !== undefined ? "POST" : "GET"),
@@ -902,50 +1248,71 @@
   }
 
   async function resolveBridgeJob(accepted, locationHeader, deadlineAt) {
-    let job = accepted?.job;
-    if (!job?.id) {
+    const initialJob = accepted?.job;
+    if (!initialJob?.id) {
       throw new Error("The bridge returned a malformed accepted-job response.");
     }
-    const pollPath = safeSameOriginPath(locationHeader || `/api/jobs/${encodeURIComponent(job.id)}`);
-    while (Date.now() < deadlineAt) {
-      const delayMs = Math.max(50, Math.min(Number(job.pollAfterMs || 500), deadlineAt - Date.now()));
-      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    safeSameOriginPath(locationHeader || `/api/jobs/${encodeURIComponent(initialJob.id)}`);
+    const job = await awaitBridgeJob(initialJob, deadlineAt);
+    if (job.state !== "succeeded" || !job.resultUrl) {
+      throw new Error("The bridge job completed without a valid result URL.");
+    }
+    const resultPath = safeSameOriginPath(job.resultUrl);
+    let result;
+    while (!result) {
       const remainingMs = deadlineAt - Date.now();
       if (remainingMs <= 0) {
-        break;
+        throw new Error("The bridge job did not finish within 60 seconds.");
       }
-      const polled = await fetchJson(pollPath, {}, Math.min(10000, remainingMs));
-      job = polled.data?.job;
-      if (!job?.id || !job?.state) {
-        throw new Error("The bridge returned malformed job status.");
+      try {
+        result = await fetchJson(resultPath, {}, Math.min(10000, remainingMs));
+      } catch (error) {
+        if (error.status !== 503 || deadlineAt - Date.now() <= 0) {
+          throw error;
+        }
+        await new Promise((resolve) => setTimeout(resolve, Math.min(500, deadlineAt - Date.now())));
       }
-      if (job.state === "queued" || job.state === "running") {
-        continue;
-      }
-      if (job.state === "failed" || job.state === "cancelled") {
-        const message = job.error?.message || `Bridge job ${job.state}.`;
-        const error = new Error(message);
-        error.data = polled.data;
-        throw error;
-      }
-      if (job.state !== "succeeded" || !job.resultUrl) {
-        throw new Error("The bridge job completed without a valid result URL.");
-      }
-      const resultPath = safeSameOriginPath(job.resultUrl);
-      const result = await fetchJson(resultPath, {}, Math.min(10000, deadlineAt - Date.now()));
-      if (result.response.status === 202 || result.data?.pending === true) {
-        return resolveBridgeJob(
-          result.data,
-          result.response.headers.get("Location"),
-          deadlineAt,
-        );
-      }
-      return result.data;
     }
-    throw new Error("The bridge job did not finish within 60 seconds.");
+    if (result.response.status === 202 || result.data?.pending === true) {
+      return resolveBridgeJob(
+        result.data,
+        result.response.headers.get("Location"),
+        deadlineAt,
+      );
+    }
+    return result.data;
+  }
+
+  function requestRequiresLiveEvents(path, options = {}) {
+    const url = new URL(path, window.location.href);
+    const method = String(options.method || (options.json !== undefined ? "POST" : "GET")).toUpperCase();
+    if (url.searchParams.get("refresh") === "1") {
+      return true;
+    }
+    if (url.pathname === "/api/details" ||
+        url.pathname === "/api/scan" ||
+        url.pathname === "/api/connect" ||
+        url.pathname === "/api/disconnect" ||
+        url.pathname === "/api/pair" ||
+        url.pathname === "/api/notifications" ||
+        url.pathname.startsWith("/api/protocol/") ||
+        url.pathname.startsWith("/api/gatt/")) {
+      return true;
+    }
+    if (method === "POST" &&
+        (url.pathname === "/api/machines" || url.pathname === "/api/machines/probe")) {
+      return true;
+    }
+    if (method !== "POST" || !url.pathname.startsWith("/api/machines/")) {
+      return false;
+    }
+    return /\/(refresh|brew|confirm|settings|mycoffee(?:\/.*)?|recipes\/refresh)$/.test(url.pathname);
   }
 
   async function api(path, options = {}) {
+    if (requestRequiresLiveEvents(path, options) && !bridgeEventsReady()) {
+      throw new Error("Live bridge updates are disconnected. BLE actions are temporarily disabled.");
+    }
     const deadlineAt = Date.now() + 60000;
     // Synchronous non-BLE routes such as a validated backup restore may use
     // most of the helper's logical deadline. Job status/result polls remain
@@ -1363,7 +1730,9 @@
       wifiStatusBadge(status),
       `<span class="badge">${status.savedMachineCount || 0} saved</span>`,
       `<span class="badge">${status.supportedDeviceCount || 0} nearby supported</span>`,
-      bridgeActivityBadge(status)
+      bridgeEventsReady()
+        ? bridgeActivityBadge(status)
+        : '<span class="badge warn">Live updates disconnected</span>'
     ];
     return items.join("");
   }
@@ -1468,6 +1837,19 @@
   }
 
   function renderBridgeActivity() {
+    if (!bridgeEventsReady()) {
+      bridgeActivity.classList.remove("busy");
+      bridgeActivity.innerHTML = `
+        <div class="activity-head">
+          <div>
+            <div class="activity-heading"><span class="activity-pulse"></span><strong>Bridge activity</strong></div>
+            <div class="activity-copy">Live updates disconnected · BLE actions are disabled</div>
+          </div>
+          <span class="badge warn">offline</span>
+        </div>
+      `;
+      return;
+    }
     const activity = bridgeActivityView(state.status);
     bridgeActivity.classList.toggle("busy", activity.busy);
     const queueLabel = activity.queued === 1 ? "1 queued" : `${activity.queued} queued`;
@@ -1539,12 +1921,7 @@
   }
 
   async function refreshCore() {
-    const [status, machinesResponse] = await Promise.all([
-      api("/api/status"),
-      api("/api/machines")
-    ]);
-
-    state.status = status;
+    const machinesResponse = await api("/api/machines");
     state.machines = (machinesResponse.machines || []).slice().sort((a, b) => {
       if (a.online !== b.online) {
         return a.online ? -1 : 1;
@@ -3391,6 +3768,7 @@
       return;
     }
     try {
+      requireLiveAction(action);
       if (action === "scan-devices") {
         const response = await runWithFlash("Scanning for nearby BLE devices…", () => api("/api/scan", { method: "POST", json: {} }), "Scan completed.");
         state.scanResults = (response.devices || []).slice().sort((a, b) => {
@@ -3688,6 +4066,7 @@
 
     event.preventDefault();
     try {
+      requireLiveAction(action);
       if (action === "save-probed-machine") {
         const alias = String(form.elements.alias.value || "").trim();
         const address = state.probedMachine?.address;
@@ -3986,30 +4365,22 @@
     void renderRoute();
   });
 
-  async function pollBridgeActivity() {
-    let nextPollMs = 2000;
-    try {
-      const result = await fetchJson("/api/status", {}, 5000);
-      if (result.data && typeof result.data === "object") {
-        state.status = result.data;
-        const activity = bridgeActivityView(state.status);
-        nextPollMs = activity.busy || activity.queued ? 1000 : 2000;
-        headerBadges.innerHTML = statusBadges(state.status);
-        renderBridgeActivity();
-      }
-    } catch (error) {
-      console.error(error);
-    } finally {
-      setTimeout(pollBridgeActivity, nextPollMs);
-    }
-  }
-
   async function boot() {
     try {
+      const statusResponse = await fetchJson("/api/status", {}, 10000);
+      state.status = statusResponse.data;
+      const capabilities = state.status?.capabilities || {};
+      state.events.supported = capabilities.websocketEvents === true &&
+        Number(capabilities.eventProtocolVersion) === EVENT_PROTOCOL_VERSION;
+      if (!state.events.supported) {
+        throw new Error("This UI requires bridge WebSocket event protocol 1.");
+      }
       await refreshCore();
       renderSidebar();
       await renderRoute();
-      setFlash("Bridge ready.", "ok");
+      updateLiveActionState();
+      setFlash("Connecting live bridge updates…");
+      connectBridgeEvents();
     } catch (error) {
       setFlash(error.message || "Failed to load bridge status.", "error");
       app.innerHTML = '<section class="panel"><div class="empty">The bridge did not answer the first status request.</div></section>';
@@ -4030,8 +4401,12 @@
       }
     };
     setTimeout(pollAfterCompletion, 15000);
-    setTimeout(pollBridgeActivity, 1000);
+    setTimeout(checkBridgeEventLiveness, 5000);
   }
+
+  const liveActionObserver = new MutationObserver(updateLiveActionState);
+  liveActionObserver.observe(app, { childList: true, subtree: true });
+  liveActionObserver.observe(sidebar, { childList: true, subtree: true });
 
   void boot();
 </script>
