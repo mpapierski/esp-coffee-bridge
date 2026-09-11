@@ -32,6 +32,17 @@ void Scheduler::reset(uint32_t bootNonce) {
     discardedCount_ = 0;
 }
 
+void Scheduler::setChangeCallback(ChangeCallback callback, void* context) {
+    changeCallback_ = callback;
+    changeContext_ = context;
+}
+
+void Scheduler::notifyChanged(const Job& job) const {
+    if (changeCallback_ != nullptr && job.occupied && !job.id.empty()) {
+        changeCallback_(job.id.c_str(), changeContext_);
+    }
+}
+
 bool Scheduler::terminal(State state) {
     return state == State::Succeeded || state == State::Failed || state == State::Cancelled;
 }
@@ -161,6 +172,7 @@ SubmitResult Scheduler::submit(const Submission& submission, uint32_t nowMs) {
                     static_cast<uint8_t>(submission.priority) > static_cast<uint8_t>(job.priority)) {
                     job.priority = submission.priority;
                     job.deadlineAtMs = nowMs + submission.deadlineMs;
+                    notifyChanged(job);
                 }
                 counters_.coalesced++;
                 return {SubmitStatus::Coalesced, job.id, {}};
@@ -188,6 +200,7 @@ SubmitResult Scheduler::submit(const Submission& submission, uint32_t nowMs) {
         makeTerminal(jobs_[evictable], State::Cancelled, nowMs);
         jobs_[evictable].errorCode = "evicted";
         jobs_[evictable].errorMessage = "background job evicted for interactive work";
+        notifyChanged(jobs_[evictable]);
         counters_.cancelled++;
         counters_.backgroundEvicted++;
     }
@@ -215,6 +228,7 @@ SubmitResult Scheduler::submit(const Submission& submission, uint32_t nowMs) {
     job.resource = submission.resource;
     jobs_[slot] = std::move(job);
     counters_.submitted++;
+    notifyChanged(jobs_[slot]);
     return {SubmitStatus::Accepted, jobs_[slot].id, evictedId};
 }
 
@@ -241,6 +255,7 @@ bool Scheduler::startNext(uint32_t nowMs, Job& out) {
         job.errorCode = "deadline_exceeded";
         job.errorMessage = "job deadline expired while queued";
         counters_.failed++;
+        notifyChanged(job);
         return startNext(nowMs, out);
     }
 
@@ -248,6 +263,7 @@ bool Scheduler::startNext(uint32_t nowMs, Job& out) {
     job.startedAtMs = nowMs;
     job.progress = 1;
     out = job;
+    notifyChanged(job);
     return true;
 }
 
@@ -279,6 +295,7 @@ bool Scheduler::finish(const std::string& id,
     } else {
         counters_.failed++;
     }
+    notifyChanged(job);
     return true;
 }
 
@@ -287,7 +304,12 @@ bool Scheduler::setProgress(const std::string& id, uint8_t progress) {
     if (index < 0 || jobs_[index].state != State::Running) {
         return false;
     }
-    jobs_[index].progress = std::min<uint8_t>(progress, 99);
+    const uint8_t bounded = std::min<uint8_t>(progress, 99);
+    if (jobs_[index].progress == bounded) {
+        return true;
+    }
+    jobs_[index].progress = bounded;
+    notifyChanged(jobs_[index]);
     return true;
 }
 
@@ -300,6 +322,7 @@ bool Scheduler::cancel(const std::string& id, uint32_t nowMs) {
     jobs_[index].errorCode = "cancelled";
     jobs_[index].errorMessage = "job cancelled";
     counters_.cancelled++;
+    notifyChanged(jobs_[index]);
     return true;
 }
 
@@ -317,6 +340,7 @@ size_t Scheduler::cancelTarget(const std::string& target,
         job.errorCode = "target_deleted";
         job.errorMessage = "target machine was deleted";
         counters_.cancelled++;
+        notifyChanged(job);
         count++;
     }
     return count;
@@ -333,6 +357,7 @@ size_t Scheduler::cancelAll(uint32_t nowMs) {
         job.errorCode = "cancelled_for_restore";
         job.errorMessage = "job cancelled for bridge restore";
         counters_.cancelled++;
+        notifyChanged(job);
         count++;
     }
     return count;
@@ -345,6 +370,7 @@ size_t Scheduler::discardAll() {
         if (!job.occupied) {
             continue;
         }
+        notifyChanged(job);
         rememberDiscardedPath(job);
         job = {};
         count++;
@@ -357,6 +383,7 @@ void Scheduler::expire(uint32_t nowMs) {
         Job& job = jobs_[index];
         if (job.occupied && terminal(job.state) &&
             elapsedAtLeast(nowMs, job.finishedAtMs, TERMINAL_RETENTION_MS)) {
+            notifyChanged(job);
             rememberDiscardedPath(job);
             job = {};
         }
@@ -369,6 +396,26 @@ bool Scheduler::get(const std::string& id, Job& out) const {
         return false;
     }
     out = jobs_[index];
+    return true;
+}
+
+bool Scheduler::getPublic(const std::string& id, PublicJob& out) const {
+    const int index = findById(id);
+    if (index < 0) {
+        return false;
+    }
+    const Job& job = jobs_[index];
+    out.id = job.id;
+    out.kind = job.kind;
+    out.target = job.target;
+    out.resultUrl = job.resultUrl;
+    out.errorCode = job.errorCode;
+    out.errorMessage = job.errorMessage;
+    out.state = job.state;
+    out.submittedAtMs = job.submittedAtMs;
+    out.startedAtMs = job.startedAtMs;
+    out.finishedAtMs = job.finishedAtMs;
+    out.progress = job.progress;
     return true;
 }
 
@@ -479,6 +526,7 @@ size_t Scheduler::cancelQueuedKindBelow(const std::string& target,
         job.errorCode = "superseded";
         job.errorMessage = "queued refresh was superseded by a combined forced refresh";
         counters_.cancelled++;
+        notifyChanged(job);
         count++;
     }
     return count;

@@ -11,6 +11,17 @@ using bridge_jobs::SubmitStatus;
 
 namespace {
 
+struct ChangeCapture {
+    size_t count{0};
+    std::string lastId;
+};
+
+void captureChange(const char* id, void* context) {
+    auto* capture = static_cast<ChangeCapture*>(context);
+    capture->count++;
+    capture->lastId = id != nullptr ? id : "";
+}
+
 Submission job(const char* kind,
                Priority priority,
                const char* target = "machine-a",
@@ -352,6 +363,32 @@ void test_explicit_restore_can_discard_jobs_and_spooled_results() {
     TEST_ASSERT_EQUAL_STRING("/job-result.json", discardedPath.c_str());
 }
 
+void test_change_callback_covers_the_published_lifecycle() {
+    Scheduler scheduler(16);
+    ChangeCapture capture;
+    scheduler.setChangeCallback(captureChange, &capture);
+    const auto submitted = scheduler.submit(job("summary", Priority::ForcedRead), 1);
+    TEST_ASSERT_EQUAL_UINT32(1U, capture.count);
+    TEST_ASSERT_EQUAL_STRING(submitted.id.c_str(), capture.lastId.c_str());
+
+    Job running;
+    TEST_ASSERT_TRUE(scheduler.startNext(2, running));
+    TEST_ASSERT_EQUAL_UINT32(2U, capture.count);
+    TEST_ASSERT_TRUE(scheduler.setProgress(running.id, 40));
+    TEST_ASSERT_EQUAL_UINT32(3U, capture.count);
+    // Publishing the same progress twice must not create event churn.
+    TEST_ASSERT_TRUE(scheduler.setProgress(running.id, 40));
+    TEST_ASSERT_EQUAL_UINT32(3U, capture.count);
+    TEST_ASSERT_TRUE(scheduler.finish(running.id, true, 3, {}, std::string(4096, 'x')));
+    TEST_ASSERT_EQUAL_UINT32(4U, capture.count);
+
+    bridge_jobs::PublicJob publicJob;
+    TEST_ASSERT_TRUE(scheduler.getPublic(running.id, publicJob));
+    TEST_ASSERT_EQUAL_STRING(running.id.c_str(), publicJob.id.c_str());
+    TEST_ASSERT_EQUAL(static_cast<int>(State::Succeeded), static_cast<int>(publicJob.state));
+    TEST_ASSERT_EQUAL_UINT8(100, publicJob.progress);
+}
+
 } // namespace
 
 int main(int, char**) {
@@ -372,5 +409,6 @@ int main(int, char**) {
     RUN_TEST(test_combined_refresh_reserves_resources_and_supersedes_background);
     RUN_TEST(test_retention_capacity_covers_sixteen_machine_poll_rate);
     RUN_TEST(test_explicit_restore_can_discard_jobs_and_spooled_results);
+    RUN_TEST(test_change_callback_covers_the_published_lifecycle);
     return UNITY_END();
 }

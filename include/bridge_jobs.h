@@ -86,6 +86,22 @@ struct Job {
     bool resource{false};
 };
 
+// Bounded lifecycle data safe to copy while publishing events. It deliberately
+// excludes request/identity strings and potentially large retained results.
+struct PublicJob {
+    std::string id;
+    std::string kind;
+    std::string target;
+    std::string resultUrl;
+    std::string errorCode;
+    std::string errorMessage;
+    State state{State::Queued};
+    uint32_t submittedAtMs{0};
+    uint32_t startedAtMs{0};
+    uint32_t finishedAtMs{0};
+    uint8_t progress{0};
+};
+
 struct Counters {
     uint32_t submitted{0};
     uint32_t completed{0};
@@ -111,9 +127,12 @@ struct SubmitResult {
 
 class Scheduler {
 public:
+    using ChangeCallback = void (*)(const char* id, void* context);
+
     explicit Scheduler(uint32_t bootNonce = 0);
 
     void reset(uint32_t bootNonce);
+    void setChangeCallback(ChangeCallback callback, void* context = nullptr);
     SubmitResult submit(const Submission& submission, uint32_t nowMs);
     bool startNext(uint32_t nowMs, Job& out);
     bool finish(const std::string& id,
@@ -134,6 +153,7 @@ public:
     void expire(uint32_t nowMs);
 
     bool get(const std::string& id, Job& out) const;
+    bool getPublic(const std::string& id, PublicJob& out) const;
     bool popDiscardedResultPath(std::string& out);
     size_t queuedCount() const;
     size_t runningCount() const;
@@ -158,6 +178,7 @@ private:
     int findFreeRecord() const;
     int findEvictableBackground() const;
     void makeTerminal(Job& job, State state, uint32_t nowMs);
+    void notifyChanged(const Job& job) const;
     void rememberDiscardedPath(const Job& job);
     std::string nextId();
 
@@ -170,6 +191,8 @@ private:
     size_t discardedRead_{0};
     size_t discardedWrite_{0};
     size_t discardedCount_{0};
+    ChangeCallback changeCallback_{nullptr};
+    void* changeContext_{nullptr};
 };
 
 } // namespace bridge_jobs
