@@ -87,7 +87,6 @@ constexpr uint32_t BACKUP_RESTORE_STATE_MAGIC = 0x42525332;
 constexpr size_t MAX_BACKUP_RESTORE_UPLOAD_BYTES =
     history_capacity::MAX_GENERATED_BACKUP_BYTES;
 constexpr size_t MAX_BACKUP_JSON_LINE_BYTES = history_storage::MAX_JSON_LINE_BYTES + 1024;
-constexpr size_t MAX_BACKUP_ENTRIES_PER_RECORD = 8;
 
 constexpr size_t MAX_MACHINE_SERIAL_BYTES = 48;
 constexpr size_t MAX_MACHINE_ALIAS_BYTES = 64;
@@ -9897,70 +9896,6 @@ void handleHistoryConfigSave() {
     sendJson(response);
 }
 
-enum class BackupLineReadResult : uint8_t {
-    Line,
-    End,
-    Error,
-};
-
-BackupLineReadResult readBackupLine(const String& path,
-                                    size_t& offset,
-                                    String& lineOut,
-                                    String& error) {
-    lineOut = "";
-    error = "";
-    history_storage::Guard filesystem(5000);
-    if (!filesystem) {
-        error = "filesystem is busy";
-        return BackupLineReadResult::Error;
-    }
-    if (!LittleFS.exists(path)) {
-        return BackupLineReadResult::End;
-    }
-
-    File file = LittleFS.open(path, "r");
-    if (!file) {
-        error = String("failed to open backup source ") + path;
-        return BackupLineReadResult::Error;
-    }
-    if (offset >= file.size() || !file.seek(offset)) {
-        file.close();
-        return BackupLineReadResult::End;
-    }
-
-    while (file.available()) {
-        lineOut = "";
-        lineOut.reserve(512);
-        while (file.available()) {
-            const int value = file.read();
-            if (value < 0) {
-                file.close();
-                error = String("failed to read backup source ") + path;
-                return BackupLineReadResult::Error;
-            }
-            offset = file.position();
-            if (value == '\n') {
-                break;
-            }
-            if (lineOut.length() >= history_storage::MAX_JSON_LINE_BYTES) {
-                file.close();
-                error = String("backup source line exceeds limit in ") + path;
-                return BackupLineReadResult::Error;
-            }
-            lineOut += static_cast<char>(value);
-        }
-        if (lineOut.endsWith("\r")) {
-            lineOut.remove(lineOut.length() - 1);
-        }
-        if (!lineOut.isEmpty()) {
-            file.close();
-            return BackupLineReadResult::Line;
-        }
-    }
-    file.close();
-    return BackupLineReadResult::End;
-}
-
 bool processBackupHistory(const String& path,
                           const String& kind,
                           const String& serial,
@@ -9978,70 +9913,79 @@ bool processBackupHistory(const String& path,
         return false;
     }
     prefix.remove(prefix.length() - 1);
-    prefix += ",\"entry\":[";
+    prefix += ",\"entry\":";
 
-    String batch = prefix;
-    batch.reserve(MAX_BACKUP_JSON_LINE_BYTES + 1);
-    bool batchHasEntries = false;
-    size_t batchEntryCount = 0;
+    // Keep the output buffer bounded, but do not build and reparse a second
+    // multi-entry JSON document. On fragmented ESP32 heaps that duplicate
+    // 12 KiB allocation could fail and make every otherwise-valid history
+    // line look unexportable.
+    String outputBatch;
+    if (emit && !outputBatch.reserve(MAX_BACKUP_JSON_LINE_BYTES + 1)) {
+        error = "insufficient memory for the backup output buffer";
+        return false;
+    }
     DynamicJsonDocument sourceEntryDoc(12288);
-    DynamicJsonDocument batchCheckDoc(12288);
-    auto flushBatch = [&]() -> bool {
-        if (!batchHasEntries) {
+    if (sourceEntryDoc.capacity() == 0) {
+        error = "insufficient memory for the backup history parser";
+        return false;
+    }
+    auto flushOutput = [&]() -> bool {
+        if (!emit || outputBatch.isEmpty()) {
             return true;
         }
-        batch += "]}\n";
-        if (batch.length() > history_capacity::MAX_GENERATED_BACKUP_BYTES -
-                std::min(bundleBytes, history_capacity::MAX_GENERATED_BACKUP_BYTES)) {
-            error = String("generated backup exceeds ") +
-                history_capacity::MAX_GENERATED_BACKUP_BYTES + " bytes";
-            return false;
-        }
-        bundleBytes += batch.length();
-        if (emit) {
-            server.sendContent(batch);
-        }
-        batch = prefix;
-        batchHasEntries = false;
-        batchEntryCount = 0;
+        server.sendContent(outputBatch);
+        outputBatch = "";
         return true;
     };
 
-    auto candidateParses = [&](const String& entry) -> bool {
-        if (batchEntryCount >= MAX_BACKUP_ENTRIES_PER_RECORD) {
-            return false;
-        }
-        const size_t separatorBytes = batchHasEntries ? 1U : 0U;
-        constexpr size_t JSON_SUFFIX_BYTES = 2; // ]}
-        if (batch.length() + separatorBytes + entry.length() + JSON_SUFFIX_BYTES >
-            MAX_BACKUP_JSON_LINE_BYTES) {
-            return false;
-        }
-        String candidate = batch;
-        if (batchHasEntries) {
-            candidate += ',';
-        }
-        candidate += entry;
-        candidate += "]}";
-        batchCheckDoc.clear();
-        return !deserializeJson(batchCheckDoc, candidate);
-    };
+    if (!LittleFS.exists(path)) {
+        return true;
+    }
+    File source = LittleFS.open(path, "r");
+    if (!source) {
+        error = String("failed to open backup source ") + path;
+        return false;
+    }
 
-    size_t offset = 0;
-    while (true) {
+    while (source.available()) {
         String entry;
-        String readError;
-        const BackupLineReadResult result = readBackupLine(path, offset, entry, readError);
-        if (result == BackupLineReadResult::End) {
-            return flushBatch();
-        }
-        if (result == BackupLineReadResult::Error) {
-            error = readError;
+        if (!entry.reserve(512)) {
+            source.close();
+            error = "insufficient memory for a backup source line";
             return false;
+        }
+        while (source.available()) {
+            const int value = source.read();
+            if (value < 0) {
+                source.close();
+                error = String("failed to read backup source ") + path;
+                return false;
+            }
+            if (value == '\n') {
+                break;
+            }
+            if (entry.length() >= history_storage::MAX_JSON_LINE_BYTES) {
+                source.close();
+                error = String("backup source line exceeds limit in ") + path;
+                return false;
+            }
+            entry += static_cast<char>(value);
+        }
+        if (entry.endsWith("\r")) {
+            entry.remove(entry.length() - 1);
+        }
+        if (entry.isEmpty()) {
+            continue;
         }
 
         sourceEntryDoc.clear();
-        if (deserializeJson(sourceEntryDoc, entry)) {
+        const DeserializationError parseError = deserializeJson(sourceEntryDoc, entry);
+        if (parseError == DeserializationError::NoMemory) {
+            source.close();
+            error = "insufficient memory while parsing backup history";
+            return false;
+        }
+        if (parseError) {
             // Preserve physical-line accounting in the history file itself,
             // but never let a torn/corrupt line poison an otherwise valid
             // bridge backup.
@@ -10060,28 +10004,51 @@ bool processBackupHistory(const String& path,
                                                 normalizedCount,
                                                 normalizationError);
         if (!normalized || normalizedCount != 1 || normalizedLines.size() != 1) {
-            continue;
+            source.close();
+            error = normalizationError.isEmpty()
+                ? String("failed to normalize a backup history entry")
+                : normalizationError;
+            return false;
         }
         entry = normalizedLines.front();
 
-        if (!candidateParses(entry)) {
-            if (!flushBatch()) {
+        String record;
+        const size_t recordBytes = prefix.length() + entry.length() + 2;
+        if (recordBytes > MAX_BACKUP_JSON_LINE_BYTES ||
+            !record.reserve(recordBytes + 1)) {
+            source.close();
+            error = recordBytes > MAX_BACKUP_JSON_LINE_BYTES
+                ? String("backup history record exceeds the bounded line limit")
+                : String("insufficient memory for a backup history record");
+            return false;
+        }
+        record += prefix;
+        record += entry;
+        record += "}\n";
+        if (record.length() > history_capacity::MAX_GENERATED_BACKUP_BYTES -
+                std::min(bundleBytes, history_capacity::MAX_GENERATED_BACKUP_BYTES)) {
+            source.close();
+            error = String("generated backup exceeds ") +
+                history_capacity::MAX_GENERATED_BACKUP_BYTES + " bytes";
+            return false;
+        }
+        bundleBytes += record.length();
+        if (emit) {
+            if (!outputBatch.isEmpty() &&
+                outputBatch.length() + record.length() > MAX_BACKUP_JSON_LINE_BYTES &&
+                !flushOutput()) {
+                source.close();
+                return false;
+            }
+            if (!outputBatch.concat(record)) {
+                source.close();
+                error = "insufficient memory while buffering backup output";
                 return false;
             }
         }
-        if (!candidateParses(entry)) {
-            // A semantically valid source entry may still require more DOM
-            // memory than the bounded restore parser. Exclude it rather than
-            // emitting a backup that this same firmware cannot consume.
-            continue;
-        }
-        if (batchHasEntries) {
-            batch += ',';
-        }
-        batch += entry;
-        batchHasEntries = true;
-        batchEntryCount++;
     }
+    source.close();
+    return flushOutput();
 }
 
 void handleBackupExport() {
