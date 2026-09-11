@@ -15,7 +15,19 @@ namespace {
 
 constexpr char HISTORY_PREFIX[] = "/stathist-";
 constexpr char HISTORY_PREFIX_BARE[] = "stathist-";
+size_t gBudgetUpperBytes = DEFAULT_HISTORY_BYTES;
 size_t gBudgetBytes = DEFAULT_HISTORY_BYTES;
+
+size_t effectiveBudgetUpperBytes(size_t filesystemBytes) {
+    const size_t availableBytes = filesystemBytes > 0
+        ? filesystemBytes
+        : DEFAULT_HISTORY_BYTES + history_storage::OPERATIONAL_HEADROOM_BYTES;
+    return history_storage::transactionalFileLimit(availableBytes);
+}
+
+size_t effectiveBudgetMinBytes(size_t upperBytes) {
+    return std::min(MIN_HISTORY_BYTES, upperBytes);
+}
 
 String sanitizeText(const String& value, size_t maxLength) {
     String out = value;
@@ -420,15 +432,28 @@ String filePath(const String& serial) {
     return historyPath(serial);
 }
 
-void configureBudget(size_t requestedBytes, size_t preservedFileBytes) {
-    const size_t configured = std::max(
-        MIN_HISTORY_BYTES,
-        requestedBytes > 0 ? requestedBytes : DEFAULT_HISTORY_BYTES);
-    gBudgetBytes = std::max(configured, preservedFileBytes);
+size_t clampBudgetBytes(size_t requestedBytes, size_t filesystemBytes) {
+    const size_t upperBytes = effectiveBudgetUpperBytes(filesystemBytes);
+    const size_t minimumBytes = effectiveBudgetMinBytes(upperBytes);
+    const size_t requested = requestedBytes > 0 ? requestedBytes : DEFAULT_HISTORY_BYTES;
+    return std::max(minimumBytes, std::min(requested, upperBytes));
+}
+
+void configureBudget(size_t requestedBytes,
+                     size_t filesystemBytes,
+                     size_t preservedFileBytes) {
+    gBudgetUpperBytes = effectiveBudgetUpperBytes(filesystemBytes);
+    const size_t configured = clampBudgetBytes(requestedBytes, filesystemBytes);
+    gBudgetBytes = history_retention::effectiveBudget(
+        configured, gBudgetUpperBytes, preservedFileBytes);
 }
 
 size_t budgetBytes() {
     return gBudgetBytes;
+}
+
+size_t budgetUpperBytes() {
+    return gBudgetUpperBytes;
 }
 
 bool validateEntry(JsonObjectConst entry, String& error) {

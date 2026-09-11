@@ -1951,7 +1951,8 @@ ConfiguredHistoryBudgets calculateHistoryBudgets(size_t requestedBrewBytes,
                                                  size_t filesystemBytes) {
     return {
         brew_history::clampBudgetBytes(requestedBrewBytes, filesystemBytes),
-        stats_history::DEFAULT_HISTORY_BYTES,
+        stats_history::clampBudgetBytes(
+            stats_history::DEFAULT_HISTORY_BYTES, filesystemBytes),
     };
 }
 
@@ -1962,7 +1963,7 @@ void applyHistoryBudgets(const ConfiguredHistoryBudgets& budgets,
     brew_history::configureBudget(
         budgets.brewBytesPerMachine, filesystemBytes, preservedBrewFileBytes);
     stats_history::configureBudget(
-        budgets.statsBytesPerMachine, preservedStatsFileBytes);
+        budgets.statsBytesPerMachine, filesystemBytes, preservedStatsFileBytes);
 }
 
 void configureHistoryBudget() {
@@ -6332,6 +6333,7 @@ void appendStatus(JsonDocument& doc) {
     historyStorage["budgetUpperBytes"] = brew_history::budgetUpperBytes();
     historyStorage["defaultBudgetBytes"] = brew_history::DEFAULT_HISTORY_BYTES;
     historyStorage["statsBudgetBytes"] = stats_history::budgetBytes();
+    historyStorage["statsBudgetUpperBytes"] = stats_history::budgetUpperBytes();
     historyStorage["writableAggregateLimitBytes"] =
         history_storage::writableHistoryLimit(health.littleFsTotalBytes);
     historyStorage["fileCount"] = health.historyFileCount;
@@ -7113,8 +7115,13 @@ bool applyBackupBundle(size_t uploadBytes,
     }
     ConfiguredHistoryBudgets restoredBudgets = calculateHistoryBudgets(
         summary.requestedBudgetBytes, totalBytes);
-    restoredBudgets.statsBytesPerMachine = std::max(
-        summary.requestedStatsBudgetBytes, stats_history::MIN_HISTORY_BYTES);
+    // Stats history did not have a configurable budget before API v2. Promote
+    // backups carrying the legacy 32 KiB ceiling so a restore cannot silently
+    // make the counter log full again.
+    restoredBudgets.statsBytesPerMachine = stats_history::clampBudgetBytes(
+        std::max(summary.requestedStatsBudgetBytes,
+                 stats_history::DEFAULT_HISTORY_BYTES),
+        totalBytes);
     appliedBudgetBytes = restoredBudgets.brewBytesPerMachine;
     String currentPersistenceError;
     if (!persistSavedMachines(&currentPersistenceError)) {
@@ -7189,7 +7196,7 @@ bool applyBackupBundle(size_t uploadBytes,
             }
         }
         brew_history::configureBudget(previousBudgetBytes, totalBytes);
-        stats_history::configureBudget(previousStatsBudgetBytes);
+        stats_history::configureBudget(previousStatsBudgetBytes, totalBytes);
         machinePersistenceDirty = true;
         String persistenceRollbackError;
         if (!persistSavedMachines(&persistenceRollbackError)) {
@@ -9876,7 +9883,7 @@ void handleHistoryConfigSave() {
                             static_cast<uint32_t>(appliedBytes)) != sizeof(uint32_t) ||
         preferences.getUInt(PREFS_HISTORY_MAX_BYTES, 0) != appliedBytes) {
         brew_history::configureBudget(previousBytes, totalBytes);
-        stats_history::configureBudget(previousStatsBytes);
+        stats_history::configureBudget(previousStatsBytes, totalBytes);
         sendError(500, "failed to persist the history budget");
         return;
     }

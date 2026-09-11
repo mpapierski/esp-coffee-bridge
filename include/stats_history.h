@@ -9,7 +9,11 @@
 
 namespace stats_history {
 
-inline constexpr size_t DEFAULT_HISTORY_BYTES = 32 * 1024;
+// Keep enough transactional headroom to rewrite/validate the file while
+// retaining materially more counter snapshots than the legacy 32 KiB cap.
+// The runtime clamps this default to the current filesystem's transaction-safe
+// single-file limit.
+inline constexpr size_t DEFAULT_HISTORY_BYTES = 192 * 1024;
 inline constexpr size_t MIN_HISTORY_BYTES = 2 * 1024;
 
 struct Stats {
@@ -44,8 +48,12 @@ using PageEntryVisitor = bool (*)(JsonObjectConst entry,
 
 String filePath(const String& serial);
 
-void configureBudget(size_t requestedBytes, size_t preservedFileBytes = 0);
+size_t clampBudgetBytes(size_t requestedBytes, size_t filesystemBytes);
+void configureBudget(size_t requestedBytes,
+                     size_t filesystemBytes,
+                     size_t preservedFileBytes = 0);
 size_t budgetBytes();
+size_t budgetUpperBytes();
 bool validateEntry(JsonObjectConst entry, String& error);
 bool append(const String& serial, JsonObjectConst entry, String& error);
 bool appendSerializedLines(const String& serial, const std::vector<String>& lines, String& error);

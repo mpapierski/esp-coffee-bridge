@@ -37,6 +37,16 @@ void test_page_window_is_newest_first_and_clamps_to_one_hundred() {
     TEST_ASSERT_EQUAL_size_t(0, older.prevOffset);
 }
 
+void test_page_larger_than_history_returns_every_line() {
+    const history_paging::Window window = history_paging::makeWindow(43, 0, 100);
+    TEST_ASSERT_EQUAL_size_t(0, window.startInclusive);
+    TEST_ASSERT_EQUAL_size_t(43, window.endExclusive);
+    TEST_ASSERT_EQUAL_size_t(43, window.selectedCount);
+    TEST_ASSERT_FALSE(window.hasOlder);
+    TEST_ASSERT_FALSE(window.hasNewer);
+    TEST_ASSERT_EQUAL_size_t(0, window.nextOffset);
+}
+
 void test_physical_lines_include_blank_and_invalid_lines() {
     constexpr char DATA[] = "{\"ok\":1}\n\nnot-json\n{\"tail\":1}";
     history_paging::PhysicalLineCounter counter;
@@ -180,6 +190,7 @@ int main(int, char**) {
     UNITY_BEGIN();
     RUN_TEST(test_empty_history_has_empty_page);
     RUN_TEST(test_page_window_is_newest_first_and_clamps_to_one_hundred);
+    RUN_TEST(test_page_larger_than_history_returns_every_line);
     RUN_TEST(test_physical_lines_include_blank_and_invalid_lines);
     RUN_TEST(test_selected_offsets_are_stable_physical_line_offsets);
     RUN_TEST(test_unterminated_tail_is_one_line_but_trailing_newline_is_not_extra);

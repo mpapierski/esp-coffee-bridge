@@ -30,7 +30,7 @@ inline Window makeWindow(size_t totalLines, size_t requestedOffset, size_t reque
     window.endExclusive = totalLines - window.offset;
     window.startInclusive = window.limit > 0 && window.endExclusive > window.limit
         ? window.endExclusive - window.limit
-        : window.endExclusive;
+        : 0;
     window.selectedCount = window.endExclusive - window.startInclusive;
     window.hasOlder = window.limit > 0 && window.startInclusive > 0;
     window.hasNewer = window.offset > 0;
