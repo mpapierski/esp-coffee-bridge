@@ -26,6 +26,7 @@
 
 #include "backup_staging.h"
 #include "brew_history.h"
+#include "bridge_json_object.h"
 #include "bridge_jobs.h"
 #include "bridge_runtime_policy.h"
 #include "bridge_time.h"
@@ -47,6 +48,10 @@ constexpr char AP_SSID[]        = "esp-coffee-maker";
 constexpr char AP_PASSWORD[]    = "coffee-setup";
 constexpr char APP_BUILD_TIME[] = __DATE__ " " __TIME__;
 constexpr uint32_t API_VERSION  = 2;
+// A serialized status snapshot is currently below 3 KiB. Reserve enough
+// ArduinoJson metadata without requiring an 8 KiB contiguous heap block while
+// the BLE worker owns its larger bounded response document.
+constexpr size_t STATUS_JSON_CAPACITY = 4096;
 constexpr uint32_t SCAN_MS      = 3000;
 constexpr uint32_t HTTP_TIMEOUT = 10000;
 constexpr uint32_t DEFAULT_RECONNECT_DELAY_MS = 750;
@@ -1127,7 +1132,7 @@ void sendJson(const JsonDocument& doc, int code = 200) {
             }
             String fallback;
             const size_t expected = measureJson(doc);
-            if (expected >= 2 && expected <= MAX_JOB_RESULT_BYTES &&
+            if (!doc.overflowed() && expected > 2 && expected <= MAX_JOB_RESULT_BYTES &&
                 serializeJson(doc, fallback) == expected) {
                 execution->responseBody = std::move(fallback);
             } else {
@@ -1142,12 +1147,23 @@ void sendJson(const JsonDocument& doc, int code = 200) {
             return true;
         };
 
+        if (doc.overflowed()) {
+            if (retainCommittedMutationResultInMemory(
+                    "mutation applied; result JSON exceeded its bounded capacity")) {
+                return;
+            }
+            execution->responseStatus = 507;
+            execution->errorCode = "result_json_overflow";
+            execution->errorMessage = "job result JSON exceeded its bounded capacity";
+            return;
+        }
+
         if (execution->resource || execution->spoolResult) {
             const size_t resultBytes = measureJson(doc);
             const size_t resultLimit = execution->resource
                 ? MAX_RESOURCE_CACHE_BYTES
                 : MAX_JOB_RESULT_BYTES;
-            if (resultBytes < 2 || resultBytes > resultLimit) {
+            if (resultBytes <= 2 || resultBytes > resultLimit) {
                 if (retainCommittedMutationResultInMemory(
                         "mutation applied; full result exceeded the storage limit")) {
                     return;
@@ -1228,6 +1244,12 @@ void sendJson(const JsonDocument& doc, int code = 200) {
 
     server.sendHeader("Cache-Control", "no-store");
     server.sendHeader("Access-Control-Allow-Origin", "*");
+    if (doc.overflowed()) {
+        server.send(507,
+                    "application/json",
+                    "{\"ok\":false,\"error\":\"response JSON exceeded its bounded capacity\"}");
+        return;
+    }
     String payload;
     serializeJson(doc, payload);
     server.send(code, "application/json", payload);
@@ -9615,7 +9637,10 @@ void handleMachineSettingsGet(const String& serial) {
         return;
     }
 
-    DynamicJsonDocument response(32768);
+    // The compact payload is capped at ten settings and ten options per
+    // setting. Keeping this below the largest observed free heap block avoids
+    // turning an allocation failure into an empty successful cache entry.
+    DynamicJsonDocument response(16384);
     if (!buildCompactSettingsSnapshot(*machine, response, error)) {
         lastError = error;
         response["error"] = error;
@@ -10081,7 +10106,7 @@ void handleRecipeIconAsset() {
 
 void handleStatus() {
     maybeApplyClientTimeHeader();
-    DynamicJsonDocument doc(8192);
+    DynamicJsonDocument doc(STATUS_JSON_CAPACITY);
     doc["ok"] = true;
     appendStatus(doc);
     sendJson(doc);
@@ -12012,7 +12037,7 @@ bool stageAtomicFileReplacement(const String& temporaryPath,
         return false;
     }
     File candidate = LittleFS.open(temporaryPath, "r");
-    if (!candidate || candidate.size() < 2 || candidate.size() > MAX_RESOURCE_CACHE_BYTES) {
+    if (!candidate || candidate.size() <= 2 || candidate.size() > MAX_RESOURCE_CACHE_BYTES) {
         if (candidate) {
             candidate.close();
         }
@@ -12418,7 +12443,7 @@ bool streamCachedResource(const ResourceCacheEntry& cache,
             return false;
         }
         File file = LittleFS.open(cache.path, "r");
-        if (!file || file.size() < 2 || file.size() > MAX_RESOURCE_CACHE_BYTES) {
+        if (!file || file.size() <= 2 || file.size() > MAX_RESOURCE_CACHE_BYTES) {
             if (file) {
                 file.close();
             }
@@ -12436,13 +12461,9 @@ bool streamCachedResource(const ResourceCacheEntry& cache,
         file.close();
     }
 
-    int closingBrace = static_cast<int>(payload.length()) - 1;
-    while (closingBrace >= 0 &&
-           (payload.charAt(closingBrace) == ' ' || payload.charAt(closingBrace) == '\n' ||
-            payload.charAt(closingBrace) == '\r' || payload.charAt(closingBrace) == '\t')) {
-        closingBrace--;
-    }
-    if (closingBrace < 0 || payload.charAt(closingBrace) != '}') {
+    bridge_json::ObjectExtent resourceObject;
+    if (!bridge_json::inspectObject(payload.c_str(), payload.length(), resourceObject) ||
+        !resourceObject.hasMembers) {
         return false;
     }
 
@@ -12465,7 +12486,7 @@ bool streamCachedResource(const ResourceCacheEntry& cache,
     String suffix;
     serializeJson(metadata, suffix);
     suffix.remove(0, 1);
-    payload.remove(static_cast<unsigned>(closingBrace));
+    payload.remove(static_cast<unsigned>(resourceObject.closingBrace));
     payload += ',';
     payload += suffix;
     server.sendHeader("Cache-Control", "no-store");
@@ -12495,7 +12516,11 @@ void handleMachineResourceRequest(const String& serial, const String& resource) 
             sendError(503, "filesystem is busy");
             return;
         }
-        hasPayload = LittleFS.exists(cache.path);
+        File cached = LittleFS.open(cache.path, "r");
+        hasPayload = cached && cached.size() > 2;
+        if (cached) {
+            cached.close();
+        }
     }
     const uint32_t nowMs = millis();
     const bridge_runtime_policy::CacheDecision cacheDecision =
@@ -12844,7 +12869,11 @@ void handleJobApiRoute(const String& id, bool resultRequested) {
                                    streamError);
         endJobResultStream(id, resultPath);
         if (!streamed && !responseStarted) {
-            sendError(streamError == "job result expired" ? 404 : 503, streamError);
+            const int errorStatus = streamError == "job result expired" ? 404 : 503;
+            if (errorStatus == 503) {
+                server.sendHeader("Retry-After", "1");
+            }
+            sendError(errorStatus, streamError);
         }
         return;
     }
