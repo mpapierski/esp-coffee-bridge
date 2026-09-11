@@ -1,10 +1,3 @@
-#pragma once
-
-#include <Arduino.h>
-
-namespace web_ui {
-
-static const char kPage[] PROGMEM = R"HTML(
 <!doctype html>
 <html lang="en">
 <head>
@@ -676,7 +669,7 @@ static const char kPage[] PROGMEM = R"HTML(
         <p>Pair nearby supported coffee machines, remember them on the bridge, watch presence and signal strength, and operate recipes, settings, statistics, and diagnostics from one place.</p>
       </div>
       <div class="masthead-meta">
-        <div class="build-pill">Build )HTML" __DATE__ " " __TIME__ R"HTML(</div>
+        <div class="build-pill">Firmware API v2</div>
         <div class="badge-row" id="header-badges"></div>
       </div>
     </header>
@@ -739,6 +732,7 @@ static const char kPage[] PROGMEM = R"HTML(
     probedMachine: null,
     modal: null,
     machineCache: {},
+    pendingResourceJobs: {},
     diagnostics: {
       output: null,
       logs: null
@@ -789,7 +783,15 @@ static const char kPage[] PROGMEM = R"HTML(
     }
   }
 
-  async function api(path, options = {}) {
+  function safeSameOriginPath(value) {
+    const resolved = new URL(value, window.location.href);
+    if (resolved.origin !== window.location.origin) {
+      throw new Error("The bridge returned an unsafe cross-origin job result URL.");
+    }
+    return `${resolved.pathname}${resolved.search}${resolved.hash}`;
+  }
+
+  async function fetchJson(path, options = {}, timeoutMs = 10000) {
     const request = {
       method: options.method || (options.json !== undefined ? "POST" : "GET"),
       headers: { ...(options.headers || {}) }
@@ -804,8 +806,17 @@ static const char kPage[] PROGMEM = R"HTML(
       request.body = options.body;
     }
 
-    const response = await fetch(path, request);
-    const text = await response.text();
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    request.signal = controller.signal;
+    let response;
+    let text;
+    try {
+      response = await fetch(path, request);
+      text = await response.text();
+    } finally {
+      clearTimeout(timer);
+    }
     const data = parsePayload(text);
     if (!response.ok) {
       const message = typeof data === "object" && data && data.error ? data.error : (typeof data === "string" ? data : `${response.status} ${response.statusText}`);
@@ -814,7 +825,110 @@ static const char kPage[] PROGMEM = R"HTML(
       error.data = data;
       throw error;
     }
-    return data;
+    return { data, response };
+  }
+
+  async function resolveBridgeJob(accepted, locationHeader, deadlineAt) {
+    let job = accepted?.job;
+    if (!job?.id) {
+      throw new Error("The bridge returned a malformed accepted-job response.");
+    }
+    const pollPath = safeSameOriginPath(locationHeader || `/api/jobs/${encodeURIComponent(job.id)}`);
+    while (Date.now() < deadlineAt) {
+      const delayMs = Math.max(50, Math.min(Number(job.pollAfterMs || 500), deadlineAt - Date.now()));
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+      const remainingMs = deadlineAt - Date.now();
+      if (remainingMs <= 0) {
+        break;
+      }
+      const polled = await fetchJson(pollPath, {}, Math.min(10000, remainingMs));
+      job = polled.data?.job;
+      if (!job?.id || !job?.state) {
+        throw new Error("The bridge returned malformed job status.");
+      }
+      if (job.state === "queued" || job.state === "running") {
+        continue;
+      }
+      if (job.state === "failed" || job.state === "cancelled") {
+        const message = job.error?.message || `Bridge job ${job.state}.`;
+        const error = new Error(message);
+        error.data = polled.data;
+        throw error;
+      }
+      if (job.state !== "succeeded" || !job.resultUrl) {
+        throw new Error("The bridge job completed without a valid result URL.");
+      }
+      const resultPath = safeSameOriginPath(job.resultUrl);
+      const result = await fetchJson(resultPath, {}, Math.min(10000, deadlineAt - Date.now()));
+      if (result.response.status === 202 || result.data?.pending === true) {
+        return resolveBridgeJob(
+          result.data,
+          result.response.headers.get("Location"),
+          deadlineAt,
+        );
+      }
+      return result.data;
+    }
+    throw new Error("The bridge job did not finish within 60 seconds.");
+  }
+
+  async function api(path, options = {}) {
+    const deadlineAt = Date.now() + 60000;
+    // Synchronous non-BLE routes such as a validated backup restore may use
+    // most of the helper's logical deadline. Job status/result polls remain
+    // individually capped at ten seconds above.
+    const result = await fetchJson(path, options, deadlineAt - Date.now());
+    if (result.response.status === 202 || result.data?.pending === true) {
+      return resolveBridgeJob(result.data, result.response.headers.get("Location"), deadlineAt);
+    }
+    return result.data;
+  }
+
+  function followStaleResourceJob(serial, cacheKey, resourcePath, data) {
+    const job = data?.cache?.state === "stale" ? data?.job : null;
+    if (!job?.id || state.pendingResourceJobs[job.id]) {
+      return;
+    }
+    state.pendingResourceJobs[job.id] = true;
+    const accepted = { ok: true, pending: true, job };
+    const deadlineAt = Date.now() + 60000;
+    void (async () => {
+      try {
+        const refreshed = await resolveBridgeJob(
+          accepted,
+          `/api/jobs/${encodeURIComponent(job.id)}`,
+          deadlineAt,
+        );
+        getMachineCache(serial)[cacheKey] = refreshed;
+      } catch (error) {
+        console.error(error);
+        // Fetch the retained stale snapshot once more so the server's
+        // structured refresh error/backoff is visible without discarding the
+        // usable data already on screen.
+        try {
+          const latest = await fetchJson(resourcePath, {}, 10000);
+          getMachineCache(serial)[cacheKey] = latest.data;
+        } catch (refreshError) {
+          console.error(refreshError);
+        }
+      } finally {
+        delete state.pendingResourceJobs[job.id];
+        if (route().serial === serial) {
+          await renderRoute({ showLoading: false });
+        }
+      }
+    })();
+  }
+
+  function renderCacheNotice(data, label = "Resource") {
+    const cache = data?.cache;
+    if (!cache || cache.state !== "stale") {
+      return "";
+    }
+    const detail = cache.refreshing
+      ? "A background refresh is queued; these values remain usable while it runs."
+      : (cache.error?.message || "The bridge is retaining the last good values until refresh can retry.");
+    return `<section class="panel" style="padding:14px 18px;"><span class="badge warn">stale</span> <strong>${escapeHtml(label)}</strong><div class="muted tiny">${escapeHtml(detail)}</div></section>`;
   }
 
   function setFlash(message, kind = "") {
@@ -1252,10 +1366,12 @@ static const char kPage[] PROGMEM = R"HTML(
 
   async function loadMachineSummary(serial, force = false) {
     const cache = getMachineCache(serial);
-    if (!force && cache.summary) {
-      return cache.summary;
+    const suffix = force ? "?refresh=1" : "";
+    const resourcePath = `/api/machines/${encodeURIComponent(serial)}/summary`;
+    cache.summary = await api(`${resourcePath}${suffix}`);
+    if (!force) {
+      followStaleResourceJob(serial, "summary", resourcePath, cache.summary);
     }
-    cache.summary = await api(`/api/machines/${encodeURIComponent(serial)}/summary`);
     return cache.summary;
   }
 
@@ -1304,10 +1420,12 @@ static const char kPage[] PROGMEM = R"HTML(
 
   async function loadMachineStats(serial, force = false) {
     const cache = getMachineCache(serial);
-    if (!force && cache.stats) {
-      return cache.stats;
+    const suffix = force ? "?refresh=1" : "";
+    const resourcePath = `/api/machines/${encodeURIComponent(serial)}/stats`;
+    cache.stats = await api(`${resourcePath}${suffix}`);
+    if (!force) {
+      followStaleResourceJob(serial, "stats", resourcePath, cache.stats);
     }
-    cache.stats = await api(`/api/machines/${encodeURIComponent(serial)}/stats`);
     return cache.stats;
   }
 
@@ -1326,19 +1444,23 @@ static const char kPage[] PROGMEM = R"HTML(
 
   async function loadMachineSettings(serial, force = false) {
     const cache = getMachineCache(serial);
-    if (!force && cache.settings) {
-      return cache.settings;
+    const suffix = force ? "?refresh=1" : "";
+    const resourcePath = `/api/machines/${encodeURIComponent(serial)}/settings`;
+    cache.settings = await api(`${resourcePath}${suffix}`);
+    if (!force) {
+      followStaleResourceJob(serial, "settings", resourcePath, cache.settings);
     }
-    cache.settings = await api(`/api/machines/${encodeURIComponent(serial)}/settings`);
     return cache.settings;
   }
 
   async function loadMachineFeatures(serial, force = false) {
     const cache = getMachineCache(serial);
-    if (!force && cache.features) {
-      return cache.features;
+    const suffix = force ? "?refresh=1" : "";
+    const resourcePath = `/api/machines/${encodeURIComponent(serial)}/features`;
+    cache.features = await api(`${resourcePath}${suffix}`);
+    if (!force) {
+      followStaleResourceJob(serial, "features", resourcePath, cache.features);
     }
-    cache.features = await api(`/api/machines/${encodeURIComponent(serial)}/features`);
     return cache.features;
   }
 
@@ -1357,6 +1479,19 @@ static const char kPage[] PROGMEM = R"HTML(
 
   function invalidateMachine(serial) {
     delete state.machineCache[serial];
+  }
+
+  async function refreshAfterBrew(serial, response) {
+    state.diagnostics.output = response;
+    invalidateMachine(serial);
+    try {
+      await loadMachineSummary(serial, true);
+    } catch (error) {
+      // The brew already succeeded. A failed follow-up read must not turn it
+      // into a failed brew or encourage the user to submit another command.
+      setFlash(`Brew command sent, but live status could not refresh: ${error.message}. Do not retry the brew.`, "error");
+    }
+    await renderRoute();
   }
 
   function looksLikeCoffeeMachine(device) {
@@ -1646,6 +1781,7 @@ static const char kPage[] PROGMEM = R"HTML(
     const percent = Math.max(0, Math.min(100, Number(liveStatus.progress || 0)));
     const canConfirm = machine.online && statusSuggestsHostConfirm(liveStatus);
     return `
+      ${renderCacheNotice(summary, "Machine summary")}
       <section class="hero-card machine-hero">
         <div class="row" style="justify-content:space-between;align-items:flex-start;">
           <div>
@@ -2079,6 +2215,7 @@ static const char kPage[] PROGMEM = R"HTML(
     };
 
     return `
+      ${renderCacheNotice(data, "Statistics")}
       ${renderMetricGroup("Ordered beverages", beverages)}
       ${renderMetricGroup("Maintenance", maintenance)}
       ${renderStatsHistory()}
@@ -2336,6 +2473,7 @@ static const char kPage[] PROGMEM = R"HTML(
     }
 
     return `
+      ${renderCacheNotice(data, "Machine settings")}
       <section class="panel">
         <h2 class="section-title">Basic settings</h2>
         <div class="stack">
@@ -2397,6 +2535,7 @@ static const char kPage[] PROGMEM = R"HTML(
     const unknownBits = Array.isArray(features?.unknownNonZeroBits) ? features.unknownNonZeroBits : [];
 
     return `
+      ${renderCacheNotice(data, "Machine features")}
       <section class="panel">
         <div class="row" style="justify-content:space-between;align-items:flex-start;">
           <div>
@@ -2761,7 +2900,7 @@ static const char kPage[] PROGMEM = R"HTML(
           <div class="grid two" style="margin-top:16px;">
             <article class="setting-row">
               <strong>Per-machine cap</strong>
-              <div class="muted">Lowering the cap compacts existing history files immediately. Raising it only expands future headroom.</div>
+              <div class="muted">Existing history is never compacted automatically. A lower cap is refused when it would discard stored entries; raising it expands future headroom.</div>
               <div class="value-list">
                 <div class="value-item"><span>Current</span><span>${escapeHtml(formatBytes(historyBudgetBytes))}</span></div>
                 <div class="value-item"><span>Minimum</span><span>${escapeHtml(formatBytes(historyBudgetMinBytes))}</span></div>
@@ -2851,7 +2990,7 @@ static const char kPage[] PROGMEM = R"HTML(
     let summary = getMachineCache(serial).summary;
     if (!summary) {
       try {
-        summary = await loadMachineSummary(serial, true);
+        summary = await loadMachineSummary(serial, false);
       } catch (error) {
         setFlash(`Live summary unavailable for ${machine.alias || machine.serial}: ${error.message}`, "error");
       }
@@ -2904,7 +3043,7 @@ static const char kPage[] PROGMEM = R"HTML(
     let summary = getMachineCache(serial).summary;
     if (!summary) {
       try {
-        summary = await loadMachineSummary(serial, true);
+        summary = await loadMachineSummary(serial, false);
       } catch (error) {
         setFlash(`Live summary unavailable for ${machine.alias || machine.serial}: ${error.message}`, "error");
       }
@@ -2933,7 +3072,7 @@ static const char kPage[] PROGMEM = R"HTML(
     let summary = getMachineCache(serial).summary;
     if (!summary) {
       try {
-        summary = await loadMachineSummary(serial, true);
+        summary = await loadMachineSummary(serial, false);
       } catch (error) {
         setFlash(`Live summary unavailable for ${machine.alias || machine.serial}: ${error.message}`, "error");
       }
@@ -3090,9 +3229,7 @@ static const char kPage[] PROGMEM = R"HTML(
         const serial = button.dataset.serial;
         const selector = Number(button.dataset.selector);
         const response = await runWithFlash("Sending brew command…", () => api(`/api/machines/${encodeURIComponent(serial)}/brew`, { json: { selector, source: "ui" } }), "Brew command sent.");
-        state.diagnostics.output = response;
-        invalidateMachine(serial);
-        await renderRoute();
+        await refreshAfterBrew(serial, response);
       }
 
       if (action === "brew-history-again") {
@@ -3120,9 +3257,7 @@ static const char kPage[] PROGMEM = R"HTML(
           () => api(`/api/machines/${encodeURIComponent(serial)}/brew`, { json: payload }),
           "Brew command sent."
         );
-        state.diagnostics.output = response;
-        invalidateMachine(serial);
-        await renderRoute();
+        await refreshAfterBrew(serial, response);
       }
 
       if (action === "confirm-machine") {
@@ -3386,6 +3521,7 @@ static const char kPage[] PROGMEM = R"HTML(
         const value = String(form.elements.value.value || "");
         await runWithFlash(`Saving ${key}…`, () => api(`/api/machines/${encodeURIComponent(serial)}/settings`, { json: { key, value } }), "Setting updated.");
         getMachineCache(serial).settings = null;
+        await loadMachineSettings(serial, true);
         await renderRoute();
       }
 
@@ -3398,6 +3534,9 @@ static const char kPage[] PROGMEM = R"HTML(
         }
         await runWithFlash(`Resetting ${label}…`, () => api(`/api/machines/${encodeURIComponent(serial)}/settings`, { json: { action: resetAction } }), `Factory reset command sent for ${label}.`);
         invalidateMachine(serial);
+        if (resetAction === "factory_reset_settings") {
+          await loadMachineSettings(serial, true);
+        }
         await renderRoute();
       }
 
@@ -3457,9 +3596,7 @@ static const char kPage[] PROGMEM = R"HTML(
           }
         });
         const response = await runWithFlash(`Brewing recipe ${selector}…`, () => api(`/api/machines/${encodeURIComponent(serial)}/brew`, { json: payload }), "Brew command sent.");
-        state.diagnostics.output = response;
-        invalidateMachine(serial);
-        await renderRoute();
+        await refreshAfterBrew(serial, response);
       }
 
       if (action === "diag-session-set") {
@@ -3644,7 +3781,7 @@ static const char kPage[] PROGMEM = R"HTML(
       app.innerHTML = '<section class="panel"><div class="empty">The bridge did not answer the first status request.</div></section>';
     }
 
-    setInterval(async () => {
+    const pollAfterCompletion = async () => {
       try {
         await refreshCore();
         renderSidebar();
@@ -3654,14 +3791,14 @@ static const char kPage[] PROGMEM = R"HTML(
         }
       } catch (error) {
         console.error(error);
+      } finally {
+        setTimeout(pollAfterCompletion, 15000);
       }
-    }, 15000);
+    };
+    setTimeout(pollAfterCompletion, 15000);
   }
 
   void boot();
 </script>
 </body>
 </html>
-)HTML";
-
-} // namespace web_ui

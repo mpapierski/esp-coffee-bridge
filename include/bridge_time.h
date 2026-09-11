@@ -23,6 +23,9 @@ struct StatusSnapshot {
     uint32_t lastSuccessMs{0};
     uint32_t ntpDiagnosticAtMs{0};
     uint32_t ntpDiagnosticRoundTripMs{0};
+    bool ntpDiagnosticPending{false};
+    bool ntpDiagnosticRunning{false};
+    uint32_t ntpDiagnosticStackHighWaterBytes{0};
     time_t lastSuccessUnix{0};
     time_t unixTime{0};
     String ntpDiagnosticCode;

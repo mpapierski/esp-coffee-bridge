@@ -1,10 +1,15 @@
 #include "bridge_time.h"
+#include "bridge_time_retry.h"
 
 #include <algorithm>
+#include <atomic>
 #include <Preferences.h>
 #include <WiFi.h>
 #include <WiFiUdp.h>
 #include <esp_sntp.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
+#include <freertos/task.h>
 #include <sys/time.h>
 #include <time.h>
 
@@ -29,6 +34,9 @@ constexpr uint32_t NTP_RETRY_INTERVAL_MS = 60000;
 constexpr uint32_t NTP_PROBE_TIMEOUT_MS = 1200;
 constexpr uint32_t CLOCK_POLL_INTERVAL_MS = 1000;
 constexpr uint32_t RTC_MAGIC = 0x4254494D;
+constexpr uint32_t NTP_DIAGNOSTIC_TASK_STACK_BYTES = 6144;
+constexpr UBaseType_t NTP_DIAGNOSTIC_TASK_PRIORITY = 1;
+constexpr BaseType_t NTP_DIAGNOSTIC_TASK_CORE = 0;
 
 struct NtpDiagnosticState {
     String code;
@@ -36,6 +44,24 @@ struct NtpDiagnosticState {
     String server;
     String address;
     uint32_t atMs{0};
+    uint32_t roundTripMs{0};
+};
+
+struct NtpDiagnosticRequest {
+    bool pending{false};
+    uint32_t generation{0};
+    uint32_t requestedAtMs{0};
+    String primary;
+    String secondary;
+    String tertiary;
+    LogFn logFn{nullptr};
+};
+
+struct NtpDiagnosticResult {
+    String code;
+    String message;
+    String server;
+    String address;
     uint32_t roundTripMs{0};
 };
 
@@ -52,8 +78,13 @@ uint32_t lastAttemptMs = 0;
 uint32_t lastSuccessMs = 0;
 uint32_t lastPollMs = 0;
 time_t lastSyncedEpoch = 0;
-volatile bool syncNotificationPending = false;
+std::atomic<bool> syncNotificationPending{false};
 NtpDiagnosticState ntpDiagnostic;
+NtpDiagnosticRequest ntpDiagnosticRequest;
+SemaphoreHandle_t stateMutex = nullptr;
+TaskHandle_t ntpDiagnosticTaskHandle = nullptr;
+bool ntpDiagnosticRunning = false;
+uint32_t stateGeneration = 0;
 Preferences clockPrefs;
 bool clockPrefsReady = false;
 
@@ -61,6 +92,33 @@ RTC_DATA_ATTR uint32_t rtcMagic = 0;
 RTC_DATA_ATTR int64_t rtcEpoch = 0;
 
 void cacheRtcEpoch(time_t epoch);
+
+class StateLock {
+public:
+    StateLock() {
+        if (stateMutex != nullptr) {
+            locked_ = xSemaphoreTake(stateMutex, portMAX_DELAY) == pdTRUE;
+        }
+    }
+
+    ~StateLock() {
+        if (locked_) {
+            xSemaphoreGive(stateMutex);
+        }
+    }
+
+    StateLock(const StateLock&) = delete;
+    StateLock& operator=(const StateLock&) = delete;
+
+private:
+    bool locked_{false};
+};
+
+void ensureStateMutex() {
+    if (stateMutex == nullptr) {
+        stateMutex = xSemaphoreCreateMutex();
+    }
+}
 
 bool hasValidEpoch(time_t epoch) {
     return epoch >= MIN_VALID_EPOCH;
@@ -124,7 +182,7 @@ void setNtpDiagnostic(const String& code,
 
 void timeSyncNotification(struct timeval* tv) {
     (void)tv;
-    syncNotificationPending = true;
+    syncNotificationPending.store(true, std::memory_order_release);
 }
 
 bool sendNtpProbe(const String& server,
@@ -192,8 +250,8 @@ bool sendNtpProbe(const String& server,
     return false;
 }
 
-void runNtpDiagnostics(uint32_t nowMs, LogFn logFn) {
-    const String servers[] = {ntpServerPrimary, ntpServerSecondary, ntpServerTertiary};
+NtpDiagnosticResult runNtpDiagnostics(const NtpDiagnosticRequest& request) {
+    const String servers[] = {request.primary, request.secondary, request.tertiary};
     bool anyUdpError = false;
     String lastServer = "";
     String lastAddress = "";
@@ -210,15 +268,13 @@ void runNtpDiagnostics(uint32_t nowMs, LogFn logFn) {
         String failureCode;
         String failureMessage;
         if (sendNtpProbe(server, resolvedAddress, roundTripMs, failureCode, failureMessage)) {
-            setNtpDiagnostic("server_replied",
-                             String("NTP server replied; waiting for system sync"),
-                             nowMs,
-                             server,
-                             resolvedAddress.toString(),
-                             roundTripMs);
-            logMessage(logFn, String("NTP probe reply from ") + server + " (" + resolvedAddress.toString() +
-                                   ") in " + roundTripMs + " ms");
-            return;
+            NtpDiagnosticResult result;
+            result.code = "server_replied";
+            result.message = "NTP server replied; waiting for system sync";
+            result.server = server;
+            result.address = resolvedAddress.toString();
+            result.roundTripMs = roundTripMs;
+            return result;
         }
 
         lastServer = server;
@@ -230,23 +286,110 @@ void runNtpDiagnostics(uint32_t nowMs, LogFn logFn) {
         }
     }
 
+    NtpDiagnosticResult result;
     if (anyUdpError) {
-        setNtpDiagnostic(lastFailureCode.isEmpty() ? "udp_no_response" : lastFailureCode,
-                         lastFailureMessage.isEmpty() ? String("Configured NTP servers resolved but did not answer on UDP/123")
-                                                      : lastFailureMessage,
-                         nowMs,
-                         lastServer,
-                         lastAddress);
-        logMessage(logFn, ntpDiagnostic.message);
-        return;
+        result.code = lastFailureCode.isEmpty() ? "udp_no_response" : lastFailureCode;
+        result.message = lastFailureMessage.isEmpty()
+                             ? String("Configured NTP servers resolved but did not answer on UDP/123")
+                             : lastFailureMessage;
+        result.server = lastServer;
+        result.address = lastAddress;
+        return result;
     }
 
-    setNtpDiagnostic("dns_failed",
-                     String("DNS failed for all configured NTP servers"),
-                     nowMs,
-                     lastServer,
-                     lastAddress);
-    logMessage(logFn, ntpDiagnostic.message);
+    result.code = "dns_failed";
+    result.message = "DNS failed for all configured NTP servers";
+    result.server = lastServer;
+    result.address = lastAddress;
+    return result;
+}
+
+void ntpDiagnosticTask(void*) {
+    for (;;) {
+        (void)ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+        for (;;) {
+            NtpDiagnosticRequest request;
+            {
+                StateLock lock;
+                if (!ntpDiagnosticRequest.pending) {
+                    ntpDiagnosticRunning = false;
+                    break;
+                }
+                request = ntpDiagnosticRequest;
+                ntpDiagnosticRequest.pending = false;
+                ntpDiagnosticRunning = true;
+            }
+
+            // All DNS and UDP work is deliberately outside the state mutex and
+            // outside the Arduino loop task.
+            const NtpDiagnosticResult result = runNtpDiagnostics(request);
+            const uint32_t completedAtMs = millis();
+            bool published = false;
+            {
+                StateLock lock;
+                ntpDiagnosticRunning = false;
+                if (request.generation == stateGeneration) {
+                    setNtpDiagnostic(result.code,
+                                     result.message,
+                                     completedAtMs,
+                                     result.server,
+                                     result.address,
+                                     result.roundTripMs);
+                    published = true;
+                }
+            }
+
+            if (published) {
+                if (result.code == "server_replied") {
+                    logMessage(request.logFn,
+                               String("NTP probe reply from ") + result.server + " (" + result.address +
+                                   ") in " + result.roundTripMs + " ms");
+                } else {
+                    logMessage(request.logFn, result.message);
+                }
+            }
+        }
+    }
+}
+
+bool ensureNtpDiagnosticTask() {
+    if (ntpDiagnosticTaskHandle != nullptr) {
+        return true;
+    }
+    if (stateMutex == nullptr) {
+        return false;
+    }
+    return xTaskCreatePinnedToCore(ntpDiagnosticTask,
+                                   "ntp-diagnostic",
+                                   NTP_DIAGNOSTIC_TASK_STACK_BYTES,
+                                   nullptr,
+                                   NTP_DIAGNOSTIC_TASK_PRIORITY,
+                                   &ntpDiagnosticTaskHandle,
+                                   NTP_DIAGNOSTIC_TASK_CORE) == pdPASS;
+}
+
+void enqueueNtpDiagnostics(const NtpDiagnosticRequest& request) {
+    TaskHandle_t task = nullptr;
+    {
+        StateLock lock;
+        if (request.generation != stateGeneration) {
+            return;
+        }
+        // One fixed request slot is intentional: a newer retry supersedes a
+        // queued retry, while a running probe is left alone.
+        ntpDiagnosticRequest = request;
+        ntpDiagnosticRequest.pending = true;
+        task = ntpDiagnosticTaskHandle;
+        if (task == nullptr) {
+            setNtpDiagnostic("worker_unavailable",
+                             "NTP diagnostic worker is unavailable",
+                             request.requestedAtMs);
+        }
+    }
+    if (task != nullptr) {
+        xTaskNotifyGive(task);
+    }
 }
 
 void recordSuccessfulSync(time_t epoch, uint32_t nowMs, LogFn logFn) {
@@ -254,17 +397,25 @@ void recordSuccessfulSync(time_t epoch, uint32_t nowMs, LogFn logFn) {
         return;
     }
 
-    lastSuccessMs = nowMs;
-    restored = false;
-    clientSeeded = false;
-    lastSyncedEpoch = epoch;
-    synced = true;
-    setNtpDiagnostic("synced",
-                     String("NTP synchronized successfully"),
-                     nowMs,
-                     ntpDiagnostic.server,
-                     ntpDiagnostic.address,
-                     ntpDiagnostic.roundTripMs);
+    {
+        StateLock lock;
+        if (!ntpModeEnabled()) {
+            return;
+        }
+        ++stateGeneration;
+        ntpDiagnosticRequest.pending = false;
+        lastSuccessMs = nowMs;
+        restored = false;
+        clientSeeded = false;
+        lastSyncedEpoch = epoch;
+        synced = true;
+        setNtpDiagnostic("synced",
+                         String("NTP synchronized successfully"),
+                         nowMs,
+                         ntpDiagnostic.server,
+                         ntpDiagnostic.address,
+                         ntpDiagnostic.roundTripMs);
+    }
     cacheRtcEpoch(epoch);
     if (clockPrefsReady) {
         if (clockPrefs.putLong64(PREFS_LAST_NTP_UNIX, static_cast<int64_t>(epoch)) == 0) {
@@ -295,51 +446,61 @@ bool restoreEpoch(time_t epoch) {
     }
 
     cacheRtcEpoch(epoch);
-    restored = true;
-    clientSeeded = false;
+    {
+        StateLock lock;
+        restored = true;
+        clientSeeded = false;
+    }
     return true;
 }
 
-void requestSync(uint32_t nowMs, LogFn logFn, const String& reason) {
-    configTzTime(NTP_TZ, ntpServerPrimary.c_str(), ntpServerSecondary.c_str(), ntpServerTertiary.c_str());
-    configured = true;
-    lastAttemptMs = nowMs;
-    logMessage(logFn, reason);
-    runNtpDiagnostics(nowMs, logFn);
-}
-
-void loadConfigFromPrefs() {
-    timeMode = String(TIME_MODE_NTP);
-    ntpServerPrimary = DEFAULT_NTP_SERVER_PRIMARY;
-    ntpServerSecondary = DEFAULT_NTP_SERVER_SECONDARY;
-    ntpServerTertiary = DEFAULT_NTP_SERVER_TERTIARY;
+ConfigSnapshot loadConfigFromPrefs() {
+    ConfigSnapshot loaded;
+    loaded.mode = TIME_MODE_NTP;
+    loaded.ntpServerPrimary = DEFAULT_NTP_SERVER_PRIMARY;
+    loaded.ntpServerSecondary = DEFAULT_NTP_SERVER_SECONDARY;
+    loaded.ntpServerTertiary = DEFAULT_NTP_SERVER_TERTIARY;
     if (!clockPrefsReady) {
-        return;
+        return loaded;
     }
 
-    timeMode = normalizeMode(clockPrefs.getString(PREFS_TIME_MODE, TIME_MODE_NTP));
-    ntpServerPrimary = sanitizeServerValue(clockPrefs.getString(PREFS_NTP_PRIMARY, DEFAULT_NTP_SERVER_PRIMARY),
-                                           DEFAULT_NTP_SERVER_PRIMARY);
-    ntpServerSecondary = sanitizeServerValue(clockPrefs.getString(PREFS_NTP_SECONDARY, DEFAULT_NTP_SERVER_SECONDARY),
-                                             DEFAULT_NTP_SERVER_SECONDARY);
-    ntpServerTertiary = sanitizeServerValue(clockPrefs.getString(PREFS_NTP_TERTIARY, DEFAULT_NTP_SERVER_TERTIARY),
-                                            DEFAULT_NTP_SERVER_TERTIARY);
+    loaded.mode = normalizeMode(clockPrefs.getString(PREFS_TIME_MODE, TIME_MODE_NTP));
+    loaded.ntpServerPrimary =
+        sanitizeServerValue(clockPrefs.getString(PREFS_NTP_PRIMARY, DEFAULT_NTP_SERVER_PRIMARY),
+                            DEFAULT_NTP_SERVER_PRIMARY);
+    loaded.ntpServerSecondary =
+        sanitizeServerValue(clockPrefs.getString(PREFS_NTP_SECONDARY, DEFAULT_NTP_SERVER_SECONDARY),
+                            DEFAULT_NTP_SERVER_SECONDARY);
+    loaded.ntpServerTertiary =
+        sanitizeServerValue(clockPrefs.getString(PREFS_NTP_TERTIARY, DEFAULT_NTP_SERVER_TERTIARY),
+                            DEFAULT_NTP_SERVER_TERTIARY);
+    return loaded;
 }
 
 } // namespace
 
 void begin(LogFn logFn) {
-    configured = false;
-    synced = false;
-    restored = false;
-    clientSeeded = false;
-    staConnectedLastTick = false;
-    lastAttemptMs = 0;
-    lastSuccessMs = 0;
-    lastPollMs = 0;
-    lastSyncedEpoch = 0;
-    syncNotificationPending = false;
-    setNtpDiagnostic("idle", "Waiting for Wi-Fi to request NTP", 0);
+    ensureStateMutex();
+    const bool workerReady = ensureNtpDiagnosticTask();
+    {
+        StateLock lock;
+        ++stateGeneration;
+        configured = false;
+        synced = false;
+        restored = false;
+        clientSeeded = false;
+        staConnectedLastTick = false;
+        lastAttemptMs = 0;
+        lastSuccessMs = 0;
+        lastPollMs = 0;
+        lastSyncedEpoch = 0;
+        ntpDiagnosticRequest.pending = false;
+        setNtpDiagnostic(workerReady ? "idle" : "worker_unavailable",
+                         workerReady ? "Waiting for Wi-Fi to request NTP"
+                                     : "NTP diagnostic worker is unavailable",
+                         0);
+    }
+    syncNotificationPending.store(false, std::memory_order_release);
 
     if (clockPrefsReady) {
         clockPrefs.end();
@@ -347,30 +508,43 @@ void begin(LogFn logFn) {
     }
 
     clockPrefsReady = clockPrefs.begin(PREFS_NAMESPACE, false);
-    loadConfigFromPrefs();
-    lastSyncedEpoch = clockPrefsReady ? static_cast<time_t>(clockPrefs.getLong64(PREFS_LAST_NTP_UNIX, 0))
-                                      : static_cast<time_t>(0);
-    if (!hasValidEpoch(lastSyncedEpoch)) {
-        lastSyncedEpoch = 0;
+    const ConfigSnapshot loadedConfig = loadConfigFromPrefs();
+    time_t loadedLastSyncedEpoch =
+        clockPrefsReady ? static_cast<time_t>(clockPrefs.getLong64(PREFS_LAST_NTP_UNIX, 0))
+                        : static_cast<time_t>(0);
+    if (!hasValidEpoch(loadedLastSyncedEpoch)) {
+        loadedLastSyncedEpoch = 0;
+    }
+    {
+        StateLock lock;
+        timeMode = loadedConfig.mode;
+        ntpServerPrimary = loadedConfig.ntpServerPrimary;
+        ntpServerSecondary = loadedConfig.ntpServerSecondary;
+        ntpServerTertiary = loadedConfig.ntpServerTertiary;
+        lastSyncedEpoch = loadedLastSyncedEpoch;
     }
     esp_sntp_set_time_sync_notification_cb(timeSyncNotification);
     const time_t rtcSavedEpoch = (rtcMagic == RTC_MAGIC) ? static_cast<time_t>(rtcEpoch) : static_cast<time_t>(0);
     if (restoreEpoch(rtcSavedEpoch)) {
         logMessage(logFn, String("Restored warm-reboot UTC clock at ") + formatIso8601Utc(rtcSavedEpoch));
     }
-    if (!ntpModeEnabled()) {
-        setNtpDiagnostic("disabled", "NTP is disabled in no time mode", 0);
-    } else if (hasValidEpoch(lastSyncedEpoch)) {
-        setNtpDiagnostic("idle",
-                         String("Waiting for the next NTP sync attempt"),
-                         0,
-                         "",
-                         "",
-                         0);
+    {
+        StateLock lock;
+        if (!ntpModeEnabled()) {
+            setNtpDiagnostic("disabled", "NTP is disabled in no time mode", 0);
+        } else if (hasValidEpoch(lastSyncedEpoch)) {
+            setNtpDiagnostic("idle",
+                             String("Waiting for the next NTP sync attempt"),
+                             0,
+                             "",
+                             "",
+                             0);
+        }
     }
 }
 
 ConfigSnapshot config() {
+    StateLock lock;
     ConfigSnapshot snapshot;
     snapshot.mode = timeMode;
     snapshot.ntpServerPrimary = ntpServerPrimary;
@@ -407,26 +581,33 @@ bool saveConfig(const String& mode,
         return false;
     }
 
-    timeMode = normalizedMode;
-    ntpServerPrimary = nextPrimary;
-    ntpServerSecondary = nextSecondary;
-    ntpServerTertiary = nextTertiary;
-    configured = false;
-    syncNotificationPending = false;
-    lastAttemptMs = 0;
-    if (!ntpModeEnabled() && esp_sntp_enabled()) {
+    {
+        StateLock lock;
+        ++stateGeneration;
+        timeMode = normalizedMode;
+        ntpServerPrimary = nextPrimary;
+        ntpServerSecondary = nextSecondary;
+        ntpServerTertiary = nextTertiary;
+        configured = false;
+        lastAttemptMs = 0;
+        ntpDiagnosticRequest.pending = false;
+        if (timeMode == TIME_MODE_NTP) {
+            synced = false;
+            setNtpDiagnostic("idle", "Waiting for Wi-Fi to request NTP", millis());
+        } else {
+            setNtpDiagnostic("disabled", "NTP is disabled in no time mode", millis());
+        }
+    }
+    syncNotificationPending.store(false, std::memory_order_release);
+    if (normalizedMode == TIME_MODE_NO_TIME && esp_sntp_enabled()) {
         esp_sntp_stop();
-    } else if (ntpModeEnabled()) {
-        synced = false;
     }
 
-    if (timeMode == TIME_MODE_NO_TIME) {
-        setNtpDiagnostic("disabled", "NTP is disabled in no time mode", millis());
+    if (normalizedMode == TIME_MODE_NO_TIME) {
         logMessage(logFn, "Updated time mode to no_time (client-seeded clock only)");
     } else {
-        setNtpDiagnostic("idle", "Waiting for Wi-Fi to request NTP", millis());
         logMessage(logFn, String("Updated time mode to ntp with servers: ") +
-                           ntpServerPrimary + ", " + ntpServerSecondary + ", " + ntpServerTertiary);
+                           nextPrimary + ", " + nextSecondary + ", " + nextTertiary);
     }
     return true;
 }
@@ -435,15 +616,22 @@ bool seedFromUnixTime(time_t epoch, uint32_t nowMs, LogFn logFn) {
     if (!hasValidEpoch(epoch)) {
         return false;
     }
-    if (timeMode != TIME_MODE_NO_TIME) {
-        return false;
+    uint32_t generation = 0;
+    {
+        StateLock lock;
+        if (timeMode != TIME_MODE_NO_TIME) {
+            return false;
+        }
+        generation = stateGeneration;
     }
 
     const time_t currentEpoch = time(nullptr);
-    if (synced && hasValidEpoch(currentEpoch)) {
-        return true;
+    {
+        StateLock lock;
+        if (synced && hasValidEpoch(currentEpoch)) {
+            return true;
+        }
     }
-
     if (hasValidEpoch(currentEpoch)) {
         const int64_t deltaSeconds = llabs(static_cast<int64_t>(epoch) - static_cast<int64_t>(currentEpoch));
         if (deltaSeconds <= 2) {
@@ -460,8 +648,14 @@ bool seedFromUnixTime(time_t epoch, uint32_t nowMs, LogFn logFn) {
     }
 
     cacheRtcEpoch(epoch);
-    restored = false;
-    clientSeeded = true;
+    {
+        StateLock lock;
+        if (generation != stateGeneration || timeMode != TIME_MODE_NO_TIME) {
+            return false;
+        }
+        restored = false;
+        clientSeeded = true;
+    }
     logMessage(logFn, String("Seeded UTC clock from client request at ") + formatIso8601Utc(epoch));
     return true;
 }
@@ -482,44 +676,90 @@ void tick(bool staConnected, uint32_t nowMs, LogFn logFn) {
     if (hasValidEpoch(currentEpoch)) {
         cacheRtcEpoch(currentEpoch);
     }
-    if (syncNotificationPending) {
-        syncNotificationPending = false;
+    if (syncNotificationPending.exchange(false, std::memory_order_acq_rel)) {
         recordSuccessfulSync(time(nullptr), nowMs, logFn);
     }
 
-    const bool gainedConnectivity = staConnected && !staConnectedLastTick;
-    staConnectedLastTick = staConnected;
-
-    if (!staConnected) {
-        if (ntpModeEnabled() && ntpDiagnostic.code != "disabled") {
-            setNtpDiagnostic("idle", "Waiting for Wi-Fi before requesting NTP", nowMs);
+    NtpDiagnosticRequest diagnosticRequest;
+    String syncReason;
+    bool requestSyncNow = false;
+    bool pollClock = false;
+    bool gainedConnectivity = false;
+    {
+        StateLock lock;
+        gainedConnectivity = staConnected && !staConnectedLastTick;
+        const bool connectivityChanged = staConnected != staConnectedLastTick;
+        staConnectedLastTick = staConnected;
+        if (connectivityChanged) {
+            ++stateGeneration;
+            ntpDiagnosticRequest.pending = false;
         }
-        return;
-    }
-    if (!ntpModeEnabled()) {
-        if (ntpDiagnostic.code != "disabled") {
-            setNtpDiagnostic("disabled", "NTP is disabled in no time mode", nowMs);
+
+        if (!staConnected) {
+            if (ntpModeEnabled() && ntpDiagnostic.code != "idle") {
+                setNtpDiagnostic("idle", "Waiting for Wi-Fi before requesting NTP", nowMs);
+            }
+            return;
         }
+        if (!ntpModeEnabled()) {
+            if (ntpDiagnostic.code != "disabled") {
+                setNtpDiagnostic("disabled", "NTP is disabled in no time mode", nowMs);
+            }
+            return;
+        }
+
+        if (gainedConnectivity) {
+            configured = false;
+            synced = false;
+            setNtpDiagnostic("pending", "Wi-Fi connected; requesting NTP", nowMs);
+        }
+
+        const detail::SyncDecision decision = detail::decideSync(staConnected,
+                                                                  gainedConnectivity,
+                                                                  true,
+                                                                  configured,
+                                                                  synced,
+                                                                  nowMs,
+                                                                  lastAttemptMs,
+                                                                  NTP_RETRY_INTERVAL_MS);
+        if (decision != detail::SyncDecision::none) {
+            configured = true;
+            lastAttemptMs = nowMs;
+            requestSyncNow = true;
+            diagnosticRequest.generation = stateGeneration;
+            diagnosticRequest.requestedAtMs = nowMs;
+            diagnosticRequest.primary = ntpServerPrimary;
+            diagnosticRequest.secondary = ntpServerSecondary;
+            diagnosticRequest.tertiary = ntpServerTertiary;
+            diagnosticRequest.logFn = logFn;
+            if (decision == detail::SyncDecision::connectivity_gained) {
+                syncReason = "Requested NTP sync after Wi-Fi connect";
+            } else if (decision == detail::SyncDecision::retry) {
+                syncReason = "Retrying NTP sync";
+            } else {
+                syncReason = "Requested initial NTP sync (UTC)";
+            }
+        }
+
+        pollClock = gainedConnectivity || detail::intervalElapsed(nowMs, lastPollMs, CLOCK_POLL_INTERVAL_MS);
+        if (pollClock) {
+            lastPollMs = nowMs;
+        }
+    }
+
+    if (requestSyncNow) {
+        // ESP-IDF's SNTP client resolves and communicates asynchronously.
+        configTzTime(NTP_TZ,
+                     diagnosticRequest.primary.c_str(),
+                     diagnosticRequest.secondary.c_str(),
+                     diagnosticRequest.tertiary.c_str());
+        logMessage(logFn, syncReason);
+        enqueueNtpDiagnostics(diagnosticRequest);
+    }
+
+    if (!pollClock) {
         return;
     }
-
-    if (gainedConnectivity) {
-        configured = false;
-        synced = false;
-        setNtpDiagnostic("pending", "Wi-Fi connected; requesting NTP", nowMs);
-    }
-
-    if (!configured) {
-        requestSync(nowMs, logFn, gainedConnectivity ? "Requested NTP sync after Wi-Fi connect"
-                                                     : "Requested initial NTP sync (UTC)");
-    } else if (!synced && (nowMs - lastAttemptMs) >= NTP_RETRY_INTERVAL_MS) {
-        requestSync(nowMs, logFn, "Retrying NTP sync");
-    }
-
-    if ((nowMs - lastPollMs) < CLOCK_POLL_INTERVAL_MS && !gainedConnectivity) {
-        return;
-    }
-    lastPollMs = nowMs;
 
     const time_t epoch = time(nullptr);
     if (!hasValidEpoch(epoch)) {
@@ -528,37 +768,53 @@ void tick(bool staConnected, uint32_t nowMs, LogFn logFn) {
 
     cacheRtcEpoch(epoch);
     const sntp_sync_status_t syncStatus = sntp_get_sync_status();
-    if (!synced && syncStatus == SNTP_SYNC_STATUS_COMPLETED) {
+    bool alreadySynced = false;
+    {
+        StateLock lock;
+        alreadySynced = synced;
+    }
+    if (!alreadySynced && syncStatus == SNTP_SYNC_STATUS_COMPLETED) {
         recordSuccessfulSync(epoch, nowMs, logFn);
         return;
     }
 
-    if (!synced && syncStatus == SNTP_SYNC_STATUS_IN_PROGRESS) {
+    if (!alreadySynced && syncStatus == SNTP_SYNC_STATUS_IN_PROGRESS) {
+        StateLock lock;
         setNtpDiagnostic("sync_in_progress", "SNTP reported that time adjustment is still in progress", nowMs);
     }
 }
 
 StatusSnapshot snapshot() {
     StatusSnapshot status;
-    status.configured = configured;
-    status.synced = synced;
-    status.lastAttemptMs = lastAttemptMs;
-    status.lastSuccessMs = lastSuccessMs;
-    status.ntpDiagnosticAtMs = ntpDiagnostic.atMs;
-    status.ntpDiagnosticRoundTripMs = ntpDiagnostic.roundTripMs;
-    status.ntpDiagnosticCode = ntpDiagnostic.code;
-    status.ntpDiagnosticMessage = ntpDiagnostic.message;
-    status.ntpDiagnosticServer = ntpDiagnostic.server;
-    status.ntpDiagnosticAddress = ntpDiagnostic.address;
-    if (hasValidEpoch(lastSyncedEpoch)) {
-        status.lastSuccessUnix = lastSyncedEpoch;
-        status.lastSuccessIsoUtc = formatIso8601Utc(lastSyncedEpoch);
+    {
+        StateLock lock;
+        status.configured = configured;
+        status.synced = synced;
+        status.lastAttemptMs = lastAttemptMs;
+        status.lastSuccessMs = lastSuccessMs;
+        status.ntpDiagnosticAtMs = ntpDiagnostic.atMs;
+        status.ntpDiagnosticRoundTripMs = ntpDiagnostic.roundTripMs;
+        status.ntpDiagnosticPending = ntpDiagnosticRequest.pending;
+        status.ntpDiagnosticRunning = ntpDiagnosticRunning;
+        status.ntpDiagnosticStackHighWaterBytes = ntpDiagnosticTaskHandle == nullptr
+                                                      ? 0
+                                                      : uxTaskGetStackHighWaterMark(ntpDiagnosticTaskHandle);
+        status.ntpDiagnosticCode = ntpDiagnostic.code;
+        status.ntpDiagnosticMessage = ntpDiagnostic.message;
+        status.ntpDiagnosticServer = ntpDiagnostic.server;
+        status.ntpDiagnosticAddress = ntpDiagnostic.address;
+        if (hasValidEpoch(lastSyncedEpoch)) {
+            status.lastSuccessUnix = lastSyncedEpoch;
+            status.lastSuccessIsoUtc = formatIso8601Utc(lastSyncedEpoch);
+        }
+        status.restored = restored && !synced;
+        status.clientSeeded = clientSeeded && !synced;
     }
 
     const time_t epoch = time(nullptr);
     status.available = hasValidEpoch(epoch);
-    status.restored = status.available && restored && !synced;
-    status.clientSeeded = status.available && clientSeeded && !synced;
+    status.restored = status.available && status.restored;
+    status.clientSeeded = status.available && status.clientSeeded;
     if (status.available) {
         status.unixTime = epoch;
         status.iso8601Utc = formatIso8601Utc(epoch);

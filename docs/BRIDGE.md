@@ -4,6 +4,130 @@ This document covers the ESP32 bridge firmware, saved-machine API, embedded web 
 
 For raw reverse-engineered BLE protocol details, payload layouts, session setup, and family register mappings, see [NIVONA.md](NIVONA.md).
 
+## API v2 Nonblocking Architecture
+
+Firmware API v2 keeps the Arduino `WebServer`, but the HTTP loop no longer performs BLE work. Every scan, connection, pairing operation, GATT transaction, proprietary-protocol operation, live resource read, and machine mutation is submitted to one NimBLE-owning FreeRTOS worker on core 0 with priority 1 and a 12 KiB stack. HTTP handlers only validate and copy request data, inspect cache state, submit work, and return a response.
+
+`GET /api/status` advertises:
+
+```json
+{
+  "apiVersion": 2,
+  "capabilities": {
+    "asyncBleJobs": true
+  }
+}
+```
+
+API v2 deliberately has no blocking BLE fallback. A client that needs to work with both firmware generations must retain its API v1 response handling and add transparent API v2 job resolution. The companion Home Assistant integration does this so it can be released before the firmware upgrade.
+
+### BLE scheduler and recovery
+
+- The scheduler admits at most eight active jobs. It serves mutations first, then forced reads, stale refreshes, and background work; FIFO order is preserved within each priority.
+- Identical reads are coalesced onto the existing job. Writes are never coalesced. Interactive work may evict queued background work; if no slot can be made available, the handler returns `503 Service Unavailable` with `Retry-After: 1`.
+- A job owns copied machine identity and normalized request data. It never retains a `SavedMachine*` or HTTP-server request state.
+- Adjacent work for one machine reuses a valid connection, discovered handles, notification subscription, and `HU` session. The worker disconnects after ten idle seconds. A failed transport operation clears the client, handles, and session before the next job.
+- Logical deadlines are 12 seconds for summary/features, 15 seconds for stats/settings, 20 seconds for one recipe/slot, 30 seconds for mutations, and 60 seconds for bulk refreshes and diagnostics. Notification waits are capped at three seconds and at the remaining job time.
+- A supervisor watches the worker heartbeat. If a running BLE call makes no progress for 45 seconds, it records the job in RTC memory and reboots instead of trying to kill the worker or disconnect NimBLE concurrently. The marker and reset reason are published in `/api/status` after boot.
+- The worker owns three-second idle scans scheduled once per minute. Scan interval/window are configured at `100`/`30`, duplicate filtering is enabled, and a background scan yields at a safe boundary when interactive work arrives.
+- One coalesced, low-priority statistics refresh is scheduled per remembered machine every 15 minutes. A counter-history entry is appended only after a successful sample whose values differ from the last stored sample.
+
+Remembered-machine persistence uses schema 2. Durable identity/model fields and `savedAtMs` are persisted; presence timestamps and RSSI remain in RAM. The loader accepts the schema 1 payload shape, while equality checking prevents unchanged polls and scans from rewriting NVS. `/api/status.durableMachineWriteCount` exposes actual writes since boot.
+
+### Cache-first resources
+
+The live-resource cache policy is:
+
+| Resource | TTL | Ordinary `GET` behavior |
+| --- | ---: | --- |
+| `summary` | 60 seconds | Return fresh cache, or return stale cache while one refresh is queued |
+| `stats` | 15 minutes | Return fresh cache, or return stale cache while one refresh is queued |
+| `settings` | 15 minutes | Return fresh cache, or return stale cache while one refresh is queued |
+| `features` | 24 hours | Return fresh cache, or return stale cache while one refresh is queued |
+
+The four resources use the following response rules:
+
+- Fresh cache: `200 OK` with the existing domain payload plus a `cache` object.
+- Stale cache: `200 OK` with the last good data, `cache.state = "stale"`, the most recent refresh error when applicable, and job metadata when a refresh is queued.
+- Cold cache or `?refresh=1`: `202 Accepted` with `Location: /api/jobs/{id}` and `Retry-After: 1`.
+- Refresh failure: retain the last good cache and publish the structured error in both the failed job and subsequent stale responses.
+
+Standard-recipe and `MyCoffee` snapshots keep their persistent LittleFS caches. A cache hit remains synchronous; a cold or explicitly forced BLE read is a job.
+
+Consumers can refresh several compact resources in one connection/session:
+
+```http
+POST /api/machines/{serial}/refresh
+Content-Type: application/json
+
+{"resources":["summary","stats","settings"]}
+```
+
+The request accepts one to four names from `summary`, `stats`, `settings`, and `features`. It returns one `202` job; after success, consumers read the requested cache-backed endpoints without `?refresh=1`.
+
+### Job API
+
+Every accepted operation uses the same envelope:
+
+```json
+{
+  "ok": true,
+  "pending": true,
+  "job": {
+    "id": "boot-nonce-counter",
+    "state": "queued",
+    "kind": "machine_stats",
+    "target": "serial",
+    "pollAfterMs": 500,
+    "submittedAtMs": 1234,
+    "progress": 0
+  }
+}
+```
+
+Poll `GET /api/jobs/{id}` until `job.state` is `succeeded`, `failed`, or `cancelled`. Running jobs also expose `startedAtMs`; terminal jobs expose `finishedAtMs`. Failures and cancellations contain `job.error.code` and `job.error.message`. Successful jobs contain a same-origin `job.resultUrl`:
+
+- Resource jobs point back to the corresponding cache-backed resource URL.
+- Mutations and diagnostic operations point to `GET /api/jobs/{id}/result`, which returns the former synchronous response body. Large diagnostic responses are spooled to temporary LittleFS files instead of being retained in RAM; their lifecycle is bounded by the retained job record.
+
+Terminal records are boot-scoped and retained for five minutes. An expired ID, a discarded result, or any ID from before a reboot returns `404`. Consumers should honor `pollAfterMs`, reject cross-origin result URLs, and impose their own total deadline; the embedded UI and Home Assistant client use 60 seconds.
+
+Deleting or resetting a remembered machine cancels its queued jobs and clears its live and persistent recipe caches. An in-flight job checks that it is still current before publishing, so completion cannot restore deleted cached metadata.
+
+### Immediate and asynchronous routes
+
+The following work stays synchronous because it does not require BLE: status, logs, machine-list reads, manual/offline machine creation, history operations, backup/restore, Wi-Fi/time/history configuration, OTA, reboot, and static assets.
+
+BLE-backed routes return jobs, including scans and probes; connect, disconnect, pairing, and notification operations; low-level GATT/protocol diagnostics; brews and confirmations; settings and `MyCoffee` writes; recipe refreshes; and any cold or forced live-resource read.
+
+### Status telemetry
+
+`GET /api/status` reads a published health snapshot and does not call NimBLE or scan history files. In addition to existing bridge/time/storage fields it exposes:
+
+- `bleQueue`: capacity, queued/running counts, and submitted, completed, failed, cancelled, rejected, coalesced, and background-eviction counters.
+- `bleWorker`: readiness, busy state, current job identity and age, heartbeat age, and stack high-water mark.
+- `bleWatchdog`: the retained stall marker with the affected job identity.
+- `memory`: free heap, minimum free heap, and largest free 8-bit-capable block.
+- `resetReason`, `durableMachineWriteCount`, and cached LittleFS/history totals.
+- `http.lastDurationUs` and `http.maxDurationUs` for on-device handler timing.
+- asynchronous NTP diagnostic state, including pending/running flags and diagnostic worker stack high-water mark.
+
+### Embedded UI and storage behavior
+
+The browser UI resolves `202` jobs through one helper, validates same-origin result URLs, honors `pollAfterMs`, and applies per-request abort timeouts within a 60-second logical deadline. Stale resources render immediately with refresh/error state. Periodic refreshes are scheduled only after the preceding request completes, so slow requests cannot accumulate overlapping polls.
+
+Standard, customized, and replayed brews explicitly refresh summary with `?refresh=1` before rerendering. A failed follow-up read warns that the brew was already sent and never retries the mutation. The worker invalidates the previous summary after an acknowledged brew or confirmation, including an acknowledged action whose final result was incomplete.
+
+The editable UI source is [`../web/index.html`](../web/index.html). PlatformIO deterministically gzips it into a generated build header and the root route serves it with `Content-Encoding: gzip`; the generated payload must decompress byte-for-byte to the source.
+
+Manual NTP UDP probing runs in a separate low-priority task. `bridge_time::tick()` only schedules asynchronous SNTP/diagnostic work and coalesces its one-minute retry; DNS and UDP waits are not performed in the HTTP loop.
+
+Brew and counter history reads use two bounded passes: count physical lines, retain at most 100 selected byte offsets, then seek and parse those entries newest-first. `entryId` remains the stable oldest-first physical-line index, and malformed or oversized selected lines increment `skippedEntries`. Responses are streamed in bounded chunks. Patch and deletion write and validate a temporary file before replacement, retaining a rollback copy until the replacement is verified. All LittleFS access shares one recursive filesystem mutex.
+
+Firmware updates are lossless for history. Startup never compacts history and a non-empty LittleFS partition is never auto-formatted after a mount failure. The configured history limit is not divided when machines are added; the largest existing file becomes a preservation floor even when it exceeds a limit introduced by newer firmware. Once a file reaches its limit, a new brew/history append is rejected before dispatch/write and statistics sampling reports a storage error instead of removing old entries. Lowering the runtime cap below the largest persisted brew-history file returns `409` with `minimumLosslessBudgetBytes`.
+
+History growth also observes a global writable limit that retains 192 KiB of operational headroom plus transaction workspace. Backup export is read-only: it takes an immutable, parser-verified snapshot without first changing live history. Restore remains an explicit state-replacement operation. Multipart uploads are staged directly into independent 32,640-byte files (at most 23), with a 512-byte forward reader spanning chunk and record boundaries. Validation and machine loading leave staging intact. Once a complete record is in RAM, restoration deletes only fully consumed chunk files before appending normalized entries. It never shifts or rewrites the unread upload tail. Peak-space preflight includes unread chunks, normalized output, original history retained for rollback, allocation slack, and operational/transaction reserves. Insufficient capacity is rejected before replacing history; aborted/interrupted staging is cleaned up without touching the rollback originals.
+
 ## ESP32 Bridge Saved-Machine API
 
 Current embedded bridge UI is now organized around remembered machines rather than the old one-page debug console.
@@ -80,8 +204,8 @@ Current embedded bridge UI is now organized around remembered machines rather th
     - returns the deleted entry payload for confirmation
   - `POST /api/history/config`
     - updates the runtime per-machine brew-history budget in bytes
-    - clamps the cap between the configured minimum and the mounted LittleFS size
-    - compacts existing history files immediately if the new cap is lower than the current file size
+    - clamps the cap between the configured minimum and the writable LittleFS limit while retaining operational headroom
+    - refuses a cap below the largest persisted file with `409`; it never compacts history implicitly
   - `POST /api/time/config`
     - persists the bridge time mode and NTP server list
     - default mode is `ntp` with `pool.ntp.org`, `time.google.com`, and `time.cloudflare.com`
@@ -93,13 +217,15 @@ Current embedded bridge UI is now organized around remembered machines rather th
     - includes `ntpDiagnosticCode`, `ntpDiagnosticMessage`, `ntpDiagnosticServer`, `ntpDiagnosticAddress`, and `ntpDiagnosticRoundTripMs`
     - the system page uses those fields to tell DNS failure apart from a missing UDP/123 reply
   - `GET /api/backup/export`
-    - streams an NDJSON backup bundle with saved machines, the configured brew-history budget, all persisted brew-history entries, and all persisted counter-history snapshots
+    - preflights and streams an immutable NDJSON backup snapshot with saved machines, the configured history budgets, and all valid persisted brew/counter-history entries
+    - batches history entries into bounded parser-verified arrays, skips malformed/torn physical lines, and refuses to start an oversized response; bridge-generated bundles are capped at 720 KiB, enough for the complete writable history set plus bundle metadata on the current partition
+    - never compacts or otherwise mutates live history before export
     - excludes Wi-Fi credentials, protocol-session cache, and LittleFS recipe caches
   - `POST /api/backup/restore`
     - accepts a multipart upload containing a backup bundle file
-    - validates the bundle before applying it, then replaces the saved-machine store, brew history, and counter history from that bundle
-    - clears recipe caches and stored protocol-session cache before restore
-    - clamps the restored brew-history budget to the target bridge's mounted LittleFS size
+    - quiesces and invalidates boot-scoped jobs, purges derived job/resource/recipe files, and validates the complete bundle before applying it
+    - transactionally replaces the saved-machine store, brew history, and counter history, with boot recovery for an interrupted swap; independently staged upload files are deleted as they are consumed, without rewriting the unread bundle tail
+    - preserves the bundle's configured limits, validates each history file, and reserves LittleFS allocation-block slack plus rollback/headroom space before changing durable state
   - `POST /api/machines/{serial}/history/clear`
   - `GET /api/machines/{serial}/stats/history`
     - returns the newest stored counter snapshots first
@@ -322,4 +448,7 @@ Current firmware behavior:
 
 - ESP32 bridge firmware and embedded web app: [`../src/main.cpp`](../src/main.cpp)
 - Current proprietary coffee-machine protocol helper module used by the bridge: [`../src/nivona.cpp`](../src/nivona.cpp)
-- Embedded machine dashboard UI: [`../include/web_ui.h`](../include/web_ui.h)
+- BLE job scheduler: [`../src/bridge_jobs.cpp`](../src/bridge_jobs.cpp)
+- Embedded machine dashboard source: [`../web/index.html`](../web/index.html)
+- Deterministic web-asset generator: [`../tools/generate_web_ui.py`](../tools/generate_web_ui.py)
+- API v2 deployment and acceptance runbook: [API_V2_DEPLOYMENT_RUNBOOK.md](API_V2_DEPLOYMENT_RUNBOOK.md)

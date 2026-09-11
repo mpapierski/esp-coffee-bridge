@@ -10,6 +10,7 @@
 namespace stats_history {
 
 inline constexpr size_t DEFAULT_HISTORY_BYTES = 32 * 1024;
+inline constexpr size_t MIN_HISTORY_BYTES = 2 * 1024;
 
 struct Stats {
     size_t entryCount{0};
@@ -36,11 +37,22 @@ struct AppendResult {
     int32_t totalDelta{0};
 };
 
+using PageEntryVisitor = bool (*)(JsonObjectConst entry,
+                                  size_t entryId,
+                                  void* context,
+                                  String& error);
+
 String filePath(const String& serial);
 
+void configureBudget(size_t requestedBytes, size_t preservedFileBytes = 0);
+size_t budgetBytes();
 bool validateEntry(JsonObjectConst entry, String& error);
 bool append(const String& serial, JsonObjectConst entry, String& error);
 bool appendSerializedLines(const String& serial, const std::vector<String>& lines, String& error);
+bool buildImportedLines(JsonVariantConst payload,
+                        std::vector<String>& linesOut,
+                        size_t& importedCount,
+                        String& error);
 bool recordSnapshotIfChanged(const String& serial,
                              JsonObjectConst liveValues,
                              const bridge_time::StatusSnapshot& timeStatus,
@@ -48,6 +60,23 @@ bool recordSnapshotIfChanged(const String& serial,
                              const String& source,
                              AppendResult& resultOut,
                              String& error);
+bool patchTimestamp(const String& serial,
+                    size_t entryId,
+                    JsonObjectConst patch,
+                    JsonObject updatedOut,
+                    String& error);
+bool deleteEntry(const String& serial,
+                 size_t entryId,
+                 JsonObject deletedOut,
+                 String& error);
+bool visitPage(const String& serial,
+               size_t offset,
+               size_t limit,
+               PageEntryVisitor visitor,
+               void* visitorContext,
+               Stats& statsOut,
+               Page& pageOut,
+               String& error);
 bool loadPage(const String& serial,
               size_t offset,
               size_t limit,

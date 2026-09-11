@@ -4,6 +4,10 @@
 
 #include <vector>
 
+#include "history_paging.h"
+#include "history_retention.h"
+#include "history_storage.h"
+
 namespace brew_history {
 
 String sanitizeMetadataText(JsonVariantConst value, size_t maxLength);
@@ -16,12 +20,12 @@ size_t gBudgetUpperBytes = DEFAULT_HISTORY_BYTES;
 size_t gBudgetBytes = DEFAULT_HISTORY_BYTES;
 
 size_t effectiveBudgetUpperBytes(size_t upperBytes) {
-    return upperBytes > 0 ? upperBytes : DEFAULT_HISTORY_BYTES;
+    const size_t filesystemBytes = upperBytes > 0 ? upperBytes : DEFAULT_HISTORY_BYTES;
+    return history_storage::writableHistoryLimit(filesystemBytes);
 }
 
 size_t effectiveBudgetMinBytes(size_t upperBytes) {
-    const size_t effectiveUpper = effectiveBudgetUpperBytes(upperBytes);
-    return std::min(MIN_HISTORY_BYTES, effectiveUpper);
+    return std::min(MIN_HISTORY_BYTES, upperBytes);
 }
 
 String safeToken(const String& value) {
@@ -49,7 +53,7 @@ String normalizeHistoryPath(const String& path) {
     return String("/") + path;
 }
 
-bool listHistoryPaths(std::vector<String>& pathsOut, String& error) {
+bool listHistoryPaths(std::vector<String>& pathsOut, String& error, bool includeArtifacts = false) {
     error = "";
     pathsOut.clear();
 
@@ -63,7 +67,8 @@ bool listHistoryPaths(std::vector<String>& pathsOut, String& error) {
     while (entry) {
         const String path = entry.name();
         entry.close();
-        if (path.startsWith(HISTORY_PREFIX) || path.startsWith(HISTORY_PREFIX_BARE)) {
+        if ((path.startsWith(HISTORY_PREFIX) || path.startsWith(HISTORY_PREFIX_BARE)) &&
+            (includeArtifacts || path.endsWith(".jsonl"))) {
             pathsOut.push_back(normalizeHistoryPath(path));
         }
         entry = root.openNextFile();
@@ -72,18 +77,92 @@ bool listHistoryPaths(std::vector<String>& pathsOut, String& error) {
     return true;
 }
 
-bool readLine(File& file, String& lineOut) {
+bool countPhysicalLines(File& file, size_t& lineCountOut, String& error) {
+    lineCountOut = 0;
+    if (!file.seek(0)) {
+        error = "failed to seek brew history";
+        return false;
+    }
+
+    history_paging::PhysicalLineCounter counter;
+    char buffer[256];
     while (file.available()) {
-        lineOut = file.readStringUntil('\n');
-        if (lineOut.endsWith("\r")) {
-            lineOut.remove(lineOut.length() - 1);
+        const size_t readCount = file.read(reinterpret_cast<uint8_t*>(buffer), sizeof(buffer));
+        if (readCount == 0) {
+            error = "failed to read brew history";
+            return false;
         }
-        if (!lineOut.isEmpty()) {
-            return true;
+        counter.consume(buffer, readCount);
+    }
+    lineCountOut = counter.lineCount();
+    return true;
+}
+
+bool collectPageOffsets(File& file,
+                        const history_paging::Window& window,
+                        history_paging::OffsetCollector& offsetsOut,
+                        String& error) {
+    if (!file.seek(0)) {
+        error = "failed to seek brew history";
+        return false;
+    }
+
+    history_paging::PhysicalLineCounter counter;
+    char buffer[256];
+    while (file.available()) {
+        const size_t readCount = file.read(reinterpret_cast<uint8_t*>(buffer), sizeof(buffer));
+        if (readCount == 0) {
+            error = "failed to index brew history";
+            return false;
+        }
+        counter.consume(buffer, readCount);
+        offsetsOut.consume(buffer, readCount);
+    }
+    if (counter.lineCount() != window.totalLines) {
+        error = "brew history changed while it was being indexed";
+        return false;
+    }
+    return offsetsOut.count() == window.selectedCount;
+}
+
+bool readBoundedLineAt(File& file,
+                       size_t offset,
+                       String& lineOut,
+                       bool& exceededLimitOut,
+                       String& error) {
+    lineOut = "";
+    lineOut.reserve(512);
+    exceededLimitOut = false;
+    if (offset > 0) {
+        if (!file.seek(offset - 1) || file.read() != '\n') {
+            error = "brew history changed while its page was being read";
+            return false;
         }
     }
-    lineOut = "";
-    return false;
+    if (!file.seek(offset)) {
+        error = "failed to seek brew history entry";
+        return false;
+    }
+
+    while (file.available()) {
+        const int value = file.read();
+        if (value < 0) {
+            error = "failed to read brew history entry";
+            return false;
+        }
+        if (value == '\n') {
+            break;
+        }
+        if (lineOut.length() < history_storage::MAX_JSON_LINE_BYTES) {
+            lineOut += static_cast<char>(value);
+        } else {
+            exceededLimitOut = true;
+        }
+    }
+    if (lineOut.endsWith("\r")) {
+        lineOut.remove(lineOut.length() - 1);
+    }
+    return true;
 }
 
 String formatIso8601Utc(time_t epoch) {
@@ -99,18 +178,25 @@ String formatIso8601Utc(time_t epoch) {
     return String(buffer);
 }
 
-bool serializeEntry(JsonObjectConst entry, String& lineOut, String& error) {
+bool serializeEntryWithLimit(JsonObjectConst entry,
+                             size_t maximumEntryBytes,
+                             String& lineOut,
+                             String& error) {
     lineOut = "";
     lineOut.reserve(measureJson(entry) + 8);
     if (serializeJson(entry, lineOut) == 0 || lineOut.isEmpty()) {
         error = "failed to serialize brew history entry";
         return false;
     }
-    if ((lineOut.length() + 1) > budgetBytes()) {
+    if ((lineOut.length() + 1) > maximumEntryBytes) {
         error = "brew history entry exceeds the configured size limit";
         return false;
     }
     return true;
+}
+
+bool serializeEntry(JsonObjectConst entry, String& lineOut, String& error) {
+    return serializeEntryWithLimit(entry, budgetBytes(), lineOut, error);
 }
 
 bool readHistoryFileSize(const String& serial, size_t& fileBytesOut, String& error) {
@@ -131,52 +217,6 @@ bool readHistoryFileSize(const String& serial, size_t& fileBytesOut, String& err
     return true;
 }
 
-bool writeLines(const String& path, const std::vector<String>& lines, String& error) {
-    File file = LittleFS.open(path, "w");
-    if (!file) {
-        error = "failed to open brew history for writing";
-        return false;
-    }
-
-    for (const String& line : lines) {
-        if (file.print(line) != line.length() || file.write('\n') != 1) {
-            file.close();
-            error = "failed to write brew history";
-            return false;
-        }
-    }
-    file.close();
-    return true;
-}
-
-bool compact(const String& path, String& error) {
-    File file = LittleFS.open(path, "r");
-    if (!file) {
-        error = "failed to open brew history for compaction";
-        return false;
-    }
-
-    std::vector<String> retained;
-    size_t retainedBytes = 0;
-    String line;
-    const size_t maxBytes = budgetBytes();
-    while (readLine(file, line)) {
-        const size_t lineBytes = line.length() + 1;
-        if (lineBytes > maxBytes) {
-            continue;
-        }
-        retained.push_back(line);
-        retainedBytes += lineBytes;
-        while (!retained.empty() && retainedBytes > maxBytes) {
-            retainedBytes -= retained.front().length() + 1;
-            retained.erase(retained.begin());
-        }
-    }
-    file.close();
-
-    return writeLines(path, retained, error);
-}
-
 } // namespace
 
 size_t clampBudgetBytes(size_t requestedBytes, size_t upperBytes) {
@@ -186,9 +226,16 @@ size_t clampBudgetBytes(size_t requestedBytes, size_t upperBytes) {
     return std::max(effectiveMin, std::min(requested, effectiveUpper));
 }
 
-void configureBudget(size_t requestedBytes, size_t upperBytes) {
+void configureBudget(size_t requestedBytes,
+                     size_t upperBytes,
+                     size_t preservedFileBytes) {
     gBudgetUpperBytes = effectiveBudgetUpperBytes(upperBytes);
-    gBudgetBytes = clampBudgetBytes(requestedBytes, gBudgetUpperBytes);
+    const size_t effectiveMin = effectiveBudgetMinBytes(gBudgetUpperBytes);
+    const size_t requested = requestedBytes > 0 ? requestedBytes : DEFAULT_HISTORY_BYTES;
+    const size_t configured = std::max(effectiveMin,
+                                       std::min(requested, gBudgetUpperBytes));
+    gBudgetBytes = history_retention::effectiveBudget(
+        configured, gBudgetUpperBytes, preservedFileBytes);
 }
 
 size_t budgetBytes() {
@@ -228,6 +275,15 @@ bool canAppendWithoutCompaction(const String& serial,
         return false;
     }
 
+    history_storage::Guard filesystem;
+    if (!filesystem) {
+        error = "failed to lock history storage";
+        return false;
+    }
+    if (!history_storage::recoverFile(historyPath(serial), error)) {
+        return false;
+    }
+
     String line;
     if (!serializeEntry(entry, line, error)) {
         return false;
@@ -252,21 +308,63 @@ bool appendSerializedLines(const String& serial, const std::vector<String>& line
         return true;
     }
 
+    history_storage::Guard filesystem;
+    if (!filesystem) {
+        error = "failed to lock history storage";
+        return false;
+    }
+
     const String path = historyPath(serial);
+    if (!history_storage::recoverFile(path, error)) {
+        return false;
+    }
+    bool needsSeparator = false;
+    size_t existingBytes = 0;
+    if (LittleFS.exists(path)) {
+        File existing = LittleFS.open(path, "r");
+        if (!existing) {
+            error = "failed to inspect brew history tail";
+            return false;
+        }
+        existingBytes = existing.size();
+        if (existingBytes > 0) {
+            if (!existing.seek(existingBytes - 1)) {
+                existing.close();
+                error = "failed to seek brew history tail";
+                return false;
+            }
+            needsSeparator = existing.read() != '\n';
+        }
+        existing.close();
+    }
+    size_t incomingBytes = needsSeparator ? 1U : 0U;
+    for (const String& line : lines) {
+        incomingBytes += line.length() + 1;
+    }
+    if (!history_retention::appendFits(existingBytes, incomingBytes, budgetBytes())) {
+        error = "brew history is full; existing entries were preserved";
+        return false;
+    }
+    const size_t filesystemBytes = LittleFS.totalBytes();
+    const size_t usedBytes = LittleFS.usedBytes();
+    const size_t freeBytes = filesystemBytes > usedBytes ? filesystemBytes - usedBytes : 0;
+    if (freeBytes < history_storage::writeReserveBytes(filesystemBytes) + incomingBytes) {
+        error = "brew history append would consume transactional filesystem headroom";
+        return false;
+    }
     File file = LittleFS.open(path, "a");
     if (!file) {
         error = "failed to open brew history for append";
         return false;
     }
 
-    bool wroteAll = true;
+    bool wroteAll = !needsSeparator || file.write('\n') == 1;
     for (const String& line : lines) {
         if (file.print(line) != line.length() || file.write('\n') != 1) {
             wroteAll = false;
             break;
         }
     }
-    const size_t finalSize = file.size();
     file.close();
 
     if (!wroteAll) {
@@ -274,9 +372,6 @@ bool appendSerializedLines(const String& serial, const std::vector<String>& line
         return false;
     }
 
-    if (finalSize > budgetBytes()) {
-        return compact(path, error);
-    }
     return true;
 }
 
@@ -286,6 +381,12 @@ bool collectStorageStats(StorageStats& statsOut, String& error) {
     statsOut.budgetBytes = budgetBytes();
     statsOut.budgetMinBytes = budgetMinBytes();
     statsOut.budgetUpperBytes = budgetUpperBytes();
+
+    history_storage::Guard filesystem;
+    if (!filesystem) {
+        error = "failed to lock history storage";
+        return false;
+    }
 
     std::vector<String> paths;
     if (!listHistoryPaths(paths, error)) {
@@ -301,29 +402,6 @@ bool collectStorageStats(StorageStats& statsOut, String& error) {
         }
         statsOut.totalBytes += file.size();
         file.close();
-    }
-    return true;
-}
-
-bool enforceBudget(String& error) {
-    error = "";
-    std::vector<String> paths;
-    if (!listHistoryPaths(paths, error)) {
-        return false;
-    }
-
-    const size_t maxBytes = budgetBytes();
-    for (const String& path : paths) {
-        File file = LittleFS.open(path, "r");
-        if (!file) {
-            error = String("failed to open brew history file ") + path;
-            return false;
-        }
-        const size_t fileBytes = file.size();
-        file.close();
-        if (fileBytes > maxBytes && !compact(path, error)) {
-            return false;
-        }
     }
     return true;
 }
@@ -376,13 +454,14 @@ void copySanitizedStringField(JsonObject target, JsonObjectConst source, const c
     }
 }
 
-bool loadPage(const String& serial,
-              size_t offset,
-              size_t limit,
-              JsonArray entriesOut,
-              Stats& statsOut,
-              Page& pageOut,
-              String& error) {
+bool visitPage(const String& serial,
+               size_t offset,
+               size_t limit,
+               PageEntryVisitor visitor,
+               void* visitorContext,
+               Stats& statsOut,
+               Page& pageOut,
+               String& error) {
     error = "";
     statsOut = Stats{};
     statsOut.maxBytes = budgetBytes();
@@ -396,43 +475,136 @@ bool loadPage(const String& serial,
     pageOut.offset = offset;
     pageOut.limit = limit;
 
-    File file = LittleFS.open(historyPath(serial), "r");
-    if (!file) {
-        return true;
+    const String path = historyPath(serial);
+    {
+        history_storage::Guard filesystem;
+        if (!filesystem) {
+            error = "failed to lock history storage";
+            return false;
+        }
+        if (!history_storage::recoverFile(path, error)) {
+            return false;
+        }
+        File file = LittleFS.open(path, "r");
+        if (!file) {
+            return true;
+        }
+
+        statsOut.fileBytes = file.size();
+        if (!countPhysicalLines(file, statsOut.entryCount, error)) {
+            file.close();
+            return false;
+        }
+        file.close();
     }
 
-    statsOut.fileBytes = file.size();
-    std::vector<String> allLines;
+    const history_paging::Window window = history_paging::makeWindow(statsOut.entryCount, offset, limit);
+    pageOut.offset = window.offset;
+    pageOut.limit = window.limit;
+    pageOut.returned = window.selectedCount;
+    pageOut.hasOlder = window.hasOlder;
+    pageOut.hasNewer = window.hasNewer;
+    pageOut.nextOffset = window.nextOffset;
+    pageOut.prevOffset = window.prevOffset;
+
+    history_paging::OffsetCollector offsets(window);
+    {
+        history_storage::Guard filesystem;
+        if (!filesystem) {
+            error = "failed to lock history storage";
+            return false;
+        }
+        File file = LittleFS.open(path, "r");
+        if (!file || file.size() != statsOut.fileBytes) {
+            if (file) {
+                file.close();
+            }
+            error = "brew history changed while it was being indexed";
+            return false;
+        }
+        if (!collectPageOffsets(file, window, offsets, error)) {
+            file.close();
+            if (error.isEmpty()) {
+                error = "brew history changed while it was being indexed";
+            }
+            return false;
+        }
+        file.close();
+    }
+
     String line;
-    while (readLine(file, line)) {
-        statsOut.entryCount++;
-        allLines.push_back(line);
-    }
-    file.close();
+    line.reserve(512);
+    DynamicJsonDocument lineDoc(4096);
+    for (size_t selectedIndex = offsets.count(); selectedIndex > 0; --selectedIndex) {
+        bool exceededLimit = false;
+        bool invalidEntry = false;
+        {
+            history_storage::Guard filesystem;
+            if (!filesystem) {
+                error = "failed to lock history storage";
+                return false;
+            }
+            File file = LittleFS.open(path, "r");
+            if (!file || file.size() != statsOut.fileBytes) {
+                if (file) {
+                    file.close();
+                }
+                error = "brew history changed while its page was being read";
+                return false;
+            }
+            if (!readBoundedLineAt(file, offsets.offsetAt(selectedIndex - 1), line, exceededLimit, error)) {
+                file.close();
+                return false;
+            }
+            file.close();
 
-    const size_t effectiveOffset = std::min(offset, statsOut.entryCount);
-    const size_t endExclusive = statsOut.entryCount > effectiveOffset ? statsOut.entryCount - effectiveOffset : 0;
-    const size_t startInclusive = limit > 0 && endExclusive > limit ? endExclusive - limit : 0;
-
-    pageOut.offset = effectiveOffset;
-    pageOut.returned = endExclusive - startInclusive;
-    pageOut.hasOlder = startInclusive > 0;
-    pageOut.hasNewer = effectiveOffset > 0;
-    pageOut.nextOffset = pageOut.hasOlder ? effectiveOffset + limit : effectiveOffset;
-    pageOut.prevOffset = pageOut.hasNewer ? (effectiveOffset > limit ? effectiveOffset - limit : 0) : 0;
-
-    for (size_t index = endExclusive; index > startInclusive; --index) {
-        DynamicJsonDocument lineDoc(4096);
-        DeserializationError parseError = deserializeJson(lineDoc, allLines[index - 1]);
-        if (parseError) {
+            lineDoc.clear();
+            invalidEntry = exceededLimit || line.isEmpty() || deserializeJson(lineDoc, line);
+        }
+        if (invalidEntry) {
             statsOut.skippedEntries++;
             continue;
         }
-        JsonObject item = entriesOut.createNestedObject();
-        item.set(lineDoc.as<JsonObjectConst>());
-        item["entryId"] = static_cast<uint32_t>(index - 1);
+
+        const size_t physicalIndex = window.startInclusive + selectedIndex - 1;
+        JsonObject item = lineDoc.as<JsonObject>();
+        item["entryId"] = static_cast<uint32_t>(physicalIndex);
+        // The visitor may stream over the network. Keep it outside the
+        // filesystem guard so slow clients cannot block history writers.
+        if (visitor != nullptr && !visitor(item, physicalIndex, visitorContext, error)) {
+            if (error.isEmpty()) {
+                error = "brew history page visitor stopped";
+            }
+            return false;
+        }
     }
     return true;
+}
+
+bool loadPage(const String& serial,
+              size_t offset,
+              size_t limit,
+              JsonArray entriesOut,
+              Stats& statsOut,
+              Page& pageOut,
+              String& error) {
+    const auto appendEntry = [](JsonObjectConst entry,
+                                size_t,
+                                void* context,
+                                String&) -> bool {
+        auto* entries = static_cast<JsonArray*>(context);
+        JsonObject item = entries->createNestedObject();
+        item.set(entry);
+        return true;
+    };
+    return visitPage(serial,
+                     offset,
+                     limit,
+                     appendEntry,
+                     &entriesOut,
+                     statsOut,
+                     pageOut,
+                     error);
 }
 
 bool clear(const String& serial, String& error) {
@@ -442,12 +614,24 @@ bool clear(const String& serial, String& error) {
         return false;
     }
 
-    const String path = historyPath(serial);
-    if (!LittleFS.exists(path)) {
-        return true;
+    history_storage::Guard filesystem;
+    if (!filesystem) {
+        error = "failed to lock history storage";
+        return false;
     }
-    if (!LittleFS.remove(path)) {
+    const String path = historyPath(serial);
+    if (!history_storage::recoverFile(path, error)) {
+        return false;
+    }
+    if (LittleFS.exists(path) && !LittleFS.remove(path)) {
         error = "failed to remove brew history";
+        return false;
+    }
+    const String temporaryPath = path + ".tmp";
+    const String backupPath = path + ".bak";
+    if ((LittleFS.exists(temporaryPath) && !LittleFS.remove(temporaryPath)) ||
+        (LittleFS.exists(backupPath) && !LittleFS.remove(backupPath))) {
+        error = "failed to remove brew history rewrite artifact";
         return false;
     }
     return true;
@@ -455,8 +639,13 @@ bool clear(const String& serial, String& error) {
 
 bool clearAll(String& error) {
     error = "";
+    history_storage::Guard filesystem;
+    if (!filesystem) {
+        error = "failed to lock history storage";
+        return false;
+    }
     std::vector<String> paths;
-    if (!listHistoryPaths(paths, error)) {
+    if (!listHistoryPaths(paths, error, true)) {
         return false;
     }
 
@@ -535,6 +724,69 @@ bool applyTimestampPatch(JsonObject target, JsonObjectConst patch, String& error
     return true;
 }
 
+bool transferPhysicalLine(File& source,
+                          File* destination,
+                          String* capturedOut,
+                          bool& hadLineOut,
+                          bool& exceededCaptureLimitOut,
+                          String& error) {
+    hadLineOut = source.available();
+    exceededCaptureLimitOut = false;
+    if (!hadLineOut) {
+        return true;
+    }
+    if (capturedOut != nullptr) {
+        *capturedOut = "";
+        capturedOut->reserve(512);
+    }
+
+    uint8_t outputBuffer[256];
+    size_t outputLength = 0;
+    while (source.available()) {
+        const int value = source.read();
+        if (value < 0) {
+            error = "failed to read brew history during rewrite";
+            return false;
+        }
+        const char ch = static_cast<char>(value);
+        if (destination != nullptr) {
+            outputBuffer[outputLength++] = static_cast<uint8_t>(ch);
+            if (outputLength == sizeof(outputBuffer)) {
+                if (destination->write(outputBuffer, outputLength) != outputLength) {
+                    error = "failed to write temporary brew history";
+                    return false;
+                }
+                outputLength = 0;
+            }
+        }
+        if (capturedOut != nullptr && ch != '\n') {
+            if (capturedOut->length() < history_storage::MAX_JSON_LINE_BYTES) {
+                *capturedOut += ch;
+            } else {
+                exceededCaptureLimitOut = true;
+            }
+        }
+        if (ch == '\n') {
+            break;
+        }
+    }
+    if (destination != nullptr && outputLength > 0 &&
+        destination->write(outputBuffer, outputLength) != outputLength) {
+        error = "failed to write temporary brew history";
+        return false;
+    }
+    if (capturedOut != nullptr && capturedOut->endsWith("\r")) {
+        capturedOut->remove(capturedOut->length() - 1);
+    }
+    return true;
+}
+
+void abandonRewrite(File& source, File& temporary, const String& temporaryPath) {
+    source.close();
+    temporary.close();
+    LittleFS.remove(temporaryPath);
+}
+
 bool patchTimestamp(const String& serial,
                     size_t entryId,
                     JsonObjectConst patch,
@@ -546,59 +798,107 @@ bool patchTimestamp(const String& serial,
         return false;
     }
 
+    history_storage::Guard filesystem;
+    if (!filesystem) {
+        error = "failed to lock history storage";
+        return false;
+    }
     const String path = historyPath(serial);
-    File file = LittleFS.open(path, "r");
-    if (!file) {
+    if (!history_storage::recoverFile(path, error)) {
+        return false;
+    }
+    File source = LittleFS.open(path, "r");
+    if (!source) {
         error = "brew history entry not found";
         return false;
     }
 
-    std::vector<String> rewrittenLines;
-    rewrittenLines.reserve(64);
-    size_t totalBytes = 0;
-    size_t currentEntryId = 0;
-    bool found = false;
-    String line;
-    while (readLine(file, line)) {
-        DynamicJsonDocument lineDoc(4096);
-        DeserializationError parseError = deserializeJson(lineDoc, line);
-        if (parseError) {
-            file.close();
-            error = String("failed to parse brew history entry ") + currentEntryId;
-            return false;
-        }
+    const String temporaryPath = path + ".tmp";
+    LittleFS.remove(temporaryPath);
+    File temporary = LittleFS.open(temporaryPath, "w");
+    if (!temporary) {
+        source.close();
+        error = "failed to open temporary brew history";
+        return false;
+    }
 
-        JsonObject entry = lineDoc.as<JsonObject>();
+    size_t currentEntryId = 0;
+    size_t writtenLines = 0;
+    bool found = false;
+    while (source.available()) {
         if (currentEntryId == entryId) {
+            String line;
+            bool hadLine = false;
+            bool exceededLimit = false;
+            if (!transferPhysicalLine(source, nullptr, &line, hadLine, exceededLimit, error)) {
+                abandonRewrite(source, temporary, temporaryPath);
+                return false;
+            }
+            if (!hadLine || exceededLimit || line.isEmpty()) {
+                abandonRewrite(source, temporary, temporaryPath);
+                error = String("failed to parse brew history entry ") + currentEntryId;
+                return false;
+            }
+            DynamicJsonDocument lineDoc(4096);
+            const DeserializationError parseError = deserializeJson(lineDoc, line);
+            if (parseError) {
+                abandonRewrite(source, temporary, temporaryPath);
+                error = String("failed to parse brew history entry ") + currentEntryId;
+                return false;
+            }
+            JsonObject entry = lineDoc.as<JsonObject>();
             if (!applyTimestampPatch(entry, patch, error)) {
-                file.close();
+                abandonRewrite(source, temporary, temporaryPath);
                 return false;
             }
             updatedOut.set(entry);
             updatedOut["entryId"] = static_cast<uint32_t>(entryId);
+            String serialized;
+            if (!serializeEntry(entry, serialized, error) ||
+                temporary.print(serialized) != serialized.length() ||
+                temporary.write('\n') != 1) {
+                if (error.isEmpty()) {
+                    error = "failed to write patched brew history entry";
+                }
+                abandonRewrite(source, temporary, temporaryPath);
+                return false;
+            }
             found = true;
+        } else {
+            bool hadLine = false;
+            bool exceededLimit = false;
+            if (!transferPhysicalLine(source, &temporary, nullptr, hadLine, exceededLimit, error)) {
+                abandonRewrite(source, temporary, temporaryPath);
+                return false;
+            }
         }
-
-        String serialized;
-        if (!serializeEntry(entry, serialized, error)) {
-            file.close();
-            return false;
-        }
-        rewrittenLines.push_back(serialized);
-        totalBytes += serialized.length() + 1;
         currentEntryId++;
+        writtenLines++;
     }
-    file.close();
+    source.close();
+    temporary.close();
 
     if (!found) {
+        LittleFS.remove(temporaryPath);
         error = "brew history entry not found";
         return false;
     }
+    File rewritten = LittleFS.open(temporaryPath, "r");
+    const size_t totalBytes = rewritten ? rewritten.size() : budgetBytes() + 1;
+    rewritten.close();
     if (totalBytes > budgetBytes()) {
+        LittleFS.remove(temporaryPath);
         error = "patched brew history exceeds the configured size limit";
         return false;
     }
-    return writeLines(path, rewrittenLines, error);
+    if (!history_storage::commitTemporaryFile(path,
+                                              temporaryPath,
+                                              budgetBytes(),
+                                              writtenLines,
+                                              error)) {
+        return false;
+    }
+    return true;
 }
 
 bool deleteEntry(const String& serial,
@@ -611,57 +911,82 @@ bool deleteEntry(const String& serial,
         return false;
     }
 
+    history_storage::Guard filesystem;
+    if (!filesystem) {
+        error = "failed to lock history storage";
+        return false;
+    }
     const String path = historyPath(serial);
-    File file = LittleFS.open(path, "r");
-    if (!file) {
+    if (!history_storage::recoverFile(path, error)) {
+        return false;
+    }
+    File source = LittleFS.open(path, "r");
+    if (!source) {
         error = "brew history entry not found";
         return false;
     }
 
-    std::vector<String> rewrittenLines;
-    rewrittenLines.reserve(64);
-    size_t totalBytes = 0;
-    size_t currentEntryId = 0;
-    bool found = false;
-    String line;
-    while (readLine(file, line)) {
-        DynamicJsonDocument lineDoc(4096);
-        DeserializationError parseError = deserializeJson(lineDoc, line);
-        if (parseError) {
-            file.close();
-            error = String("failed to parse brew history entry ") + currentEntryId;
-            return false;
-        }
+    const String temporaryPath = path + ".tmp";
+    LittleFS.remove(temporaryPath);
+    File temporary = LittleFS.open(temporaryPath, "w");
+    if (!temporary) {
+        source.close();
+        error = "failed to open temporary brew history";
+        return false;
+    }
 
-        JsonObject entry = lineDoc.as<JsonObject>();
+    size_t currentEntryId = 0;
+    size_t writtenLines = 0;
+    bool found = false;
+    while (source.available()) {
         if (currentEntryId == entryId) {
+            String line;
+            bool hadLine = false;
+            bool exceededLimit = false;
+            if (!transferPhysicalLine(source, nullptr, &line, hadLine, exceededLimit, error)) {
+                abandonRewrite(source, temporary, temporaryPath);
+                return false;
+            }
+            if (!hadLine || exceededLimit || line.isEmpty()) {
+                abandonRewrite(source, temporary, temporaryPath);
+                error = String("failed to parse brew history entry ") + currentEntryId;
+                return false;
+            }
+            DynamicJsonDocument lineDoc(4096);
+            const DeserializationError parseError = deserializeJson(lineDoc, line);
+            if (parseError) {
+                abandonRewrite(source, temporary, temporaryPath);
+                error = String("failed to parse brew history entry ") + currentEntryId;
+                return false;
+            }
+            JsonObject entry = lineDoc.as<JsonObject>();
             deletedOut.set(entry);
             deletedOut["entryId"] = static_cast<uint32_t>(entryId);
             found = true;
-            currentEntryId++;
-            continue;
+        } else {
+            bool hadLine = false;
+            bool exceededLimit = false;
+            if (!transferPhysicalLine(source, &temporary, nullptr, hadLine, exceededLimit, error)) {
+                abandonRewrite(source, temporary, temporaryPath);
+                return false;
+            }
+            writtenLines++;
         }
-
-        String serialized;
-        if (!serializeEntry(entry, serialized, error)) {
-            file.close();
-            return false;
-        }
-        rewrittenLines.push_back(serialized);
-        totalBytes += serialized.length() + 1;
         currentEntryId++;
     }
-    file.close();
+    source.close();
+    temporary.close();
 
     if (!found) {
+        LittleFS.remove(temporaryPath);
         error = "brew history entry not found";
         return false;
     }
-    if (totalBytes > budgetBytes()) {
-        error = "rewritten brew history exceeds the configured size limit";
-        return false;
-    }
-    return writeLines(path, rewrittenLines, error);
+    return history_storage::commitTemporaryFile(path,
+                                                temporaryPath,
+                                                budgetBytes(),
+                                                writtenLines,
+                                                error);
 }
 
 void appendCompactRecipe(JsonObject target, JsonObjectConst recipe) {
@@ -789,7 +1114,8 @@ bool buildImportedEntry(JsonObjectConst request, JsonObject target, String& erro
 bool buildImportedLines(JsonVariantConst payload,
                         std::vector<String>& linesOut,
                         size_t& importedCount,
-                        String& error) {
+                        String& error,
+                        size_t maximumEntryBytes) {
     error = "";
     importedCount = 0;
     linesOut.clear();
@@ -809,7 +1135,10 @@ bool buildImportedLines(JsonVariantConst payload,
         }
 
         String line;
-        if (!serializeEntry(entry, line, entryError)) {
+        const size_t entryLimit = maximumEntryBytes > 0
+            ? maximumEntryBytes
+            : budgetBytes();
+        if (!serializeEntryWithLimit(entry, entryLimit, line, entryError)) {
             error = String("entry ") + String(index + 1) + ": " + entryError;
             return false;
         }
