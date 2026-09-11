@@ -18,7 +18,7 @@ Run the firmware checks from the firmware repository:
 
 ```bash
 pio test -e native
-node --test tests/web_ui_brew.test.mjs
+node --test tests/*.test.mjs
 python3 tools/test_backup_staging_littlefs.py
 pio run -e esp32dev
 python3 tools/generate_web_ui.py --verify \
@@ -44,7 +44,7 @@ Run the Home Assistant checks from its repository before publishing that compati
 Preserve both the new firmware and the last known-good firmware, with hashes:
 
 ```bash
-shasum -a 256 .pio/build/esp32dev/firmware.bin
+openssl dgst -sha256 .pio/build/esp32dev/firmware.bin
 ```
 
 ## Baseline and backup
@@ -112,13 +112,24 @@ jq '{
 
 The immediate pass conditions are:
 
-- `apiVersion` is `2` and `capabilities.asyncBleJobs` is `true`;
+- `apiVersion` is `2`, `capabilities.asyncBleJobs` and
+  `capabilities.websocketEvents` are `true`,
+  `capabilities.eventProtocolVersion` is `1`, and
+  `capabilities.eventsUrl` is `/api/events`;
 - `bridgeId` matches the baseline;
 - `bleWorker.ready` is `true`;
 - `bleQueue.capacity` is `8`, with no unexpected queued/running work after settling;
 - `bleWatchdog.markerPresent` is `false` for a clean rollout;
 - saved machines are still present; and
 - Home Assistant reconnects without configuration changes.
+
+Open the embedded UI in a browser and confirm its persistent Bridge activity
+indicator reports live updates as connected. Start one forced resource refresh;
+the browser should receive `queued`, `running`, and terminal job updates over
+`/api/events`, then fetch the job's same-origin `resultUrl`. The browser must not
+poll `/api/status` or `/api/jobs/{id}` after the initial page load. Temporarily
+interrupting the WebSocket should visibly disable BLE-backed actions and should
+not resubmit an accepted mutation; after reconnect, pending watches resume.
 
 History preservation is a deployment gate. The post-upgrade total must be greater than or equal to the recorded API v1 total, and the status must advertise the lossless policy:
 
@@ -129,7 +140,7 @@ test "$AFTER_HISTORY_BYTES" -ge "$BEFORE_HISTORY_BYTES"
 test "$(jq -r '.historyStorage.losslessAcrossFirmwareUpdates' "$RUN_DIR/status-after.json")" = true
 ```
 
-Also inspect `historyStorage.largestBrewFileBytes`, `largestStatsFileBytes`, and `writableAggregateLimitBytes`. If an existing file exceeds the normal writable cap it remains readable/exportable; new appends fail closed rather than deleting any older entry.
+Also inspect `historyStorage.largestBrewFileBytes`, `largestStatsFileBytes`, `statsBudgetBytes`, `statsBudgetUpperBytes`, and `writableAggregateLimitBytes`. Counter history defaults to the transaction-safe 192 KiB single-file ceiling on the current partition. If an existing file exceeds a normal writable cap it remains readable/exportable; new appends fail closed rather than deleting any older entry.
 
 If a watchdog marker is present, capture the complete status and logs before rebooting again:
 
