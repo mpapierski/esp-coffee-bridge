@@ -30,6 +30,7 @@
 #include "bridge_http_server.h"
 #include "bridge_json_object.h"
 #include "bridge_jobs.h"
+#include "bridge_multipart.h"
 #include "bridge_runtime_policy.h"
 #include "bridge_time.h"
 #include "history_capacity.h"
@@ -100,7 +101,12 @@ constexpr uint32_t BACKUP_RESTORE_STATE_MAGIC = 0x42525332;
 // Uploads are staged directly into independently reclaimable chunk files.
 constexpr size_t MAX_BACKUP_RESTORE_UPLOAD_BYTES =
     history_capacity::MAX_GENERATED_BACKUP_BYTES;
-constexpr size_t MAX_BACKUP_JSON_LINE_BYTES = history_storage::MAX_JSON_LINE_BYTES + 1024;
+constexpr size_t MAX_BACKUP_JSON_LINE_BYTES =
+    history_capacity::MAX_BACKUP_JSON_LINE_BYTES;
+constexpr size_t BACKUP_HTTP_PROGRESS_INTERVAL_BYTES = 4 * 1024;
+static_assert(history_capacity::MAX_HISTORY_FILE_COUNT >=
+                  MACHINE_GENERATION_CAPACITY * 2,
+              "Backup capacity must cover brew and stats files for every machine");
 constexpr char DIAGNOSTIC_CONFIRM_HEADER[] = "X-Bridge-Diagnostics-Confirm";
 constexpr char CRASH_DUMP_DOWNLOAD_CONFIRM[] = "download-crash-dump";
 constexpr char CRASH_DUMP_ERASE_CONFIRM[] = "erase-crash-dump";
@@ -2240,8 +2246,12 @@ void clearAllStatsHistory() {
     }
 }
 
-bool readTextLine(BackupReader& file, String& lineOut, String& error) {
+bool readTextLine(BackupReader& file,
+                  String& lineOut,
+                  String& error,
+                  size_t& bytesSinceProgress) {
     error = "";
+    server.markTaskProgress();
     while (file.available()) {
         lineOut = "";
         lineOut.reserve(512);
@@ -2250,6 +2260,14 @@ bool readTextLine(BackupReader& file, String& lineOut, String& error) {
             if (value < 0) {
                 error = "failed to read backup bundle";
                 return false;
+            }
+            bytesSinceProgress++;
+            if (bytesSinceProgress >= BACKUP_HTTP_PROGRESS_INTERVAL_BYTES) {
+                server.markTaskProgress();
+                // The HTTP handler owns this task for the whole synchronous
+                // restore. Yield so its supervisor can observe fresh progress.
+                vTaskDelay(1);
+                bytesSinceProgress = 0;
             }
             if (value == '\n') {
                 break;
@@ -2267,10 +2285,12 @@ bool readTextLine(BackupReader& file, String& lineOut, String& error) {
             lineOut.remove(lineOut.length() - 1);
         }
         if (!lineOut.isEmpty()) {
+            server.markTaskProgress();
             return true;
         }
     }
     lineOut = "";
+    server.markTaskProgress();
     return false;
 }
 
@@ -7101,9 +7121,10 @@ bool validateBackupBundle(size_t uploadBytes, BackupBundleSummary& summaryOut, S
     };
     bool sawMeta = false;
     size_t lineNumber = 0;
+    size_t bytesSinceProgress = 0;
     String line;
     String lineError;
-    while (readTextLine(file, line, lineError)) {
+    while (readTextLine(file, line, lineError, bytesSinceProgress)) {
         lineNumber++;
         DynamicJsonDocument recordDoc(12288);
         const DeserializationError parseError = deserializeJson(recordDoc, line);
@@ -7318,9 +7339,10 @@ bool loadBackupMachinesFromBundle(size_t uploadBytes, std::vector<SavedMachine>&
     }
 
     size_t lineNumber = 0;
+    size_t bytesSinceProgress = 0;
     String line;
     String lineError;
-    while (readTextLine(file, line, lineError)) {
+    while (readTextLine(file, line, lineError, bytesSinceProgress)) {
         lineNumber++;
         DynamicJsonDocument recordDoc(12288);
         const DeserializationError parseError = deserializeJson(recordDoc, line);
@@ -7373,9 +7395,10 @@ bool restoreHistoriesFromBundleProgressively(size_t uploadBytes,
     }
 
     size_t lineNumber = 0;
+    size_t bytesSinceProgress = 0;
     String line;
     String lineError;
-    while (readTextLine(file, line, lineError)) {
+    while (readTextLine(file, line, lineError, bytesSinceProgress)) {
         ++lineNumber;
         DynamicJsonDocument recordDoc(12288);
         const DeserializationError parseError = deserializeJson(recordDoc, line);
@@ -10524,10 +10547,11 @@ public:
                     return false;
                 }
                 bytesSinceYield_ += bufferLength_;
-                if (bytesSinceYield_ >= 4096) {
+                if (bytesSinceYield_ >= BACKUP_HTTP_PROGRESS_INTERVAL_BYTES) {
                     // Backup generation runs on the HTTP task. Give the
                     // core's idle task a scheduling window while scanning a
                     // large file so an export cannot trip the task watchdog.
+                    server.markTaskProgress();
                     vTaskDelay(1);
                     bytesSinceYield_ = 0;
                 }
@@ -10577,7 +10601,12 @@ bool processBackupHistory(const String& path,
         return false;
     }
     prefix.remove(prefix.length() - 1);
-    prefix += ",\"entry\":";
+    prefix += ",\"entry\":[";
+    if (prefix.length() + history_capacity::BACKUP_RECORD_SUFFIX_BYTES >
+            history_capacity::MAX_BACKUP_RECORD_ENVELOPE_BYTES) {
+        error = "backup history record envelope exceeds its bounded limit";
+        return false;
+    }
 
     DynamicJsonDocument sourceEntryDoc(12288);
     if (sourceEntryDoc.capacity() == 0) {
@@ -10596,11 +10625,43 @@ bool processBackupHistory(const String& path,
 
     BufferedBackupLineReader reader(source, path);
     String entry;
-    if (!entry.reserve(512)) {
+    String record;
+    if (!entry.reserve(512) ||
+        !record.reserve(MAX_BACKUP_JSON_LINE_BYTES + 1)) {
         source.close();
-        error = "insufficient memory for a backup source line";
+        error = "insufficient memory for a bounded backup history record";
         return false;
     }
+    record = prefix;
+    size_t recordEntryCount = 0;
+    const size_t maximumRecordEntries = kind == "history"
+        ? history_capacity::MAX_BREW_ENTRIES_PER_BACKUP_RECORD
+        : history_capacity::MAX_STATS_ENTRIES_PER_BACKUP_RECORD;
+
+    auto flushRecord = [&]() -> bool {
+        if (recordEntryCount == 0) {
+            return true;
+        }
+        if (!record.concat("]}\n")) {
+            error = "insufficient memory for a backup history record";
+            return false;
+        }
+        if (record.length() > history_capacity::MAX_GENERATED_BACKUP_BYTES -
+                std::min(bundleBytes, history_capacity::MAX_GENERATED_BACKUP_BYTES)) {
+            error = String("generated backup exceeds ") +
+                history_capacity::MAX_GENERATED_BACKUP_BYTES + " bytes";
+            return false;
+        }
+        bundleBytes += record.length();
+        if (emit && !server.sendContent(record)) {
+            error = "backup client disconnected";
+            return false;
+        }
+        record = prefix;
+        recordEntryCount = 0;
+        return true;
+    };
+
     while (true) {
         bool lineAvailable = false;
         if (!reader.next(entry, lineAvailable, error)) {
@@ -10650,33 +10711,42 @@ bool processBackupHistory(const String& path,
             return false;
         }
         entry = std::move(normalizedLines.front());
+        const size_t minimumEntryBytes = kind == "history"
+            ? history_capacity::MIN_BREW_HISTORY_ENTRY_BYTES
+            : history_capacity::MIN_STATS_HISTORY_ENTRY_BYTES;
+        if (entry.length() + 1 < minimumEntryBytes) {
+            source.close();
+            error = "normalized backup entry violates the capacity bound";
+            return false;
+        }
 
-        String record;
-        const size_t recordBytes = prefix.length() + entry.length() + 2;
-        if (recordBytes > MAX_BACKUP_JSON_LINE_BYTES ||
-            !record.reserve(recordBytes + 1)) {
+        if (!history_capacity::backupRecordEntryFits(record.length(),
+                                                      recordEntryCount,
+                                                      entry.length(),
+                                                      maximumRecordEntries) &&
+            !flushRecord()) {
             source.close();
-            error = recordBytes > MAX_BACKUP_JSON_LINE_BYTES
-                ? String("backup history record exceeds the bounded line limit")
-                : String("insufficient memory for a backup history record");
             return false;
         }
-        record += prefix;
-        record += entry;
-        record += "}\n";
-        if (record.length() > history_capacity::MAX_GENERATED_BACKUP_BYTES -
-                std::min(bundleBytes, history_capacity::MAX_GENERATED_BACKUP_BYTES)) {
+        if (!history_capacity::backupRecordEntryFits(record.length(),
+                                                      recordEntryCount,
+                                                      entry.length(),
+                                                      maximumRecordEntries)) {
             source.close();
-            error = String("generated backup exceeds ") +
-                history_capacity::MAX_GENERATED_BACKUP_BYTES + " bytes";
+            error = "backup history entry exceeds the bounded record limit";
             return false;
         }
-        bundleBytes += record.length();
-        if (emit && !server.sendContent(record)) {
+        if ((recordEntryCount != 0 && !record.concat(',')) ||
+            !record.concat(entry)) {
             source.close();
-            error = "backup client disconnected";
+            error = "insufficient memory for a backup history record";
             return false;
         }
+        recordEntryCount++;
+    }
+    if (!flushRecord()) {
+        source.close();
+        return false;
     }
     source.close();
     return true;
@@ -10743,6 +10813,7 @@ void handleBackupExport() {
     metaLine += '\n';
 
     size_t bundleBytes = metaLine.length();
+    size_t nonHistoryBytes = metaLine.length();
     String preflightError;
     for (const SavedMachine& machine : exportMachines) {
         String machineLine;
@@ -10754,6 +10825,13 @@ void handleBackupExport() {
             serializeJson(machineDoc, machineLine);
         }
         machineLine += '\n';
+        if (machineLine.length() > history_capacity::MAX_NON_HISTORY_BACKUP_BYTES -
+                std::min(nonHistoryBytes,
+                         history_capacity::MAX_NON_HISTORY_BACKUP_BYTES)) {
+            preflightError = "generated backup metadata exceeds its bounded limit";
+            break;
+        }
+        nonHistoryBytes += machineLine.length();
         if (machineLine.length() > history_capacity::MAX_GENERATED_BACKUP_BYTES -
                 std::min(bundleBytes, history_capacity::MAX_GENERATED_BACKUP_BYTES)) {
             preflightError = String("generated backup exceeds ") +
@@ -14428,7 +14506,11 @@ void registerRoutes() {
     server.on("/api/machines/reset", HTTP_POST, handleMachinesReset);
 
     server.on("/api/backup/export", HTTP_GET, handleBackupExport);
-    server.on("/api/backup/restore", HTTP_POST, handleBackupRestoreFinished, handleBackupRestoreUpload);
+    server.on("/api/backup/restore",
+              HTTP_POST,
+              handleBackupRestoreFinished,
+              handleBackupRestoreUpload,
+              bridge_http::multipartRequestLimit(MAX_BACKUP_RESTORE_UPLOAD_BYTES));
     server.on("/api/wifi/save", HTTP_POST, handleWifiSave);
     server.on("/api/time/config", HTTP_POST, handleTimeConfigSave);
     server.on("/api/history/config", HTTP_POST, handleHistoryConfigSave);

@@ -61,6 +61,23 @@ private:
     bool partStarted_{false};
 };
 
+// A single-file multipart request adds an opening boundary, bounded headers,
+// and a closing boundary around the payload. Keep the transport allowance
+// explicit so endpoint payload limits can be converted to request limits
+// without silently falling back to the generic upload ceiling.
+inline constexpr size_t MULTIPART_REQUEST_ENVELOPE_ALLOWANCE_BYTES = 2 * 1024;
+
+inline constexpr size_t multipartRequestLimit(size_t payloadBytes) {
+    return payloadBytes > SIZE_MAX - MULTIPART_REQUEST_ENVELOPE_ALLOWANCE_BYTES
+        ? SIZE_MAX
+        : payloadBytes + MULTIPART_REQUEST_ENVELOPE_ALLOWANCE_BYTES;
+}
+
+static_assert(
+    MULTIPART_REQUEST_ENVELOPE_ALLOWANCE_BYTES >=
+        MultipartParser::MAX_HEADER_BYTES + 2 * MultipartParser::MAX_BOUNDARY_BYTES + 16,
+    "Multipart request allowance must cover the parser's bounded envelope");
+
 bool extractMultipartBoundary(const std::string& contentType,
                               std::string& boundaryOut,
                               std::string& errorOut);

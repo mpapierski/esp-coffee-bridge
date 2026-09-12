@@ -82,6 +82,11 @@ public:
 
     void on(const char* uri, HTTPMethod method, Handler handler);
     void on(const char* uri, HTTPMethod method, Handler handler, Handler uploadHandler);
+    void on(const char* uri,
+            HTTPMethod method,
+            Handler handler,
+            Handler uploadHandler,
+            size_t maximumMultipartRequestBytes);
     void onNotFound(Handler handler);
     void collectHeaders(const char*[], size_t) {}
 
@@ -144,6 +149,7 @@ private:
         HTTPMethod method{HTTP_GET};
         Handler handler;
         Handler uploadHandler;
+        size_t maximumMultipartRequestBytes{0};
     };
 
     struct RequestContext {
@@ -169,7 +175,7 @@ private:
     };
 
     static constexpr size_t MAX_JSON_BODY_BYTES = 8192;
-    static constexpr size_t MAX_MULTIPART_REQUEST_BYTES = 2 * 1024 * 1024;
+    static constexpr size_t DEFAULT_MAX_MULTIPART_REQUEST_BYTES = 2 * 1024 * 1024;
     static constexpr size_t MAX_EVENT_CLIENTS = 4;
     static constexpr uint32_t EVENT_DIRTY_MIN_INTERVAL_MS = 200;
     static constexpr uint32_t EVENT_ACTIVE_STATUS_INTERVAL_MS = 1000;
@@ -187,7 +193,9 @@ private:
     esp_err_t dispatch(httpd_req_t* request);
     esp_err_t handleWebsocket(httpd_req_t* request);
     bool readBody(httpd_req_t* request, String& bodyOut);
-    bool processMultipart(httpd_req_t* request, const Handler& uploadHandler);
+    bool processMultipart(httpd_req_t* request,
+                          const Handler& uploadHandler,
+                          size_t maximumRequestBytes);
     Route* findRoute(const String& uri, HTTPMethod method);
     void parseQuery(httpd_req_t* request, RequestContext& context);
     void applyResponseMetadata(RequestContext& context, int code, const char* contentType);

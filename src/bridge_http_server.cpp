@@ -93,7 +93,23 @@ void BridgeHttpServer::on(const char* uri,
                           HTTPMethod method,
                           Handler handler,
                           Handler uploadHandler) {
-    routes_.push_back({String(uri), method, std::move(handler), std::move(uploadHandler)});
+    on(uri,
+       method,
+       std::move(handler),
+       std::move(uploadHandler),
+       DEFAULT_MAX_MULTIPART_REQUEST_BYTES);
+}
+
+void BridgeHttpServer::on(const char* uri,
+                          HTTPMethod method,
+                          Handler handler,
+                          Handler uploadHandler,
+                          size_t maximumMultipartRequestBytes) {
+    routes_.push_back({String(uri),
+                       method,
+                       std::move(handler),
+                       std::move(uploadHandler),
+                       maximumMultipartRequestBytes});
 }
 
 void BridgeHttpServer::onNotFound(Handler handler) {
@@ -300,10 +316,12 @@ bool BridgeHttpServer::readBody(httpd_req_t* request, String& bodyOut) {
     return true;
 }
 
-bool BridgeHttpServer::processMultipart(httpd_req_t* request, const Handler& uploadHandler) {
+bool BridgeHttpServer::processMultipart(httpd_req_t* request,
+                                        const Handler& uploadHandler,
+                                        size_t maximumRequestBytes) {
     const size_t contentTypeLength = httpd_req_get_hdr_value_len(request, "Content-Type");
     if (contentTypeLength == 0 || contentTypeLength > 512 ||
-        request->content_len == 0 || request->content_len > MAX_MULTIPART_REQUEST_BYTES) {
+        request->content_len == 0 || request->content_len > maximumRequestBytes) {
         return false;
     }
     std::unique_ptr<char[]> contentType(new (std::nothrow) char[contentTypeLength + 1]);
@@ -407,7 +425,9 @@ esp_err_t BridgeHttpServer::dispatch(httpd_req_t* request) {
     Route* route = findRoute(context.uri, context.method);
     bool requestValid = true;
     if (route != nullptr && route->uploadHandler) {
-        requestValid = processMultipart(request, route->uploadHandler);
+        requestValid = processMultipart(request,
+                                        route->uploadHandler,
+                                        route->maximumMultipartRequestBytes);
         if (requestValid) {
             route->handler();
         }
@@ -423,10 +443,11 @@ esp_err_t BridgeHttpServer::dispatch(httpd_req_t* request) {
     }
 
     if (!requestValid && !context.responseStarted) {
+        const size_t maximumRequestBytes = route != nullptr && route->uploadHandler
+            ? route->maximumMultipartRequestBytes
+            : MAX_JSON_BODY_BYTES;
         httpd_resp_set_status(request,
-                              request->content_len > MAX_MULTIPART_REQUEST_BYTES ||
-                                      ((route == nullptr || !route->uploadHandler) &&
-                                       request->content_len > MAX_JSON_BODY_BYTES)
+                              request->content_len > maximumRequestBytes
                                   ? "413 Payload Too Large"
                                   : "400 Bad Request");
         httpd_resp_set_type(request, "application/json");

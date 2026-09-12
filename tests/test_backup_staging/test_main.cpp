@@ -5,6 +5,7 @@
 #include <string>
 
 #include "backup_staging.h"
+#include "history_storage.h"
 
 namespace {
 
@@ -206,11 +207,42 @@ void test_capacity_preflight_keeps_old_history_and_allocation_slack_charged() {
     constexpr size_t uploadSlack = 8 * 1024;
     TEST_ASSERT_EQUAL((600 + 8 + 64 + 8 + 240) * 1024,
         backup_staging::requiredCapacity(upload + uploadSlack + 64 * 1024, upload, upload, 2, reserve));
-    TEST_ASSERT_GREATER_THAN(960 * 1024,
-        backup_staging::requiredCapacity(upload + uploadSlack + 128 * 1024, upload, upload, 2, reserve));
+    constexpr size_t maximumUpload = history_capacity::MAX_GENERATED_BACKUP_BYTES;
+    TEST_ASSERT_GREATER_THAN(history_capacity::LITTLEFS_PARTITION_BYTES,
+        backup_staging::requiredCapacity(maximumUpload + 512 * 1024,
+                                         maximumUpload,
+                                         maximumUpload,
+                                         2,
+                                         reserve));
     TEST_ASSERT_EQUAL(SIZE_MAX, backup_staging::requiredCapacity(10, 11, 0, 0, 0));
     TEST_ASSERT_EQUAL(SIZE_MAX, backup_staging::requiredCapacity(upload, upload, upload, SIZE_MAX, reserve));
     TEST_ASSERT_EQUAL(SIZE_MAX, backup_staging::requiredCapacity(upload, upload, SIZE_MAX, 2, reserve));
+}
+
+void test_batched_backup_bound_covers_the_full_writable_history_limit() {
+    TEST_ASSERT_EQUAL_size_t(
+        history_capacity::CURRENT_WRITABLE_HISTORY_BYTES,
+        history_storage::writableHistoryLimit(
+            history_capacity::LITTLEFS_PARTITION_BYTES));
+    const size_t maximumBackupBytes = history_capacity::maximumBatchedBackupBytes(
+        history_capacity::CURRENT_WRITABLE_HISTORY_BYTES,
+        history_capacity::MAX_HISTORY_FILE_COUNT);
+    TEST_ASSERT_LESS_OR_EQUAL_size_t(
+        history_capacity::MAX_GENERATED_BACKUP_BYTES,
+        maximumBackupBytes);
+
+    constexpr size_t emptyRecordBytes =
+        history_capacity::MAX_BACKUP_RECORD_ENVELOPE_BYTES -
+        history_capacity::BACKUP_RECORD_SUFFIX_BYTES;
+    constexpr size_t exactFitEntryBytes =
+        history_capacity::MAX_BACKUP_JSON_LINE_BYTES - emptyRecordBytes -
+        history_capacity::BACKUP_RECORD_SUFFIX_BYTES;
+    TEST_ASSERT_TRUE(history_capacity::backupRecordEntryFits(
+        emptyRecordBytes, 0, exactFitEntryBytes, 1));
+    TEST_ASSERT_FALSE(history_capacity::backupRecordEntryFits(
+        emptyRecordBytes, 0, exactFitEntryBytes + 1, 1));
+    TEST_ASSERT_FALSE(history_capacity::backupRecordEntryFits(
+        emptyRecordBytes, 1, 1, 1));
 }
 
 } // namespace
@@ -227,5 +259,6 @@ int main() {
     RUN_TEST(test_size_limit_empty_input_and_reclaim_errors);
     RUN_TEST(test_peak_preflight_accounts_for_unread_upload_and_normalization_growth);
     RUN_TEST(test_capacity_preflight_keeps_old_history_and_allocation_slack_charged);
+    RUN_TEST(test_batched_backup_bound_covers_the_full_writable_history_limit);
     return UNITY_END();
 }

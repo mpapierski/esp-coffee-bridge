@@ -123,6 +123,45 @@ void test_truncated_and_multiple_part_uploads_are_rejected() {
         reinterpret_cast<const uint8_t*>(multipleBody.data()), multipleBody.size()));
 }
 
+void test_payload_limit_includes_the_bounded_multipart_envelope() {
+    constexpr size_t payloadBytes = 7500 * 1024;
+    constexpr size_t requestBytes = bridge_http::multipartRequestLimit(payloadBytes);
+    TEST_ASSERT_EQUAL_size_t(
+        payloadBytes + bridge_http::MULTIPART_REQUEST_ENVELOPE_ALLOWANCE_BYTES,
+        requestBytes);
+    TEST_ASSERT_GREATER_THAN_size_t(2 * 1024 * 1024, requestBytes);
+    TEST_ASSERT_GREATER_OR_EQUAL_size_t(
+        MultipartParser::MAX_HEADER_BYTES +
+            2 * MultipartParser::MAX_BOUNDARY_BYTES + 16,
+        bridge_http::MULTIPART_REQUEST_ENVELOPE_ALLOWANCE_BYTES);
+}
+
+void test_maximum_backup_payload_streams_past_the_old_transport_limit() {
+    constexpr size_t payloadBytes = 7500 * 1024;
+    const std::string boundary(MultipartParser::MAX_BOUNDARY_BYTES, 'b');
+    const std::string body = request(boundary, std::string(payloadBytes, 'z'));
+    TEST_ASSERT_LESS_OR_EQUAL_size_t(
+        bridge_http::multipartRequestLimit(payloadBytes), body.size());
+    TEST_ASSERT_GREATER_THAN_size_t(2 * 1024 * 1024, body.size());
+
+    size_t streamedBytes = 0;
+    MultipartParser parser(
+        boundary,
+        [](const MultipartPart&) { return true; },
+        [&](const uint8_t*, size_t size) {
+            streamedBytes += size;
+            return true;
+        },
+        []() { return true; });
+    for (size_t offset = 0; offset < body.size(); offset += 4096) {
+        const size_t count = std::min<size_t>(4096, body.size() - offset);
+        TEST_ASSERT_TRUE(parser.feed(
+            reinterpret_cast<const uint8_t*>(body.data() + offset), count));
+    }
+    TEST_ASSERT_TRUE(parser.finish());
+    TEST_ASSERT_EQUAL_size_t(payloadBytes, streamedBytes);
+}
+
 } // namespace
 
 int main(int, char**) {
@@ -132,5 +171,7 @@ int main(int, char**) {
     RUN_TEST(test_large_payload_is_emitted_without_retaining_the_whole_body);
     RUN_TEST(test_documented_firmware_field_name_remains_compatible);
     RUN_TEST(test_truncated_and_multiple_part_uploads_are_rejected);
+    RUN_TEST(test_payload_limit_includes_the_bounded_multipart_envelope);
+    RUN_TEST(test_maximum_backup_payload_streams_past_the_old_transport_limit);
     return UNITY_END();
 }

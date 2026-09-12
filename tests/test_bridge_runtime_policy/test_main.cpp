@@ -153,7 +153,9 @@ void test_full_history_rejects_append_without_removing_existing_bytes() {
     TEST_ASSERT_FALSE(history_retention::appendFits(
         SIZE_MAX - 10U, 20U, SIZE_MAX));
 
-    TEST_ASSERT_EQUAL_UINT32(720U * 1024U,
+    TEST_ASSERT_EQUAL_UINT32(8U * 1024U * 1024U,
+                             history_capacity::LITTLEFS_PARTITION_BYTES);
+    TEST_ASSERT_EQUAL_UINT32(7500U * 1024U,
                              history_capacity::MAX_GENERATED_BACKUP_BYTES);
 }
 
