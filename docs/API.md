@@ -34,11 +34,12 @@ API v2 deliberately has no blocking BLE fallback. A client that needs to work wi
 - The scheduler admits at most eight active jobs. It serves mutations first, then forced reads, stale refreshes, and background work; FIFO order is preserved within each priority.
 - Identical reads are coalesced onto the existing job. Writes are never coalesced. Interactive work may evict queued background work; if no slot can be made available, the handler returns `503 Service Unavailable` with `Retry-After: 1`.
 - A job owns copied machine identity and normalized request data. It never retains a `SavedMachine*` or HTTP-server request state.
-- Adjacent work for one machine reuses a valid connection, discovered handles, notification subscription, and `HU` session. The worker disconnects after ten idle seconds. A failed transport operation clears the client, handles, and session before the next job.
+- The first interactive operation for a saved machine implicitly connects, enables notifications, establishes `HU`, and validates the link with a plain `Hp` round trip. No session token or explicit connect call is required from HTTP clients.
+- A validated machine session stays connected and receives a coalesced `Hp` liveness probe every ten seconds. A failed probe or BLE disconnect marks the machine offline and clears the client, handles, and `HU` key; the next interactive request establishes a new session. Diagnostic or background-only connections still use the ten-second idle disconnect.
 - Logical deadlines are 12 seconds for summary/features, 15 seconds for stats/settings, 20 seconds for one recipe/slot, 30 seconds for mutations, and 60 seconds for bulk refreshes and diagnostics. Notification waits are capped at three seconds and at the remaining job time.
 - A supervisor watches the BLE worker and an independently queued HTTP-task heartbeat. It also watches for a recent failed allocation followed by an HTTP stall, and for free internal heap below 12 KiB or a largest free internal block below 4 KiB continuously for five seconds. Normal HTTP stalls use a 45-second limit; a stall immediately following an allocation failure uses ten seconds.
 - Automatic recovery records its reason, job identity, heap state, HTTP-heartbeat age, and latest failed allocation in RTC memory, then enters the ESP panic path. This is intentionally different from the administrative reboot and OTA paths: a panic lets ESP-IDF persist all task stacks to the core-dump partition before restarting. The older `bleWatchdog` marker remains available for BLE-specific stalls, while `bridgeRecovery` covers every automatic recovery reason.
-- The worker owns three-second idle scans scheduled once per minute. Scan interval/window are configured at `100`/`30`, duplicate filtering is enabled, and a background scan yields at a safe boundary when interactive work arrives.
+- The worker owns three-second idle scans scheduled once per minute while no interactive machine session is active. Scan interval/window are configured at `100`/`30`, duplicate filtering is enabled, and a background scan yields at a safe boundary when interactive work arrives.
 - One coalesced, low-priority statistics refresh is scheduled per remembered machine every 15 minutes. A counter-history entry is appended only after a successful sample whose values differ from the last stored sample.
 
 Remembered-machine persistence uses schema 2. Durable identity/model fields and `savedAtMs` are persisted; presence timestamps and RSSI remain in RAM. The loader accepts the schema 1 payload shape, while equality checking prevents unchanged polls and scans from rewriting NVS. `/api/status.durableMachineWriteCount` exposes actual writes since boot.
@@ -49,7 +50,7 @@ The live-resource cache policy is:
 
 | Resource | TTL | Ordinary `GET` behavior |
 | --- | ---: | --- |
-| `summary` | 60 seconds | Return fresh cache, or return stale cache while one refresh is queued |
+| `summary` | 60 seconds | Establish a session when offline; otherwise return fresh cache or stale cache while one refresh is queued |
 | `stats` | 15 minutes | Return fresh cache, or return stale cache while one refresh is queued |
 | `settings` | 15 minutes | Return fresh cache, or return stale cache while one refresh is queued |
 | `features` | 24 hours | Return fresh cache, or return stale cache while one refresh is queued |
@@ -131,6 +132,7 @@ The bridge accepts an absent `Origin` for non-browser tools. When browsers provi
 - `resetReason`, `durableMachineWriteCount`, and cached LittleFS/history totals.
 - `http`: readiness, handler timing, heartbeat age, task stack high-water mark, pending health-probe state, and probe queue failures.
 - `crashDump`: partition availability, dump presence/integrity, byte length, crashed task/PC, and the crashing application's ELF SHA when a summary is available.
+- `machineSession`: active saved-machine serial, `offline`/`connecting`/`online` state, last successful `Hp` time, and the ten-second probe interval.
 - asynchronous NTP diagnostic state, including pending/running flags and diagnostic worker stack high-water mark.
 
 ### Crash-dump diagnostics
@@ -183,6 +185,12 @@ History growth also observes a global writable limit that retains 192 KiB of ope
 ## ESP32 Bridge Saved-Machine API
 
 Current embedded bridge UI is now organized around remembered machines rather than the old one-page debug console.
+
+Machine list objects distinguish protocol readiness from scan presence:
+
+- `online` and `sessionState` (`offline`, `connecting`, or `online`) describe the bridge-owned BLE/`HU` session.
+- `nearby`, `lastSeenAtMs`, and `lastSeenRssi` describe the most recent idle scan and do not imply that commands can be sent.
+- Opening a machine page forces a summary read when no session is online. The UI shows connection progress and offers an explicit retry after failure, but session establishment remains implicit in the underlying request.
 
 - machine store
   - `GET /api/machines`
@@ -351,8 +359,8 @@ Manual saved-machine add:
     - derives the supported family/model from the supplied `serial` and optional `model`
     - rejects the request if the supplied data does not map to a supported family
   - related summary behavior:
-    - `GET /api/machines/{serial}/summary` now returns `ok: true` even if the bridge cannot connect live
-    - in that case the response uses saved metadata and reports status summary `offline` or `unavailable` with the connection error text
+    - `GET /api/machines/{serial}/summary` implicitly establishes and validates the machine session when it is offline
+    - connection, `HU`, `Hp`, or live `HX` failures fail the asynchronous job and leave the remembered machine offline
     - on live `HX` reads the response now includes both numeric codes and APK-backed labels for `process` and `message`
     - when the app-backed prompt paths are detected, the response also marks `hostConfirmSuggested = true`
     - example on the `756` / family `700` path: `process=8`, `processLabel=ready`, `message=0`, `messageLabel=none`
@@ -369,8 +377,8 @@ Current firmware behavior:
     - decoded model name from the serial prefix
     - serial
     - family key
-    - online/offline state
-    - RSSI when seen in the current scan window
+    - validated protocol-session online/offline state
+    - separate nearby state and RSSI from the current scan window
 - `/api/protocol/settings-probe` and `GET /api/machines/{serial}/settings`
   - pairs if requested
   - enables `AD02` notifications

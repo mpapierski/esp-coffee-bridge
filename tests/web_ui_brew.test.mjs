@@ -12,6 +12,7 @@ function environment(fail = false) {
   const state = { diagnostics: {}, machineCache: { serial: { summary: { status: "ready" } } } };
   const scope = {
     state,
+    findMachine: () => null,
     getMachineCache: (serial) => state.machineCache[serial] ??= {},
     invalidateMachine: (serial) => { calls.push(["invalidate", serial]); delete state.machineCache[serial]; },
     api: async (path) => {

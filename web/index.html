@@ -798,6 +798,7 @@
   const BLE_UI_ACTIONS = new Set([
     "scan-devices",
     "probe-device",
+    "reconnect-machine",
     "brew-standard",
     "brew-history-again",
     "confirm-machine",
@@ -962,9 +963,24 @@
     if (!status || typeof status !== "object") {
       return;
     }
+    const previousOnlineSerial = state.machines.find((machine) => machine.online)?.serial || "";
     state.status = status;
+    const activeSerial = String(status.machineSession?.serial || "");
+    const activeState = String(status.machineSession?.state || "offline");
+    state.machines.forEach((machine) => {
+      const matches = activeSerial && String(machine.serial).toLowerCase() === activeSerial.toLowerCase();
+      machine.sessionState = matches ? activeState : "offline";
+      machine.online = matches && activeState === "online";
+    });
     headerBadges.innerHTML = statusBadges(status);
     renderBridgeActivity();
+    renderSidebar();
+    const current = route();
+    if (previousOnlineSerial && activeState === "offline" &&
+        current.serial && String(current.serial).toLowerCase() === String(previousOnlineSerial).toLowerCase()) {
+      setFlash("The coffee machine stopped responding. It will reconnect on the next live request.", "error");
+      void renderRoute({ showLoading: false });
+    }
   }
 
   function pruneRecentJobEvents() {
@@ -1719,9 +1735,15 @@
   }
 
   function machinePresenceBadge(machine) {
-    return machine.online
-      ? `<span class="badge good">Online${machine.lastSeenRssi ? ` · ${machine.lastSeenRssi} dBm` : ""}</span>`
-      : `<span class="badge warn">Offline</span>`;
+    const session = machine.sessionState === "connecting"
+      ? '<span class="badge">Connecting</span>'
+      : machine.online
+        ? '<span class="badge good">Online</span>'
+        : '<span class="badge warn">Offline</span>';
+    const presence = machine.nearby
+      ? `<span class="badge good">Nearby${machine.lastSeenRssi ? ` · ${machine.lastSeenRssi} dBm` : ""}</span>`
+      : '<span class="badge">Not seen nearby</span>';
+    return `${session}${presence}`;
   }
 
   function statusBadges(status) {
@@ -1937,6 +1959,10 @@
     const suffix = force ? "?refresh=1" : "";
     const resourcePath = `/api/machines/${encodeURIComponent(serial)}/summary`;
     cache.summary = await api(`${resourcePath}${suffix}`);
+    const machine = findMachine(serial);
+    if (machine && cache.summary?.machine) {
+      Object.assign(machine, cache.summary.machine);
+    }
     if (!force) {
       followStaleResourceJob(serial, "summary", resourcePath, cache.summary);
     }
@@ -2209,7 +2235,7 @@
 
     return sectionShell(
       "Dashboard",
-      "Remembered machines stay on the bridge and their online/offline state follows periodic idle BLE scans.",
+      "Online means the bridge has a validated BLE protocol session. Nearby is based on periodic BLE scans.",
       `${stats}${machineCards}`
     );
   }
@@ -2369,6 +2395,12 @@
           <div class="value-item"><span>Progress</span><span>${percent ? `${percent}%` : "idle"}</span></div>
         </div>
         <div class="progress"><span style="width:${percent}%"></span></div>
+        ${!machine.online ? `
+          <div class="row" style="margin-top:14px;align-items:center;gap:12px;">
+            <button data-action="reconnect-machine" data-serial="${escapeHtml(machine.serial)}">Reconnect</button>
+            <span class="muted tiny">Reconnects Bluetooth, establishes HU, and verifies the machine with Hp.</span>
+          </div>
+        ` : ""}
         ${canConfirm ? `
           <div class="row" style="margin-top:14px;align-items:center;gap:12px;">
             <button data-action="confirm-machine" data-serial="${escapeHtml(machine.serial)}">${escapeHtml(hostConfirmTitle(liveStatus))}</button>
@@ -3583,9 +3615,9 @@
     }
 
     let summary = getMachineCache(serial).summary;
-    if (!summary) {
+    if (!summary || !machine.online) {
       try {
-        summary = await loadMachineSummary(serial, false);
+        summary = await loadMachineSummary(serial, !machine.online);
       } catch (error) {
         setFlash(`Live summary unavailable for ${machine.alias || machine.serial}: ${error.message}`, "error");
       }
@@ -3636,9 +3668,9 @@
     }
 
     let summary = getMachineCache(serial).summary;
-    if (!summary) {
+    if (!summary || !machine.online) {
       try {
-        summary = await loadMachineSummary(serial, false);
+        summary = await loadMachineSummary(serial, !machine.online);
       } catch (error) {
         setFlash(`Live summary unavailable for ${machine.alias || machine.serial}: ${error.message}`, "error");
       }
@@ -3665,9 +3697,9 @@
     }
 
     let summary = getMachineCache(serial).summary;
-    if (!summary) {
+    if (!summary || !machine.online) {
       try {
-        summary = await loadMachineSummary(serial, false);
+        summary = await loadMachineSummary(serial, !machine.online);
       } catch (error) {
         setFlash(`Live summary unavailable for ${machine.alias || machine.serial}: ${error.message}`, "error");
       }
@@ -3819,6 +3851,18 @@
           return;
         }
         await renderRoute();
+      }
+
+      if (action === "reconnect-machine") {
+        const serial = button.dataset.serial;
+        invalidateMachine(serial);
+        await runWithFlash(
+          "Connecting to coffee machine…",
+          () => loadMachineSummary(serial, true),
+          "Coffee machine is online."
+        );
+        await refreshCore();
+        await renderRoute({ showLoading: false });
       }
 
       if (action === "brew-standard") {

@@ -39,7 +39,7 @@ The intended workflow is:
 4. use the onboard web UI or HTTP API to:
    - scan and probe nearby BLE devices
    - pair and save supported machines by alias in bridge memory
-   - watch online/offline state and last-seen presence from idle scans
+   - distinguish a validated online protocol session from last-seen BLE presence
    - browse standard drinks and `MyCoffee` saved recipes
    - brew drinks quickly or with temporary machine-valid customizations
    - inspect beverage counters, maintenance counters, and settings
@@ -56,7 +56,7 @@ The intended workflow is:
 
 ## Web App Features
 
-- `Dashboard`: lists remembered machines with alias/model/family, online or offline state, last-seen presence, and quick open or forget actions.
+- `Dashboard`: lists remembered machines with alias/model/family, validated online or offline session state, separate nearby/last-seen presence, and quick open or forget actions.
 - `Add machine flow`: scans nearby BLE devices, highlights likely supported coffee machines, probes a device before saving it, and also supports manual offline add by BLE address, serial number, and optional model.
 - `Live machine summary`: shows current status summary, process label/code, operator message label/code, progress, and whether the APK-backed `HY` host-confirm path is currently suggested.
 - `Standard drinks`: lists the built-in drink selectors, supports quick brew, and opens a per-drink customization view.
