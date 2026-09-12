@@ -13186,8 +13186,11 @@ void handleMachineResourceRequest(const String& serial, const String& resource) 
         submission.identity = serializeMachineIdentity(*machine).c_str();
         submission.priority = forced || !hasPayload ? bridge_jobs::Priority::ForcedRead
                                                     : bridge_jobs::Priority::StaleRefresh;
-        const uint32_t resourceDeadlineMs =
-            resource == "summary" || resource == "features" ? 12000 : 15000;
+        const bool establishesMachineSession =
+            resource == "summary" && !machineSessionIsOnline(canonicalSerial);
+        const uint32_t resourceDeadlineMs = establishesMachineSession
+            ? 20000U
+            : (resource == "summary" || resource == "features" ? 12000U : 15000U);
         bool followsCombinedRefresh = false;
         if (jobMutex != nullptr && xSemaphoreTake(jobMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
             followsCombinedRefresh = jobScheduler.hasActiveCombinedResource(
@@ -13200,8 +13203,10 @@ void handleMachineResourceRequest(const String& serial, const String& resource) 
         // execution deadline once the worker starts it.
         submission.deadlineMs = followsCombinedRefresh
             ? 60000U + resourceDeadlineMs
-            : resourceDeadlineMs;
-        submission.executionDeadlineMs = followsCombinedRefresh ? resourceDeadlineMs : 0;
+            : (establishesMachineSession ? 35000U : resourceDeadlineMs);
+        submission.executionDeadlineMs = followsCombinedRefresh || establishesMachineSession
+            ? resourceDeadlineMs
+            : 0;
         submission.resource = true;
         submission.resultUrl = (String("/api/machines/") + canonicalSerial + "/" + resource).c_str();
         submission.coalesceKey = defaultJobCoalesceKey(
