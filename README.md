@@ -61,6 +61,7 @@ The intended workflow is:
 - `Live machine summary`: shows current status summary, process label/code, operator message label/code, progress, and whether the APK-backed `HY` host-confirm path is currently suggested.
 - `Standard drinks`: lists the built-in drink selectors, supports quick brew, and opens a per-drink customization view.
 - `Temporary brew customization`: refreshes current standard drink values from the machine, can warm the full standard-drink cache from the machine, and sends temporary overrides such as strength, aroma, temperature, cup mode, and amount fields without overwriting the machine's saved recipe.
+- `Durable brew queue`: accepts drinks while a machine is offline, tracks command acceptance separately from physical preparation/completion, pauses for water/beans/operator prompts or ambiguous outcomes, and survives reboot/OTA without replaying a possibly delivered command.
 - `Brew history`: stores a bounded per-machine history in LittleFS with the final applied recipe snapshot, a stable recipe fingerprint, optional source or actor metadata, UTC timestamps from either NTP or the fallback client-seeded clock, and a runtime-adjustable cap from the system page.
 - `Counter history`: stores a separate bounded per-machine timeline of beverage and maintenance counters, snapshots only when live values change, and captures local machine use started from the front panel.
 - `MyCoffee / saved recipes`: stores saved custom recipe snapshots in LittleFS too, exposes explicit refresh buttons, shows recipe details, and edits persisted custom recipes where the machine family supports them.
@@ -151,12 +152,12 @@ You can also let an AI agent drive the bridge over HTTP. A custom OpenClaw skill
 That skill teaches the agent to:
 
 - discover remembered machines with `GET /api/machines`
-- preflight machine state with `GET /api/machines/{serial}/summary`
+- inspect machine state with `GET /api/machines/{serial}/summary`
 - enumerate drinks and machine-valid override options with `GET /api/machines/{serial}/recipes` and `GET /api/machines/{serial}/recipes/{selector}`
 - read beverage counters with `GET /api/machines/{serial}/stats`
-- issue temporary brew commands with `POST /api/machines/{serial}/brew`
+- enqueue temporary brews with a unique `correlationId`, then follow `GET /api/brews/{brewId}` until the physical outcome is terminal
 
-Because it uses the bridge's live `writableFields` and `options` data, the agent can stay inside model-specific limits instead of guessing bean counts, aroma codes, or temperature options. The skill also checks `/summary` first and avoids brewing when the machine is offline, busy, or reporting a non-zero operator message.
+Because it uses the bridge's live `writableFields` and `options` data, the agent can stay inside model-specific limits instead of guessing bean counts, aroma codes, or temperature options. The bridge itself establishes the machine session when the queued brew reaches the head, waits through temporary offline periods, and reports water/beans/operator intervention separately from completion.
 
 Example prompts:
 

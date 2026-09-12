@@ -16,8 +16,9 @@ Firmware API v2 uses ESP-IDF `esp_http_server` on core 1. Every scan, connection
   "capabilities": {
     "asyncBleJobs": true,
     "websocketEvents": true,
-    "eventProtocolVersion": 1,
+    "eventProtocolVersion": 2,
     "eventsUrl": "/api/events",
+    "durableBrewQueue": true,
     "crashDumpDownload": true
   }
 }
@@ -77,7 +78,9 @@ The request accepts one to four names from `summary`, `stats`, `settings`, and `
 
 ### Job API
 
-Every accepted operation uses the same envelope:
+Every accepted generic BLE operation uses the same envelope. Brew requests use
+the durable brew lifecycle described below instead of this boot-scoped job
+contract:
 
 ```json
 {
@@ -104,17 +107,84 @@ Terminal records are boot-scoped and retained for five minutes. An expired ID, a
 
 Deleting or resetting a remembered machine cancels its queued jobs and clears its live and persistent recipe caches. An in-flight job checks that it is still current before publishing, so completion cannot restore deleted cached metadata.
 
+### Durable brew queue
+
+`POST /api/machines/{serial}/brew` adds a drink to a global 16-item FIFO and
+returns `202 Accepted`, `Location: /api/brews/{brewId}`, and a durable brew
+object. It does not return a generic job ID:
+
+```json
+{
+  "ok": true,
+  "brew": {
+    "id": "brew-89abcdef-1",
+    "correlationId": "caller-generated-id",
+    "serial": "machine-serial",
+    "state": "queued",
+    "position": 1,
+    "commandAccepted": false,
+    "statusUrl": "/api/brews/brew-89abcdef-1"
+  }
+}
+```
+
+`correlationId` is required and must contain 1-64 printable non-space ASCII
+characters. Repeating the same canonical request and correlation ID returns the
+existing brew with `deduplicated: true`; reusing it for different content or a
+different machine returns `409 correlation_conflict`. Deduplication survives
+completion through brew history until that history is explicitly cleared.
+`holdAfter` is optional and defaults to `false`.
+
+The states are `queued`, `waiting_for_machine`, `dispatching`, `accepted`,
+`preparing`, `attention_required`, `reconnecting`, `completed`, `failed`,
+`interrupted`, `unknown`, and `cancelled`. `accepted` means the machine
+acknowledged `HE`; it never means the drink finished. Completion requires an
+observed process `4` or `11`, followed by two message-zero ready observations
+(process `3` or `8`) at least two seconds apart. The next FIFO entry waits
+another three seconds before dispatch. Before sending `HE`, the bridge also
+requires a fresh ready observation, so a queued drink waits behind a manual
+front-panel drink, startup/cleaning work, or an operator prompt.
+
+Known nonzero messages (`1`-`6`, `11`, and `20`) take precedence over the
+process code and produce `attention_required`; the bridge keeps polling and
+never sends `HY` automatically. Unknown nonzero messages make the eventual
+result `unknown`. A disconnect after possible command delivery produces
+`reconnecting` and retries observation indefinitely with bounded backoff. There
+is deliberately no preparation or operator-intervention timeout.
+
+Queue state is transactionally persisted in LittleFS. On reboot or OTA,
+definitely unsent items resume, while an item for which `HE` may have been sent
+becomes `unknown` and pauses the queue. The bridge never automatically replays
+an ambiguous brew. Invalid index metadata or a failed queue recovery sets
+`recoveryBlocked: true`, disables automatic dispatch, and rejects new brews
+with `503 brew_queue_recovery_required` instead of silently dropping state.
+
+- `GET /api/brew-queue` lists the global FIFO.
+- `GET /api/brews/{brewId}` reads an active or finalized brew.
+- `DELETE /api/brews/{brewId}` cancels only a definitely unsent item.
+- `DELETE /api/brew-queue` cancels every definitely unsent item while
+  preserving any potentially active head.
+- `POST /api/brews/{brewId}/resolve` accepts `abandon`, `continue`, or
+  `cancel_remaining`. Continuing after `failed`, `interrupted`, or `unknown`
+  additionally requires `acknowledgeRisk: true`.
+
+Failed, interrupted, unknown, and held completed entries pause the FIFO until
+manual resolution. The UI exposes these actions and warns that the bridge has
+no cup-presence sensor. Saved-machine deletion/reset, backup restore, and
+destructive brew-history cleanup are rejected while affected brews remain
+unresolved. The queue itself is intentionally excluded from backups.
+
 ### Immediate and asynchronous routes
 
-The following work stays synchronous because it does not require BLE: status, logs, machine-list reads, manual/offline machine creation, history operations, backup/restore, Wi-Fi/time/history configuration, OTA, reboot, and static assets.
+The following work stays synchronous because it does not require BLE: status, logs, machine-list and brew-queue reads/mutations, manual/offline machine creation, history operations, backup/restore, Wi-Fi/time/history configuration, OTA, reboot, and static assets.
 
-BLE-backed routes return jobs, including scans and probes; connect, disconnect, pairing, and notification operations; low-level GATT/protocol diagnostics; brews and confirmations; settings and `MyCoffee` writes; recipe refreshes; and any cold or forced live-resource read.
+BLE-backed routes return jobs, including scans and probes; connect, disconnect, pairing, and notification operations; low-level GATT/protocol diagnostics; confirmations; settings and `MyCoffee` writes; recipe refreshes; and any cold or forced live-resource read. Brews instead return durable brew lifecycle records.
 
 ### WebSocket event protocol
 
-`GET /api/events` upgrades to a WebSocket when `capabilities.websocketEvents` is true. The bridge supports four concurrent event clients and up to eight watched jobs per client. Browser clients send `{"type":"watch_job","jobId":"..."}` and receive a current job snapshot immediately followed by change events until the job is terminal. `unwatch_job` releases a subscription and `ping` receives `pong`.
+`GET /api/events` upgrades to a WebSocket when `capabilities.websocketEvents` is true. Protocol version 2 adds broadcast `brew` events containing the current durable brew snapshot. The bridge supports four concurrent event clients and up to eight watched generic jobs per client. Browser clients send `{"type":"watch_job","jobId":"..."}` and receive a current job snapshot immediately followed by change events until the job is terminal. `unwatch_job` releases a subscription and `ping` receives `pong`. REST remains authoritative after reconnect or `resync`.
 
-The first server message is `hello`, containing `eventProtocolVersion`, `apiVersion`, a boot-scoped sequence value, and the full status snapshot. Subsequent `status`, `job`, and `resync` messages use the same sequence scope. Changes are coalesced in a fixed-capacity buffer; overflow emits `resync`, after which clients re-establish outstanding watches. Status updates are limited to once per second while busy and once every five seconds while idle. Status JSON uses a bounded document allocated once at boot and a fixed response/event buffer, so concurrent BLE work and WebSocket clients do not create a large transient allocation for every status request.
+The first server message is `hello`, containing `eventProtocolVersion`, `apiVersion`, a boot-scoped sequence value, and the full status snapshot. Subsequent `status`, `job`, `brew`, and `resync` messages use the same sequence scope. Changes are coalesced in a fixed-capacity buffer; overflow emits `resync`, after which clients reload queue state and re-establish outstanding job watches. Status updates are limited to once per second while busy and once every five seconds while idle. Status JSON uses a bounded document allocated once at boot and a fixed response/event buffer, so concurrent BLE work and WebSocket clients do not create a large transient allocation for every status request.
 
 The bridge accepts an absent `Origin` for non-browser tools. When browsers provide it, the value must equal the request's `http://Host` origin; a mismatch is closed immediately. WebSocket payloads expose only public job metadata and never request bodies, credentials, machine secrets, or retained diagnostic result contents. Broken or slow clients are disconnected rather than allowed to stall the event stream.
 
@@ -133,6 +203,7 @@ The bridge accepts an absent `Origin` for non-browser tools. When browsers provi
 - `http`: readiness, handler timing, heartbeat age, task stack high-water mark, pending health-probe state, and probe queue failures.
 - `crashDump`: partition availability, dump presence/integrity, byte length, crashed task/PC, and the crashing application's ELF SHA when a summary is available.
 - `machineSession`: active saved-machine serial, `offline`/`connecting`/`online` state, last successful `Hp` time, and the ten-second probe interval.
+- `brewQueue`: capacity, count, blocked/recovery state, and current head ID/state.
 - asynchronous NTP diagnostic state, including pending/running flags and diagnostic worker stack high-water mark.
 
 ### Crash-dump diagnostics
@@ -168,9 +239,7 @@ Wi-Fi uses mutually exclusive modes. With no saved station SSID, the bridge expo
 
 A persistent Bridge activity strip and header badge are driven by WebSocket `status` events after the initial page load. While work is active they show a human-readable operation, machine model/alias, elapsed time, worker progress, and queued-job count. Loss of the live event channel is visible and temporarily disables BLE-backed actions; synchronous configuration, history, backup, and static routes remain usable.
 
-Standard, customized, and replayed brews explicitly refresh summary with `?refresh=1` before rerendering. A failed follow-up read warns that the brew was already sent and never retries the mutation. The worker invalidates the previous summary after an acknowledged brew or confirmation, including an acknowledged action whose final result was incomplete.
-
-Only one brew job per machine may be queued or running. A second `POST /api/machines/{serial}/brew` during that window returns `409 Conflict` with `code: "brew_job_active"`, a `Location` header for the existing job, and that job's metadata. The guard is released when the existing job succeeds, fails, or is cancelled. It prevents overlapping bridge brew commands; it does not represent a physical drink backlog or keep the guard until the machine finishes dispensing.
+Standard, customized, and replayed brews add entries to the durable global queue. The UI renders accepted, preparing, operator-attention, reconnection, completion, and manual-resolution state from REST plus protocol-v2 events; it does not infer physical completion from a generic BLE worker job.
 
 The editable UI source is [`../web/index.html`](../web/index.html). PlatformIO deterministically gzips it into a generated build header and the root route serves it with `Content-Encoding: gzip`; the generated payload must decompress byte-for-byte to the source.
 
@@ -214,8 +283,10 @@ Machine list objects distinguish protocol readiness from scan presence:
   - `POST /api/machines/{serial}/recipes/refresh`
     - opens one live session, rereads all supported standard drink definitions, and rewrites the per-machine standard-recipe LittleFS cache in one pass
   - `POST /api/machines/{serial}/brew`
-    - current implementation first reads the live standard recipe, applies request overrides, uploads a temporary recipe snapshot into the machine scratch namespace, and only then sends the standard selector-based `HE` payload
-    - successful accepted brews are appended to a bounded per-machine JSONL history in LittleFS
+    - requires `correlationId`, accepts optional `holdAfter`, and queues even while the machine is offline
+    - returns a durable `brewId`; use `/api/brews/{brewId}` rather than `/api/jobs`
+    - at the FIFO head, reads the live standard recipe, applies request overrides, uploads a temporary recipe snapshot, and only then sends `HE`
+    - appends exactly one finalized lifecycle entry to per-machine JSONL history after the outcome is terminal
     - history timestamps use UTC from the active bridge time mode: `ntp` requests fresh network time on every Wi-Fi connect, while `no_time` disables NTP and relies on client-seeded HTTP requests plus the restored last-known clock
     - the per-machine history budget is runtime-configurable from the system page and persisted in controller preferences
     - optional request metadata fields:
@@ -223,7 +294,8 @@ Machine list objects distinguish protocol readiness from scan presence:
       - `actor`
       - `label`
       - `note`
-      - `correlationId`
+      - `correlationId` (required)
+      - `holdAfter`
     - supported override fields:
       - `strength`
       - `strengthBeans`
@@ -245,6 +317,11 @@ Machine list objects distinguish protocol readiness from scan presence:
       - example: `NICR 756` is capped to `3` beans and aroma codes `dynamic`, `constant`, `intense`, `individual`
     - those overrides are temporary for the started brew; they do not overwrite persistent `MyCoffee` slots
     - if the next history entry would overflow the fixed per-machine history budget, the bridge rejects the brew before dispatch instead of compacting away older history
+  - `GET /api/brew-queue`
+  - `GET /api/brews/{brewId}`
+  - `DELETE /api/brews/{brewId}`
+  - `DELETE /api/brew-queue`
+  - `POST /api/brews/{brewId}/resolve`
   - `GET /api/machines/{serial}/history`
     - returns newest brew log entries first
     - supports optional `limit` and `offset` query parameters for pagination from newest to oldest
@@ -287,7 +364,7 @@ Machine list objects distinguish protocol readiness from scan presence:
     - validates each history entry independently, groups normalized entries into bounded array records, streams complete NDJSON records through a bounded output buffer, skips malformed/torn physical lines, and refuses to start an oversized response
     - bridge-generated bundles are capped at 7,500 KiB; a compile-time and native-test boundary calculation covers the smallest valid entries, maximum escaped record envelopes, all 32 history files, and non-history records at the full 6,000 KiB writable-history limit on the 8 MiB partition
     - never compacts or otherwise mutates live history before export
-    - excludes Wi-Fi credentials, protocol-session cache, and LittleFS recipe caches
+    - excludes Wi-Fi credentials, protocol-session cache, the live brew queue, and LittleFS recipe caches
   - `POST /api/backup/restore`
     - accepts a multipart upload containing a backup bundle file
     - quiesces and invalidates boot-scoped jobs, purges derived job/resource/recipe files, and validates the complete bundle before applying it

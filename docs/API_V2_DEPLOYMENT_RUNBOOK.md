@@ -173,7 +173,8 @@ The immediate pass conditions are:
 
 - `apiVersion` is `2`, `capabilities.asyncBleJobs` and
   `capabilities.websocketEvents` are `true`,
-  `capabilities.eventProtocolVersion` is `1`, and
+  `capabilities.eventProtocolVersion` is `2`,
+  `capabilities.durableBrewQueue` is `true`, and
   `capabilities.eventsUrl` is `/api/events`;
 - `bridgeId` matches the baseline;
 - `bleWorker.ready` is `true`;
