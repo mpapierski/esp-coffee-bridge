@@ -76,6 +76,9 @@ public:
                                            String& jsonOut,
                                            bool& terminalOut,
                                            void* context);
+    using BrewRenderer = EventJobLookup (*)(const String& id,
+                                            String& jsonOut,
+                                            void* context);
 
     explicit BridgeHttpServer(uint16_t port = 80);
     ~BridgeHttpServer();
@@ -96,6 +99,7 @@ public:
     void configureEvents(uint32_t bootNonce,
                          StatusRenderer statusRenderer,
                          JobRenderer jobRenderer,
+                         BrewRenderer brewRenderer,
                          void* context = nullptr);
 
     bool begin();
@@ -127,6 +131,7 @@ public:
     BridgeHttpClient client();
 
     void notifyJobChanged(const char* id);
+    void notifyBrewChanged(const char* id);
     void markStatusChanged();
     bool sendStatusSnapshot();
     void tickEvents(uint32_t nowMs, bool active);
@@ -213,6 +218,7 @@ private:
     void sendStatusToAll(const char* type = "status");
     void sendJob(EventClient& client, const char* id);
     void sendJobToWatchers(const char* id);
+    void sendBrewToAll(const char* id);
     void sendErrorEvent(EventClient& client,
                         const char* code,
                         const char* message,
@@ -242,6 +248,7 @@ private:
     uint32_t eventCounter_{1};
     StatusRenderer statusRenderer_{nullptr};
     JobRenderer jobRenderer_{nullptr};
+    BrewRenderer brewRenderer_{nullptr};
     void* eventContext_{nullptr};
     std::array<EventClient, MAX_EVENT_CLIENTS> eventClients_{};
     std::atomic<size_t> eventClientCount_{0};

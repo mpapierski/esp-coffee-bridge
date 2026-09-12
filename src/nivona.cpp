@@ -1214,20 +1214,20 @@ void annotateProcessStatus(ProcessStatus& status) {
         return;
     }
 
-    if ((status.process == 3 || status.process == 8) && status.message == 0) {
-        status.summary = "ready";
-        return;
-    }
-    if (status.process == 4 || status.process == 11) {
-        status.summary = "preparing";
-        return;
-    }
     if (status.message == 20) {
         status.summary = "flush required";
         return;
     }
     if (status.message >= 1 && status.message <= 6) {
         status.summary = "attention";
+        return;
+    }
+    if ((status.process == 3 || status.process == 8) && status.message == 0) {
+        status.summary = "ready";
+        return;
+    }
+    if (status.process == 4 || status.process == 11) {
+        status.summary = "preparing";
         return;
     }
     if (status.process == 0 && status.subProcess == 0 && status.message == 0 && status.progress == 0) {

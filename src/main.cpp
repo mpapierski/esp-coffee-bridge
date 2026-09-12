@@ -10,6 +10,7 @@
 #include <esp_heap_caps.h>
 #include <esp_partition.h>
 #include <esp_system.h>
+#include <mbedtls/sha256.h>
 
 #include <NimBLEDevice.h>
 
@@ -26,6 +27,7 @@
 #include <vector>
 
 #include "backup_staging.h"
+#include "brew_lifecycle.h"
 #include "brew_history.h"
 #include "bridge_http_server.h"
 #include "bridge_json_object.h"
@@ -60,6 +62,14 @@ constexpr uint32_t DEFAULT_RECONNECT_DELAY_MS = 750;
 constexpr uint32_t NOTIFICATION_BATCH_SETTLE_MS = 60;
 constexpr size_t LOG_CAPACITY   = 128;
 constexpr size_t BREW_HISTORY_PRECHECK_RESERVE_BYTES = 448;
+constexpr size_t BREW_QUEUE_CAPACITY = 16;
+constexpr uint32_t BREW_READY_SEPARATION_MS = 2000;
+constexpr uint32_t BREW_NEXT_DELAY_MS = 3000;
+constexpr uint32_t BREW_ACTIVE_POLL_MS = 1000;
+constexpr uint32_t BREW_ATTENTION_POLL_MS = 3000;
+constexpr uint32_t BREW_RECONNECT_MAX_MS = 30000;
+constexpr char BREW_QUEUE_INDEX_PATH[] = "/brew-queue.json";
+constexpr uint32_t BREW_QUEUE_SCHEMA = 1;
 constexpr uint32_t STATS_HISTORY_POLL_INTERVAL_MS = 15 * 60 * 1000;
 constexpr uint32_t IDLE_SCAN_INTERVAL_MS = 60 * 1000;
 constexpr uint32_t BLE_IDLE_DISCONNECT_MS = 10 * 1000;
@@ -224,6 +234,32 @@ struct MachineGenerationEntry {
     uint32_t lastStatsScheduledAtMs{0};
 };
 
+struct BrewQueueItem {
+    String id;
+    String correlationId;
+    String serial;
+    String requestHash;
+    brew_lifecycle::Tracker tracker;
+    bool holdAfter{false};
+    bool resolutionAccepted{false};
+    bool historyLogged{false};
+    int16_t process{0};
+    int16_t subProcess{0};
+    int16_t message{0};
+    int16_t progress{0};
+    String statusSummary;
+    String errorCode;
+    String errorMessage;
+    uint32_t createdAtMs{0};
+    uint32_t updatedAtMs{0};
+    uint32_t acceptedAtMs{0};
+    uint32_t preparingAtMs{0};
+    uint32_t completedAtMs{0};
+    uint32_t nextActionAtMs{0};
+    uint32_t reconnectDelayMs{1000};
+    uint32_t lastPersistAtMs{0};
+};
+
 enum class MachineSessionState : uint8_t {
     Offline,
     Connecting,
@@ -237,7 +273,8 @@ enum class BleOperation : uint16_t {
     MachineFeatures,
     MachineRecipesRefresh,
     MachineRecipeDetail,
-    MachineBrew,
+    BrewQueueDispatch,
+    BrewQueueObserve,
     MachineConfirm,
     MachineMyCoffeeList,
     MachineMyCoffeeDetail,
@@ -472,12 +509,17 @@ SemaphoreHandle_t cacheMutex        = nullptr;
 SemaphoreHandle_t healthMutex       = nullptr;
 SemaphoreHandle_t machineMutex      = nullptr;
 SemaphoreHandle_t machineGenerationMutex = nullptr;
+SemaphoreHandle_t brewQueueMutex    = nullptr;
 
 std::vector<ScanRecord> scannedDevices;
 std::vector<ScanRecord> scanScratchDevices;
 std::vector<LogEntry> logs;
 std::vector<SavedMachine> savedMachines;
 std::array<MachineGenerationEntry, MACHINE_GENERATION_CAPACITY> machineGenerations{};
+std::unique_ptr<BrewQueueItem[]> brewQueue;
+size_t brewQueueCount = 0;
+uint32_t nextBrewCounter = 1;
+bool brewQueueRecoveryBlocked = false;
 
 ByteVector lastNotificationBytes;
 std::vector<ByteVector> notificationHistory;
@@ -600,6 +642,9 @@ void requestBleWorkerReset();
 size_t jobSpoolBytesLocked(const String& replacingPath);
 bool littleFsCanAllocateLocked(size_t incomingBytes);
 void invalidateResourceCache(const String& serial, const String& resource);
+void appendBrewQueueStatus(JsonObject target);
+void loadBrewQueue();
+bool brewQueueHasUnresolved(const String& serial = "");
 bool streamJsonFileResponse(const String& path,
                             size_t maximumBytes,
                             int status,
@@ -6832,9 +6877,12 @@ void appendStatus(JsonDocument& doc, bool includeRuntimeDiagnostics = false) {
     JsonObject capabilities = doc.createNestedObject("capabilities");
     capabilities["asyncBleJobs"] = true;
     capabilities["websocketEvents"] = true;
-    capabilities["eventProtocolVersion"] = 1;
     capabilities["eventsUrl"] = "/api/events";
     capabilities["implicitMachineSessions"] = true;
+    capabilities["durableBrewQueue"] = true;
+    capabilities["eventProtocolVersion"] = 2;
+    JsonObject brewQueueStatus = doc.createNestedObject("brewQueue");
+    appendBrewQueueStatus(brewQueueStatus);
     if (includeRuntimeDiagnostics) {
         capabilities["crashDumpDownload"] = dump.supported;
     }
@@ -8450,6 +8498,10 @@ void handleMachineHistoryClear(const String& serial) {
         sendError(404, "saved machine not found");
         return;
     }
+    if (brewQueueHasUnresolved(machine->serial)) {
+        sendError(409, "brew history cannot be cleared while this machine has unresolved brews");
+        return;
+    }
 
     String error;
     if (!brew_history::clear(machine->serial, error)) {
@@ -8473,6 +8525,10 @@ void handleMachineHistoryImport(const String& serial) {
     SavedMachine* machine = findSavedMachineBySerial(serial);
     if (machine == nullptr) {
         sendError(404, "saved machine not found");
+        return;
+    }
+    if (brewQueueHasUnresolved(machine->serial)) {
+        sendError(409, "brew history cannot be imported while this machine has unresolved brews");
         return;
     }
     if (!littleFsReady) {
@@ -8565,6 +8621,10 @@ void handleMachineHistoryDelete(const String& serial, const String& entryIdRaw) 
     SavedMachine* machine = findSavedMachineBySerial(serial);
     if (machine == nullptr) {
         sendError(404, "saved machine not found");
+        return;
+    }
+    if (brewQueueHasUnresolved(machine->serial)) {
+        sendError(409, "brew history entries cannot be deleted while this machine has unresolved brews");
         return;
     }
     if (!littleFsReady) {
@@ -8888,6 +8948,10 @@ void handleMachinesManualCreate() {
 }
 
 void handleMachinesReset() {
+    if (brewQueueHasUnresolved()) {
+        sendError(409, "saved machines cannot be reset while the brew queue is unresolved");
+        return;
+    }
     const std::vector<SavedMachine> previousMachines = savedMachines;
     const auto previousGenerations = machineGenerations;
     bool cancelled = true;
@@ -9134,165 +9198,1443 @@ void handleMachineRecipeDetail(const String& serial, const String& selectorText)
     sendJson(response);
 }
 
-void handleMachineBrew(const String& serial) {
-    SavedMachine* machine = findSavedMachineBySerial(serial);
-    if (machine == nullptr) {
-        sendError(404, "saved machine not found");
+String brewPayloadPath(const String& id) {
+    return String("/brewq-") + id + ".json";
+}
+
+String brewRequestHash(const String& value) {
+    uint8_t digest[32];
+    if (mbedtls_sha256_ret(
+            reinterpret_cast<const uint8_t*>(value.c_str()), value.length(), digest, 0) != 0) {
+        return "";
+    }
+    char text[65];
+    for (size_t index = 0; index < sizeof(digest); ++index) {
+        std::snprintf(text + index * 2, 3, "%02x", digest[index]);
+    }
+    return String(text);
+}
+
+bool validCorrelationId(const String& value) {
+    if (value.isEmpty() || value.length() > 64) return false;
+    for (size_t index = 0; index < value.length(); ++index) {
+        const uint8_t ch = static_cast<uint8_t>(value[index]);
+        if (ch < 0x21 || ch > 0x7e) return false;
+    }
+    return true;
+}
+
+bool validBrewId(const String& value) {
+    if (!value.startsWith("brew-") || value.length() > 31) return false;
+    for (size_t index = 0; index < value.length(); ++index) {
+        const char ch = value[index];
+        if ((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '-') continue;
+        return false;
+    }
+    return true;
+}
+
+void canonicalizeBrewRequest(DynamicJsonDocument& request) {
+    static const char* FIELDS[] = {
+        "selector", "strength", "strengthBeans", "aroma", "temperature",
+        "coffeeTemperature", "waterTemperature", "milkTemperature",
+        "milkFoamTemperature", "overallTemperature", "preparation", "twoCups",
+        "coffeeAmountMl", "waterAmountMl", "milkAmountMl", "milkFoamAmountMl",
+        "sizeMl", "source", "actor", "label", "note", "correlationId", "holdAfter",
+    };
+    DynamicJsonDocument canonical(8192);
+    for (const char* field : FIELDS) {
+        if (request.containsKey(field)) canonical[field].set(request[field]);
+    }
+    request.clear();
+    request.set(canonical);
+}
+
+int findQueuedBrewLocked(const String& id) {
+    for (size_t index = 0; index < brewQueueCount; ++index) {
+        if (brewQueue[index].id == id) return static_cast<int>(index);
+    }
+    return -1;
+}
+
+std::unique_ptr<BrewQueueItem[]> copyBrewQueueLocked() {
+    std::unique_ptr<BrewQueueItem[]> copy(
+        new (std::nothrow) BrewQueueItem[BREW_QUEUE_CAPACITY]);
+    if (!copy) return nullptr;
+    for (size_t index = 0; index < BREW_QUEUE_CAPACITY; ++index) {
+        copy[index] = brewQueue[index];
+    }
+    return copy;
+}
+
+void restoreBrewQueueLocked(const BrewQueueItem* copy) {
+    if (copy == nullptr) return;
+    for (size_t index = 0; index < BREW_QUEUE_CAPACITY; ++index) {
+        brewQueue[index] = copy[index];
+    }
+}
+
+int findCorrelationLocked(const String& correlationId) {
+    for (size_t index = 0; index < brewQueueCount; ++index) {
+        if (brewQueue[index].correlationId == correlationId) return static_cast<int>(index);
+    }
+    return -1;
+}
+
+void appendBrewJson(JsonObject target, const BrewQueueItem& item, size_t position) {
+    target["id"] = item.id;
+    target["correlationId"] = item.correlationId;
+    target["serial"] = item.serial;
+    target["state"] = brew_lifecycle::stateName(item.tracker.state);
+    target["position"] = static_cast<uint32_t>(position);
+    target["commandAccepted"] = item.tracker.commandAccepted;
+    target["commandMayHaveBeenSent"] = item.tracker.commandMayHaveBeenSent;
+    target["terminal"] = brew_lifecycle::terminal(item.tracker.state);
+    target["blocked"] = (brew_lifecycle::terminal(item.tracker.state) && !item.historyLogged) ||
+        (!item.resolutionAccepted &&
+         brew_lifecycle::blocksQueue(item.tracker.state, item.holdAfter));
+    target["holdAfter"] = item.holdAfter;
+    target["statusUrl"] = String("/api/brews/") + item.id;
+    target["createdAtMs"] = item.createdAtMs;
+    target["updatedAtMs"] = item.updatedAtMs;
+    if (item.acceptedAtMs != 0) target["acceptedAtMs"] = item.acceptedAtMs;
+    if (item.preparingAtMs != 0) target["preparingAtMs"] = item.preparingAtMs;
+    if (item.completedAtMs != 0) target["completedAtMs"] = item.completedAtMs;
+    JsonObject evidence = target.createNestedObject("completionEvidence");
+    evidence["preparationObserved"] = item.tracker.preparationObserved;
+    evidence["readyObservations"] = item.tracker.readyObservations;
+    evidence["readySeparationMs"] = BREW_READY_SEPARATION_MS;
+    if (!item.statusSummary.isEmpty() || item.message != 0 || item.process != 0) {
+        JsonObject status = target.createNestedObject("machineStatus");
+        status["process"] = item.process;
+        status["subProcess"] = item.subProcess;
+        status["message"] = item.message;
+        status["progress"] = item.progress;
+        status["summary"] = item.statusSummary;
+        const char* messageLabel = nivona::describeMessageCode(item.message);
+        if (messageLabel != nullptr) status["messageLabel"] = messageLabel;
+    }
+    if (!item.errorCode.isEmpty() || !item.errorMessage.isEmpty()) {
+        JsonObject error = target.createNestedObject("error");
+        error["code"] = item.errorCode;
+        error["message"] = item.errorMessage;
+    }
+}
+
+bool writeBrewJsonAtomically(const String& path,
+                             const JsonDocument& document,
+                             size_t maximumBytes,
+                             String& error) {
+    error = "";
+    if (!littleFsReady) {
+        error = "LittleFS is unavailable";
+        return false;
+    }
+    const size_t bytes = measureJson(document) + 1;
+    if (document.overflowed() || bytes <= 3 || bytes > maximumBytes) {
+        error = "brew queue record exceeds its storage limit";
+        return false;
+    }
+    history_storage::Guard filesystem(5000);
+    if (!filesystem) {
+        error = "filesystem is busy";
+        return false;
+    }
+    const String temporary = path + ".tmp";
+    LittleFS.remove(temporary);
+    File file = LittleFS.open(temporary, "w");
+    if (!file) {
+        error = "failed to create temporary brew queue record";
+        return false;
+    }
+    const bool written = serializeJson(document, file) == bytes - 1 && file.write('\n') == 1;
+    file.close();
+    if (!written) {
+        LittleFS.remove(temporary);
+        error = "failed to write brew queue record";
+        return false;
+    }
+    return history_storage::commitTemporaryFile(path, temporary, maximumBytes, 1, error);
+}
+
+bool persistBrewQueueLocked(String& error) {
+    DynamicJsonDocument document(24 * 1024);
+    document["schema"] = BREW_QUEUE_SCHEMA;
+    document["nextCounter"] = nextBrewCounter;
+    JsonArray items = document.createNestedArray("items");
+    for (size_t index = 0; index < brewQueueCount; ++index) {
+        const BrewQueueItem& item = brewQueue[index];
+        JsonObject entry = items.createNestedObject();
+        entry["id"] = item.id;
+        entry["correlationId"] = item.correlationId;
+        entry["serial"] = item.serial;
+        entry["requestHash"] = item.requestHash;
+        entry["state"] = brew_lifecycle::stateName(item.tracker.state);
+        entry["commandMayHaveBeenSent"] = item.tracker.commandMayHaveBeenSent;
+        entry["commandAccepted"] = item.tracker.commandAccepted;
+        entry["preparationObserved"] = item.tracker.preparationObserved;
+        entry["ambiguousStatusObserved"] = item.tracker.ambiguousStatusObserved;
+        entry["attentionInterrupted"] = item.tracker.attentionInterrupted;
+        entry["readyObservations"] = item.tracker.readyObservations;
+        entry["firstReadyAtMs"] = item.tracker.firstReadyAtMs;
+        entry["holdAfter"] = item.holdAfter;
+        entry["resolutionAccepted"] = item.resolutionAccepted;
+        entry["historyLogged"] = item.historyLogged;
+        entry["process"] = item.process;
+        entry["subProcess"] = item.subProcess;
+        entry["message"] = item.message;
+        entry["progress"] = item.progress;
+        entry["statusSummary"] = item.statusSummary;
+        entry["errorCode"] = item.errorCode;
+        entry["errorMessage"] = item.errorMessage;
+        entry["createdAtMs"] = item.createdAtMs;
+        entry["updatedAtMs"] = item.updatedAtMs;
+        entry["acceptedAtMs"] = item.acceptedAtMs;
+        entry["preparingAtMs"] = item.preparingAtMs;
+        entry["completedAtMs"] = item.completedAtMs;
+        entry["nextActionAtMs"] = item.nextActionAtMs;
+        entry["reconnectDelayMs"] = item.reconnectDelayMs;
+    }
+    const bool persisted = writeBrewJsonAtomically(
+        BREW_QUEUE_INDEX_PATH, document, 32 * 1024, error);
+    if (persisted) {
+        const uint32_t nowMs = millis();
+        for (size_t index = 0; index < brewQueueCount; ++index) {
+            brewQueue[index].lastPersistAtMs = nowMs;
+        }
+    }
+    return persisted;
+}
+
+bool persistBrewPayload(const BrewQueueItem& item,
+                        JsonVariantConst request,
+                        JsonObjectConst recipe,
+                        String& error) {
+    DynamicJsonDocument document(20 * 1024);
+    document["schema"] = BREW_QUEUE_SCHEMA;
+    document["id"] = item.id;
+    document["correlationId"] = item.correlationId;
+    document["serial"] = item.serial;
+    document["requestHash"] = item.requestHash;
+    document["request"].set(request);
+    if (!recipe.isNull()) document["recipe"].set(recipe);
+    return writeBrewJsonAtomically(brewPayloadPath(item.id), document, 20 * 1024, error);
+}
+
+bool loadBrewPayload(const String& id, DynamicJsonDocument& document, String& error) {
+    error = "";
+    history_storage::Guard filesystem(5000);
+    if (!filesystem) {
+        error = "filesystem is busy";
+        return false;
+    }
+    const String path = brewPayloadPath(id);
+    if (!history_storage::recoverFile(path, error)) return false;
+    File file = LittleFS.open(path, "r");
+    if (!file) {
+        error = "brew queue payload is missing";
+        return false;
+    }
+    const DeserializationError parseError = deserializeJson(document, file);
+    file.close();
+    if (parseError) {
+        error = String("invalid brew queue payload: ") + parseError.c_str();
+        return false;
+    }
+    if ((document["schema"] | 0U) != BREW_QUEUE_SCHEMA ||
+        (document["id"] | String("")) != id ||
+        !document["request"].is<JsonObjectConst>()) {
+        error = "brew queue payload does not match its index record";
+        return false;
+    }
+    String normalizedRequest;
+    if (serializeJson(document["request"], normalizedRequest) == 0 ||
+        brewRequestHash(normalizedRequest) != (document["requestHash"] | String(""))) {
+        error = "brew queue payload failed its request integrity check";
+        return false;
+    }
+    return true;
+}
+
+void notifyBrewChanged(const BrewQueueItem& item) {
+    server.notifyBrewChanged(item.id.c_str());
+    server.markStatusChanged();
+}
+
+void appendBrewQueueStatus(JsonObject target) {
+    target["capacity"] = brewQueue ? BREW_QUEUE_CAPACITY : 0;
+    if (brewQueueMutex == nullptr || !brewQueue ||
+        xSemaphoreTake(brewQueueMutex, pdMS_TO_TICKS(20)) != pdTRUE) {
+        target["busy"] = true;
+        target["recoveryBlocked"] = true;
+        target["blocked"] = true;
         return;
     }
+    target["count"] = static_cast<uint32_t>(brewQueueCount);
+    target["recoveryBlocked"] = brewQueueRecoveryBlocked;
+    target["blocked"] = brewQueueRecoveryBlocked ||
+        (brewQueueCount != 0 &&
+         ((brew_lifecycle::terminal(brewQueue[0].tracker.state) && !brewQueue[0].historyLogged) ||
+          (!brewQueue[0].resolutionAccepted &&
+           brew_lifecycle::blocksQueue(brewQueue[0].tracker.state, brewQueue[0].holdAfter))));
+    if (brewQueueCount != 0) {
+        target["headId"] = brewQueue[0].id;
+        target["headState"] = brew_lifecycle::stateName(brewQueue[0].tracker.state);
+    }
+    xSemaphoreGive(brewQueueMutex);
+}
 
-    DynamicJsonDocument request(4096);
+bool brewQueueHasUnresolved(const String& serial) {
+    if (brewQueueMutex == nullptr || !brewQueue ||
+        xSemaphoreTake(brewQueueMutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+        return true;
+    }
+    bool found = brewQueueRecoveryBlocked;
+    for (size_t index = 0; index < brewQueueCount; ++index) {
+        const BrewQueueItem& item = brewQueue[index];
+        if ((serial.isEmpty() || item.serial.equalsIgnoreCase(serial)) &&
+            (!brew_lifecycle::terminal(item.tracker.state) ||
+             (!item.resolutionAccepted &&
+              brew_lifecycle::blocksQueue(item.tracker.state, item.holdAfter)) ||
+             !item.historyLogged)) {
+            found = true;
+            break;
+        }
+    }
+    xSemaphoreGive(brewQueueMutex);
+    return found;
+}
+
+bool finalizeBrewHistoryLocked(BrewQueueItem& item, String& error) {
+    if (item.historyLogged) return true;
+    DynamicJsonDocument existing(6144);
+    if (brew_history::findNewestByStringField(
+            item.serial, "brewId", item.id, existing.to<JsonObject>(), error)) {
+        item.historyLogged = true;
+        return true;
+    }
+    if (!error.isEmpty()) return false;
+    DynamicJsonDocument payload(20 * 1024);
+    if (!loadBrewPayload(item.id, payload, error)) return false;
+    DynamicJsonDocument historyDocument(6144);
+    JsonObject entry = historyDocument.to<JsonObject>();
+    nivona::ProcessStatus status;
+    status.ok = !item.statusSummary.isEmpty();
+    status.process = item.process;
+    status.subProcess = item.subProcess;
+    status.message = item.message;
+    status.progress = item.progress;
+    status.summary = item.statusSummary;
+    nivona::annotateProcessStatus(status);
+    JsonObjectConst recipe = payload["recipe"].as<JsonObjectConst>();
+    if (recipe.isNull()) {
+        JsonObject fallback = payload.createNestedObject("recipe");
+        fallback["selector"] = payload["request"]["selector"] | 0;
+        recipe = fallback;
+    }
+    brew_history::buildAcceptedEntry(payload["request"].as<JsonVariantConst>(),
+                                     recipe,
+                                     status,
+                                     item.errorMessage,
+                                     bridge_time::snapshot(),
+                                     millis(),
+                                     entry);
+    entry["schema"] = 2;
+    entry["brewId"] = item.id;
+    entry["requestHash"] = item.requestHash;
+    entry["result"] = brew_lifecycle::stateName(item.tracker.state);
+    entry["commandAccepted"] = item.tracker.commandAccepted;
+    entry["commandMayHaveBeenSent"] = item.tracker.commandMayHaveBeenSent;
+    entry["createdAtMs"] = item.createdAtMs;
+    entry["acceptedAtMs"] = item.acceptedAtMs;
+    entry["preparingAtMs"] = item.preparingAtMs;
+    entry["completedAtMs"] = item.completedAtMs;
+    JsonObject evidence = entry.createNestedObject("completionEvidence");
+    evidence["preparationObserved"] = item.tracker.preparationObserved;
+    evidence["readyObservations"] = item.tracker.readyObservations;
+    evidence["readySeparationMs"] = BREW_READY_SEPARATION_MS;
+    if (!item.errorCode.isEmpty()) entry["errorCode"] = item.errorCode;
+    if (historyDocument.overflowed()) {
+        error = "brew history record exceeds its memory limit";
+        return false;
+    }
+    if (!brew_history::append(item.serial, entry, error)) return false;
+    item.historyLogged = true;
+    refreshCachedStorageTotals();
+    return true;
+}
+
+bool removeBrewDurablyLocked(size_t index, String& error) {
+    if (index >= brewQueueCount) {
+        error = "brew queue index is out of range";
+        return false;
+    }
+    std::unique_ptr<BrewQueueItem[]> previous = copyBrewQueueLocked();
+    if (!previous) {
+        error = "not enough memory to update the brew queue";
+        return false;
+    }
+    const size_t previousCount = brewQueueCount;
+    const String path = brewPayloadPath(brewQueue[index].id);
+    for (size_t move = index + 1; move < brewQueueCount; ++move) {
+        brewQueue[move - 1] = std::move(brewQueue[move]);
+    }
+    brewQueue[--brewQueueCount] = {};
+    if (!persistBrewQueueLocked(error)) {
+        restoreBrewQueueLocked(previous.get());
+        brewQueueCount = previousCount;
+        return false;
+    }
+    history_storage::Guard filesystem(1000);
+    if (filesystem) {
+        LittleFS.remove(path);
+        LittleFS.remove(path + ".bak");
+        LittleFS.remove(path + ".tmp");
+    }
+    return true;
+}
+
+void markHttpHistoryProgress(void*) {
+    server.markTaskProgress();
+}
+
+bool findHistoryBrew(const String& id,
+                     DynamicJsonDocument& document,
+                     String& error,
+                     bool machineRegistryAlreadyLocked) {
+    std::vector<String> serials;
+    if (!machineRegistryAlreadyLocked) {
+        if (machineMutex == nullptr ||
+            xSemaphoreTake(machineMutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+            error = "machine registry is busy";
+            return false;
+        }
+    }
+    serials.reserve(savedMachines.size());
+    for (const SavedMachine& machine : savedMachines) serials.push_back(machine.serial);
+    if (!machineRegistryAlreadyLocked) xSemaphoreGive(machineMutex);
+
+    for (const String& serial : serials) {
+        document.clear();
+        JsonObject entry = document.to<JsonObject>();
+        if (brew_history::findNewestByStringField(
+                serial, "brewId", id, entry, error,
+                machineRegistryAlreadyLocked ? markHttpHistoryProgress : nullptr)) {
+            return true;
+        }
+        if (!error.isEmpty()) return false;
+    }
+    return false;
+}
+
+void appendHistoricalBrewJson(JsonObject target, JsonObjectConst entry) {
+    target.set(entry);
+    target["id"] = entry["brewId"] | "";
+    target["state"] = entry["result"] | "unknown";
+    target["commandAccepted"] = entry["commandAccepted"] | false;
+    target["commandMayHaveBeenSent"] = entry["commandMayHaveBeenSent"] | false;
+    target["terminal"] = true;
+    target["blocked"] = false;
+    const String id = entry["brewId"] | "";
+    if (!id.isEmpty()) target["statusUrl"] = String("/api/brews/") + id;
+}
+
+void loadBrewQueue() {
+    brewQueueRecoveryBlocked = !littleFsReady || !brewQueue;
+    if (!littleFsReady || brewQueueMutex == nullptr || !brewQueue) return;
+    String error;
+    DynamicJsonDocument document(24 * 1024);
+    {
+        history_storage::Guard filesystem(5000);
+        if (!filesystem) {
+            brewQueueRecoveryBlocked = true;
+            lastError = "filesystem is busy while recovering the brew queue";
+            return;
+        }
+        if (!history_storage::recoverFile(BREW_QUEUE_INDEX_PATH, error)) {
+            brewQueueRecoveryBlocked = true;
+            lastError = error;
+            return;
+        }
+        if (!LittleFS.exists(BREW_QUEUE_INDEX_PATH)) return;
+        File file = LittleFS.open(BREW_QUEUE_INDEX_PATH, "r");
+        if (!file) {
+            brewQueueRecoveryBlocked = true;
+            lastError = "failed to open the brew queue index";
+            return;
+        }
+        const DeserializationError parseError = deserializeJson(document, file);
+        file.close();
+        if (parseError) {
+            brewQueueRecoveryBlocked = true;
+            lastError = String("invalid brew queue index: ") + parseError.c_str();
+            return;
+        }
+    }
+    if ((document["schema"] | 0U) != BREW_QUEUE_SCHEMA ||
+        !document["items"].is<JsonArrayConst>() ||
+        document["items"].size() > BREW_QUEUE_CAPACITY) {
+        brewQueueRecoveryBlocked = true;
+        lastError = "unsupported or oversized brew queue index";
+        return;
+    }
+    xSemaphoreTake(brewQueueMutex, portMAX_DELAY);
+    brewQueueCount = 0;
+    nextBrewCounter = document["nextCounter"] | 1U;
+    bool malformed = false;
+    for (JsonObjectConst entry : document["items"].as<JsonArrayConst>()) {
+        BrewQueueItem item;
+        item.id = entry["id"] | "";
+        item.correlationId = entry["correlationId"] | "";
+        item.serial = entry["serial"] | "";
+        item.requestHash = entry["requestHash"] | "";
+        if (!validBrewId(item.id) || item.serial.isEmpty() || item.serial.length() > 64 ||
+            !validCorrelationId(item.correlationId) || item.requestHash.length() != 64 ||
+            !brew_lifecycle::parseState(entry["state"] | "", item.tracker.state)) {
+            malformed = true;
+            break;
+        }
+        item.tracker.commandMayHaveBeenSent = entry["commandMayHaveBeenSent"] | false;
+        item.tracker.commandAccepted = entry["commandAccepted"] | false;
+        item.tracker.preparationObserved = entry["preparationObserved"] | false;
+        item.tracker.ambiguousStatusObserved = entry["ambiguousStatusObserved"] | false;
+        item.tracker.attentionInterrupted = entry["attentionInterrupted"] | false;
+        item.tracker.readyObservations = entry["readyObservations"] | 0;
+        item.tracker.firstReadyAtMs = entry["firstReadyAtMs"] | 0U;
+        item.holdAfter = entry["holdAfter"] | false;
+        item.resolutionAccepted = entry["resolutionAccepted"] | false;
+        item.historyLogged = entry["historyLogged"] | false;
+        item.process = entry["process"] | 0;
+        item.subProcess = entry["subProcess"] | 0;
+        item.message = entry["message"] | 0;
+        item.progress = entry["progress"] | 0;
+        item.statusSummary = entry["statusSummary"] | "";
+        item.errorCode = entry["errorCode"] | "";
+        item.errorMessage = entry["errorMessage"] | "";
+        item.createdAtMs = entry["createdAtMs"] | 0U;
+        item.updatedAtMs = millis();
+        item.acceptedAtMs = entry["acceptedAtMs"] | 0U;
+        item.preparingAtMs = entry["preparingAtMs"] | 0U;
+        item.completedAtMs = entry["completedAtMs"] | 0U;
+        item.nextActionAtMs = 0;
+        item.reconnectDelayMs = 1000;
+        const brew_lifecycle::State recovered = brew_lifecycle::recoverAfterRestart(item.tracker);
+        if (recovered != item.tracker.state) {
+            item.tracker.state = recovered;
+            if (recovered == brew_lifecycle::State::Unknown) {
+                item.errorCode = "bridge_restarted";
+                item.errorMessage = "bridge restarted after the command may have been delivered";
+            }
+        }
+        DynamicJsonDocument payload(20 * 1024);
+        String payloadError;
+        if (!item.historyLogged) {
+            const bool payloadLoaded = loadBrewPayload(item.id, payload, payloadError);
+            const bool payloadMatches = payloadLoaded &&
+                (payload["serial"] | String("")) == item.serial &&
+                (payload["correlationId"] | String("")) == item.correlationId &&
+                (payload["requestHash"] | String("")) == item.requestHash;
+            if (!payloadMatches) {
+                item.tracker.state = item.tracker.commandMayHaveBeenSent
+                    ? brew_lifecycle::State::Unknown : brew_lifecycle::State::Failed;
+                item.errorCode = "queue_payload_unavailable";
+                item.errorMessage = payloadLoaded
+                    ? String("brew queue payload does not match its index metadata")
+                    : payloadError;
+            }
+        }
+        brewQueue[brewQueueCount++] = std::move(item);
+    }
+    if (malformed) {
+        brewQueueCount = 0;
+        brewQueueRecoveryBlocked = true;
+        lastError = "malformed brew queue index; automatic dispatch is disabled";
+    } else if (!persistBrewQueueLocked(error)) {
+        brewQueueRecoveryBlocked = true;
+        if (!error.isEmpty()) lastError = error;
+    }
+    xSemaphoreGive(brewQueueMutex);
+}
+
+void handleBrewQueueList() {
+    DynamicJsonDocument response(24 * 1024);
+    response["ok"] = true;
+    response["capacity"] = BREW_QUEUE_CAPACITY;
+    JsonArray items = response.createNestedArray("brews");
+    if (brewQueueMutex == nullptr || !brewQueue ||
+        xSemaphoreTake(brewQueueMutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+        sendError(503, "brew queue is busy");
+        return;
+    }
+    response["count"] = static_cast<uint32_t>(brewQueueCount);
+    response["recoveryBlocked"] = brewQueueRecoveryBlocked;
+    for (size_t index = 0; index < brewQueueCount; ++index) {
+        appendBrewJson(items.createNestedObject(), brewQueue[index], index + 1);
+    }
+    xSemaphoreGive(brewQueueMutex);
+    sendJson(response);
+}
+
+void handleBrewGet(const String& id) {
+    DynamicJsonDocument response(8192);
+    response["ok"] = true;
+    if (brewQueueMutex == nullptr || !brewQueue ||
+        xSemaphoreTake(brewQueueMutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+        sendError(503, "brew queue is busy");
+        return;
+    }
+    const int index = findQueuedBrewLocked(id);
+    if (index >= 0) {
+        appendBrewJson(response.createNestedObject("brew"), brewQueue[index], index + 1);
+    }
+    xSemaphoreGive(brewQueueMutex);
+    if (index >= 0) {
+        sendJson(response);
+        return;
+    }
+    String error;
+    DynamicJsonDocument history(6144);
+    if (findHistoryBrew(id, history, error, true)) {
+        appendHistoricalBrewJson(response.createNestedObject("brew"),
+                                 history.as<JsonObjectConst>());
+        sendJson(response);
+    } else if (!error.isEmpty()) {
+        sendError(503, error);
+    } else {
+        sendError(404, "brew not found");
+    }
+}
+
+void handleBrewDelete(const String& id) {
+    if (brewQueueMutex == nullptr || !brewQueue ||
+        xSemaphoreTake(brewQueueMutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+        sendError(503, "brew queue is busy");
+        return;
+    }
+    const int index = findQueuedBrewLocked(id);
+    if (index < 0) {
+        xSemaphoreGive(brewQueueMutex);
+        sendError(404, "brew not found in the active queue");
+        return;
+    }
+    BrewQueueItem& item = brewQueue[index];
+    const BrewQueueItem previous = item;
+    if (!brew_lifecycle::safelyCancellable(item.tracker)) {
+        DynamicJsonDocument response(4096);
+        response["ok"] = false;
+        response["code"] = "brew_may_have_started";
+        response["error"] = "only a brew that has definitely not been sent can be cancelled";
+        appendBrewJson(response.createNestedObject("brew"), item, index + 1);
+        xSemaphoreGive(brewQueueMutex);
+        sendJson(response, 409);
+        return;
+    }
+    item.tracker.state = brew_lifecycle::State::Cancelled;
+    item.errorCode = "cancelled_by_user";
+    item.errorMessage = "brew was cancelled before dispatch";
+    item.updatedAtMs = millis();
+    item.nextActionAtMs = millis();
+    String error;
+    const bool persisted = persistBrewQueueLocked(error);
+    const BrewQueueItem snapshot = item;
+    if (!persisted) item = previous;
+    xSemaphoreGive(brewQueueMutex);
+    if (!persisted) {
+        sendError(507, error);
+        return;
+    }
+    notifyBrewChanged(snapshot);
+    DynamicJsonDocument response(4096);
+    response["ok"] = true;
+    appendBrewJson(response.createNestedObject("brew"), snapshot, index + 1);
+    sendJson(response);
+}
+
+void handleBrewQueueCancelUnsent() {
+    if (brewQueueMutex == nullptr || !brewQueue ||
+        xSemaphoreTake(brewQueueMutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+        sendError(503, "brew queue is busy");
+        return;
+    }
+    size_t cancelled = 0;
+    std::unique_ptr<BrewQueueItem[]> previous = copyBrewQueueLocked();
+    if (!previous) {
+        xSemaphoreGive(brewQueueMutex);
+        sendError(503, "not enough memory to update the brew queue");
+        return;
+    }
+    std::array<size_t, BREW_QUEUE_CAPACITY> changedIndices{};
+    for (size_t reverse = brewQueueCount; reverse > 0; --reverse) {
+        BrewQueueItem& item = brewQueue[reverse - 1];
+        if (!brew_lifecycle::safelyCancellable(item.tracker)) continue;
+        item.tracker.state = brew_lifecycle::State::Cancelled;
+        item.errorCode = "cancelled_by_user";
+        item.errorMessage = "brew was cancelled before dispatch";
+        item.updatedAtMs = millis();
+        item.nextActionAtMs = millis();
+        changedIndices[cancelled++] = reverse - 1;
+    }
+    String error;
+    const bool persisted = persistBrewQueueLocked(error);
+    if (!persisted) {
+        restoreBrewQueueLocked(previous.get());
+    } else {
+        for (size_t index = 0; index < cancelled; ++index) {
+            notifyBrewChanged(brewQueue[changedIndices[index]]);
+        }
+    }
+    xSemaphoreGive(brewQueueMutex);
+    if (!persisted) {
+        sendError(507, error);
+        return;
+    }
+    DynamicJsonDocument response(512);
+    response["ok"] = true;
+    response["cancelled"] = static_cast<uint32_t>(cancelled);
+    sendJson(response);
+}
+
+void handleBrewResolve(const String& id) {
+    DynamicJsonDocument request(1024);
     String error;
     if (!parseJsonBody(request, error)) {
         sendError(400, error);
         return;
     }
-    const int selector = request["selector"] | -1;
-    if (selector < 0) {
-        sendError(400, "selector is required");
+    const String action = request["action"] | "";
+    const bool acknowledgeRisk = request["acknowledgeRisk"] | false;
+    if (brewQueueMutex == nullptr || !brewQueue ||
+        xSemaphoreTake(brewQueueMutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+        sendError(503, "brew queue is busy");
+        return;
+    }
+    const int index = findQueuedBrewLocked(id);
+    if (index < 0) {
+        xSemaphoreGive(brewQueueMutex);
+        sendError(404, "brew not found in the active queue");
+        return;
+    }
+    std::unique_ptr<BrewQueueItem[]> previous = copyBrewQueueLocked();
+    if (!previous) {
+        xSemaphoreGive(brewQueueMutex);
+        sendError(503, "not enough memory to update the brew queue");
+        return;
+    }
+    BrewQueueItem& item = brewQueue[index];
+    if (action == "abandon") {
+        if (brew_lifecycle::terminal(item.tracker.state) || !item.tracker.commandMayHaveBeenSent) {
+            xSemaphoreGive(brewQueueMutex);
+            sendError(409, "only a nonterminal possibly delivered brew can be abandoned");
+            return;
+        }
+        item.tracker.state = brew_lifecycle::State::Unknown;
+        item.errorCode = "abandoned_by_user";
+        item.errorMessage = "completion was not verified; manual acknowledgement is required";
+        item.updatedAtMs = millis();
+    } else if (action == "continue") {
+        if (!brew_lifecycle::terminal(item.tracker.state)) {
+            xSemaphoreGive(brewQueueMutex);
+            sendError(409, "brew is not in a terminal state");
+            return;
+        }
+        const bool risky = item.tracker.state == brew_lifecycle::State::Failed ||
+            item.tracker.state == brew_lifecycle::State::Interrupted ||
+            item.tracker.state == brew_lifecycle::State::Unknown;
+        if (risky && !acknowledgeRisk) {
+            xSemaphoreGive(brewQueueMutex);
+            DynamicJsonDocument response(512);
+            response["ok"] = false;
+            response["code"] = "risk_acknowledgement_required";
+            response["error"] = "set acknowledgeRisk to true before advancing past an unverified outcome";
+            sendJson(response, 409);
+            return;
+        }
+        item.resolutionAccepted = true;
+        item.holdAfter = false;
+        item.nextActionAtMs = millis();
+        item.updatedAtMs = millis();
+    } else if (action == "cancel_remaining") {
+        if (index != 0) {
+            xSemaphoreGive(brewQueueMutex);
+            sendError(409, "cancel_remaining must target the queue head");
+            return;
+        }
+        for (size_t tail = 1; tail < brewQueueCount; ++tail) {
+            BrewQueueItem& queued = brewQueue[tail];
+            if (brew_lifecycle::safelyCancellable(queued.tracker)) {
+                queued.tracker.state = brew_lifecycle::State::Cancelled;
+                queued.errorCode = "cancelled_by_user";
+                queued.errorMessage = "cancelled after an earlier brew outcome";
+                queued.updatedAtMs = millis();
+            }
+        }
+    } else {
+        xSemaphoreGive(brewQueueMutex);
+        sendError(400, "action must be abandon, continue, or cancel_remaining");
+        return;
+    }
+    if (!persistBrewQueueLocked(error)) {
+        restoreBrewQueueLocked(previous.get());
+        xSemaphoreGive(brewQueueMutex);
+        sendError(507, error);
+        return;
+    }
+    const BrewQueueItem snapshot = item;
+    xSemaphoreGive(brewQueueMutex);
+    notifyBrewChanged(snapshot);
+    DynamicJsonDocument response(4096);
+    response["ok"] = true;
+    appendBrewJson(response.createNestedObject("brew"), snapshot, index + 1);
+    sendJson(response);
+}
+
+void handleBrewEnqueue(const String& serial) {
+    SavedMachine* machine = findSavedMachineBySerial(serial);
+    if (machine == nullptr) {
+        sendError(404, "saved machine not found");
+        return;
+    }
+    if (!littleFsReady) {
+        sendError(507, "durable brew queue storage is unavailable");
+        return;
+    }
+    if (!brewQueue || brewQueueMutex == nullptr) {
+        sendError(503, "durable brew queue memory is unavailable");
+        return;
+    }
+    DynamicJsonDocument request(8192);
+    String error;
+    if (!parseJsonBody(request, error)) {
+        sendError(400, error);
+        return;
+    }
+    if (!request["selector"].is<int>()) {
+        sendError(400, "selector must be an integer");
+        return;
+    }
+    const int selector = request["selector"].as<int>();
+    if (selector < 0 || selector > 255) {
+        sendError(400, "selector must be between 0 and 255");
+        return;
+    }
+    if (!request["correlationId"].is<const char*>()) {
+        sendError(400, "correlationId must be a string");
+        return;
+    }
+    const String correlationId = request["correlationId"].as<String>();
+    if (!validCorrelationId(correlationId)) {
+        sendError(400, "correlationId must contain 1 to 64 printable non-space ASCII characters");
+        return;
+    }
+    if (request.containsKey("holdAfter") && !request["holdAfter"].is<bool>()) {
+        sendError(400, "holdAfter must be a boolean");
+        return;
+    }
+    request["correlationId"] = correlationId;
+    canonicalizeBrewRequest(request);
+    if (request.overflowed()) {
+        sendError(413, "brew request exceeds its normalized memory limit");
+        return;
+    }
+    String normalized;
+    serializeJson(request, normalized);
+    const String requestHash = brewRequestHash(normalized);
+    if (requestHash.isEmpty()) {
+        sendError(500, "failed to fingerprint the brew request");
         return;
     }
 
-    if (!beginMachineProtocolSession(*machine, error)) {
-        lastError = error;
-        sendError(500, error);
+    xSemaphoreTake(brewQueueMutex, portMAX_DELAY);
+    if (brewQueueRecoveryBlocked) {
+        xSemaphoreGive(brewQueueMutex);
+        DynamicJsonDocument response(512);
+        response["ok"] = false;
+        response["code"] = "brew_queue_recovery_required";
+        response["error"] = "brew queue recovery failed; automatic dispatch is disabled";
+        sendJson(response, 503);
         return;
     }
-    if (!ensureMachineHuSession(2500, error)) {
-        lastError = error;
-        sendError(500, error);
+    const int duplicate = findCorrelationLocked(correlationId);
+    if (duplicate >= 0) {
+        DynamicJsonDocument response(4096);
+        const bool same = brewQueue[duplicate].serial.equalsIgnoreCase(machine->serial) &&
+            brewQueue[duplicate].requestHash == requestHash;
+        response["ok"] = same;
+        response["deduplicated"] = same;
+        if (!same) {
+            response["code"] = "correlation_conflict";
+            response["error"] = "correlationId already identifies a different brew request";
+        }
+        appendBrewJson(response.createNestedObject("brew"), brewQueue[duplicate], duplicate + 1);
+        xSemaphoreGive(brewQueueMutex);
+        sendJson(response, same ? 200 : 409);
+        return;
+    }
+    DynamicJsonDocument historical(6144);
+    String historicalSerial;
+    bool historicalFound = false;
+    for (const SavedMachine& candidate : savedMachines) {
+        historical.clear();
+        if (brew_history::findNewestByStringField(candidate.serial,
+                                                  "correlationId",
+                                                  correlationId,
+                                                  historical.to<JsonObject>(),
+                                                  error,
+                                                  markHttpHistoryProgress)) {
+            historicalFound = true;
+            historicalSerial = candidate.serial;
+            break;
+        }
+        if (!error.isEmpty()) break;
+    }
+    if (historicalFound) {
+        const bool same = historicalSerial.equalsIgnoreCase(machine->serial) &&
+            (historical["requestHash"] | String("")) == requestHash;
+        DynamicJsonDocument response(7168);
+        response["ok"] = same;
+        response["deduplicated"] = same;
+        if (!same) {
+            response["code"] = "correlation_conflict";
+            response["error"] = "correlationId already identifies a different brew request";
+        }
+        appendHistoricalBrewJson(response.createNestedObject("brew"),
+                                 historical.as<JsonObjectConst>());
+        xSemaphoreGive(brewQueueMutex);
+        sendJson(response, same ? 200 : 409);
+        return;
+    }
+    if (!error.isEmpty()) {
+        xSemaphoreGive(brewQueueMutex);
+        sendError(503, error);
+        return;
+    }
+    if (brewQueueCount == BREW_QUEUE_CAPACITY) {
+        xSemaphoreGive(brewQueueMutex);
+        DynamicJsonDocument response(512);
+        response["ok"] = false;
+        response["code"] = "brew_queue_full";
+        response["error"] = "brew queue is full";
+        sendJson(response, 409);
+        return;
+    }
+    BrewQueueItem item;
+    char id[32];
+    std::snprintf(id, sizeof(id), "brew-%08lx-%lu",
+                  static_cast<unsigned long>(bootNonce),
+                  static_cast<unsigned long>(nextBrewCounter++));
+    item.id = id;
+    item.correlationId = correlationId;
+    item.serial = machine->serial;
+    item.requestHash = requestHash;
+    item.holdAfter = request["holdAfter"] | false;
+    item.createdAtMs = millis();
+    item.updatedAtMs = item.createdAtMs;
+    if (!persistBrewPayload(item, request.as<JsonVariantConst>(), JsonObjectConst(), error)) {
+        xSemaphoreGive(brewQueueMutex);
+        sendError(507, error);
+        return;
+    }
+    brewQueue[brewQueueCount++] = item;
+    if (!persistBrewQueueLocked(error)) {
+        brewQueue[--brewQueueCount] = {};
+        history_storage::Guard filesystem(1000);
+        if (filesystem) LittleFS.remove(brewPayloadPath(item.id));
+        xSemaphoreGive(brewQueueMutex);
+        sendError(507, error);
+        return;
+    }
+    const size_t position = brewQueueCount;
+    xSemaphoreGive(brewQueueMutex);
+    notifyBrewChanged(item);
+    DynamicJsonDocument response(4096);
+    response["ok"] = true;
+    appendBrewJson(response.createNestedObject("brew"), item, position);
+    const String location = String("/api/brews/") + item.id;
+    server.sendHeader("Location", location);
+    server.sendHeader("Retry-After", "1");
+    sendJson(response, 202);
+}
+
+bool updateBrewFailure(const String& id,
+                       brew_lifecycle::State state,
+                       const String& code,
+                       const String& message,
+                       uint32_t nextActionAtMs = 0) {
+    if (brewQueueMutex == nullptr || xSemaphoreTake(brewQueueMutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
+        return false;
+    }
+    const int index = findQueuedBrewLocked(id);
+    if (index < 0) {
+        xSemaphoreGive(brewQueueMutex);
+        return false;
+    }
+    BrewQueueItem& item = brewQueue[index];
+    if (brew_lifecycle::terminal(item.tracker.state)) {
+        xSemaphoreGive(brewQueueMutex);
+        return true;
+    }
+    item.tracker.state = state;
+    item.errorCode = code;
+    item.errorMessage = message;
+    item.updatedAtMs = millis();
+    item.nextActionAtMs = nextActionAtMs;
+    String persistenceError;
+    const bool persisted = persistBrewQueueLocked(persistenceError);
+    const BrewQueueItem snapshot = item;
+    xSemaphoreGive(brewQueueMutex);
+    if (!persisted) lastError = persistenceError;
+    notifyBrewChanged(snapshot);
+    return persisted;
+}
+
+bool updateBrewWaitingStatus(const String& id,
+                             const nivona::ProcessStatus& status,
+                             const String& code,
+                             const String& message,
+                             uint32_t nextActionAtMs) {
+    if (brewQueueMutex == nullptr ||
+        xSemaphoreTake(brewQueueMutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
+        return false;
+    }
+    const int index = findQueuedBrewLocked(id);
+    if (index < 0 || brew_lifecycle::terminal(brewQueue[index].tracker.state)) {
+        xSemaphoreGive(brewQueueMutex);
+        return index >= 0;
+    }
+    BrewQueueItem& item = brewQueue[index];
+    item.tracker.state = brew_lifecycle::State::WaitingForMachine;
+    item.process = status.process;
+    item.subProcess = status.subProcess;
+    item.message = status.message;
+    item.progress = status.progress;
+    item.statusSummary = status.summary;
+    item.errorCode = code;
+    item.errorMessage = message;
+    item.updatedAtMs = millis();
+    item.nextActionAtMs = nextActionAtMs;
+    String persistenceError;
+    const bool persisted = persistBrewQueueLocked(persistenceError);
+    const BrewQueueItem snapshot = item;
+    xSemaphoreGive(brewQueueMutex);
+    if (!persisted) lastError = persistenceError;
+    notifyBrewChanged(snapshot);
+    return persisted;
+}
+
+void handleBrewQueueDispatch(const String& serial, const String& brewId) {
+    SavedMachine* machine = findSavedMachineBySerial(serial);
+    if (machine == nullptr) {
+        updateBrewFailure(brewId, brew_lifecycle::State::Failed,
+                          "machine_missing", "saved machine no longer exists");
+        DynamicJsonDocument response(256);
+        response["ok"] = true;
+        sendJson(response);
+        return;
+    }
+
+    DynamicJsonDocument payload(20 * 1024);
+    String error;
+    if (!loadBrewPayload(brewId, payload, error)) {
+        updateBrewFailure(brewId, brew_lifecycle::State::Failed,
+                          "queue_payload_unavailable", error);
+        DynamicJsonDocument response(256);
+        response["ok"] = true;
+        sendJson(response);
+        return;
+    }
+    DynamicJsonDocument request(8192);
+    request.set(payload["request"]);
+    if (request.overflowed()) {
+        updateBrewFailure(brewId, brew_lifecycle::State::Failed,
+                          "queue_payload_invalid", "brew request exceeds its memory limit");
+        DynamicJsonDocument response(256);
+        response["ok"] = true;
+        sendJson(response);
+        return;
+    }
+    const int selector = request["selector"] | -1;
+
+    if (brewQueueMutex == nullptr || xSemaphoreTake(brewQueueMutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
+        sendError(503, "brew queue is busy");
+        return;
+    }
+    const int queueIndex = findQueuedBrewLocked(brewId);
+    if (queueIndex != 0 ||
+        !brew_lifecycle::shouldDispatch(brewQueue[queueIndex].tracker)) {
+        xSemaphoreGive(brewQueueMutex);
+        DynamicJsonDocument response(256);
+        response["ok"] = true;
+        response["skipped"] = true;
+        sendJson(response);
+        return;
+    }
+    brewQueue[0].tracker.state = brew_lifecycle::State::Dispatching;
+    brewQueue[0].updatedAtMs = millis();
+    brewQueue[0].errorCode = "";
+    brewQueue[0].errorMessage = "";
+    if (!persistBrewQueueLocked(error)) {
+        brewQueue[0].tracker.state = brew_lifecycle::State::Failed;
+        brewQueue[0].errorCode = "queue_persistence_failed";
+        brewQueue[0].errorMessage = error;
+        xSemaphoreGive(brewQueueMutex);
+        sendError(507, error);
+        return;
+    }
+    BrewQueueItem dispatchingSnapshot = brewQueue[0];
+    xSemaphoreGive(brewQueueMutex);
+    notifyBrewChanged(dispatchingSnapshot);
+
+    if (!beginMachineProtocolSession(*machine, error) || !ensureMachineHuSession(2500, error)) {
+        const uint32_t nowMs = millis();
+        uint32_t retryMs = 1000;
+        if (xSemaphoreTake(brewQueueMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+            const int index = findQueuedBrewLocked(brewId);
+            if (index >= 0) {
+                retryMs = brewQueue[index].reconnectDelayMs;
+                brewQueue[index].reconnectDelayMs =
+                    std::min<uint32_t>(BREW_RECONNECT_MAX_MS, retryMs * 2U);
+            }
+            xSemaphoreGive(brewQueueMutex);
+        }
+        updateBrewFailure(brewId, brew_lifecycle::State::WaitingForMachine,
+                          "machine_offline", error, nowMs + retryMs);
+        DynamicJsonDocument response(256);
+        response["ok"] = true;
+        response["waitingForMachine"] = true;
+        sendJson(response);
         return;
     }
     noteWorkerProgress(20);
 
+    nivona::ProcessStatus preflightStatus;
+    if (!readMachineProcessStatus(preflightStatus, error)) {
+        updateBrewFailure(brewId, brew_lifecycle::State::WaitingForMachine,
+                          "status_unavailable", error, millis() + BREW_ATTENTION_POLL_MS);
+        DynamicJsonDocument response(256);
+        response["ok"] = true;
+        response["waitingForMachine"] = true;
+        sendJson(response);
+        return;
+    }
+    const brew_lifecycle::Observation preflightObservation =
+        brew_lifecycle::classifyStatus(preflightStatus.process, preflightStatus.message);
+    if (preflightObservation != brew_lifecycle::Observation::Ready) {
+        const bool attention = preflightObservation == brew_lifecycle::Observation::KnownAttention ||
+            preflightObservation == brew_lifecycle::Observation::UnknownAttention;
+        updateBrewWaitingStatus(
+            brewId,
+            preflightStatus,
+            attention ? String("machine_attention") : String("machine_busy"),
+            attention
+                ? String("machine needs attention before this brew can start")
+                : String("machine is not ready for the next brew"),
+            millis() + BREW_ATTENTION_POLL_MS);
+        DynamicJsonDocument response(256);
+        response["ok"] = true;
+        response["waitingForMachine"] = true;
+        sendJson(response);
+        return;
+    }
+
     const nivona::ModelInfo modelInfo = nivona::detectModelInfo(toNivonaDetails(*machine));
     nivona::StandardRecipeLayout layout;
     if (!nivona::resolveStandardRecipeLayout(modelInfo, layout)) {
-        sendError(400, "standard recipe overrides are not supported for this machine");
+        updateBrewFailure(brewId, brew_lifecycle::State::Failed,
+                          "unsupported_recipe", "standard recipe overrides are not supported for this machine");
+        DynamicJsonDocument response(256);
+        response["ok"] = true;
+        sendJson(response);
         return;
     }
 
-    DynamicJsonDocument recipeDoc(12288);
-    JsonObject recipe = recipeDoc.createNestedObject("recipe");
-    if (!appendStandardRecipe(recipe, *machine, static_cast<uint8_t>(selector), true, error)) {
-        lastError = error;
-        sendError(500, error);
-        return;
-    }
-    if (!applyStandardRecipeOverrides(recipe, request.as<JsonVariantConst>(), modelInfo, layout, error)) {
-        sendError(400, error);
+    DynamicJsonDocument recipeDocument(12288);
+    JsonObject recipe = recipeDocument.createNestedObject("recipe");
+    if (!appendStandardRecipe(recipe, *machine, static_cast<uint8_t>(selector), true, error) ||
+        !applyStandardRecipeOverrides(recipe, request.as<JsonVariantConst>(), modelInfo, layout, error) ||
+        recipeDocument.overflowed()) {
+        if (error.isEmpty()) error = "applied recipe exceeds its memory limit";
+        updateBrewFailure(brewId, brew_lifecycle::State::Failed,
+                          "invalid_recipe", error);
+        DynamicJsonDocument response(256);
+        response["ok"] = true;
+        sendJson(response);
         return;
     }
     noteWorkerProgress(50);
-    JsonObjectConst recipeView = recipe;
 
-    if (littleFsReady) {
-        DynamicJsonDocument historyPreflightDoc(3072);
-        JsonObject historyPreflightEntry = historyPreflightDoc.to<JsonObject>();
-        brew_history::buildAcceptedEntry(request.as<JsonVariantConst>(),
-                                         recipeView,
-                                         nivona::ProcessStatus{},
-                                         "",
-                                         bridge_time::snapshot(),
-                                         millis(),
-                                         historyPreflightEntry);
-        brew_history::CapacityCheck capacity;
-        if (!brew_history::canAppendWithoutCompaction(machine->serial,
-                                                      historyPreflightEntry,
-                                                      BREW_HISTORY_PRECHECK_RESERVE_BYTES,
-                                                      capacity,
-                                                      error)) {
-            if (error.isEmpty()) {
-                DynamicJsonDocument response(8192);
-                response["ok"] = false;
-                response["error"] = "brew history storage is full; clear or export history before brewing again";
-                response["historyStorageRejected"] = true;
-                response["historyFileBytes"] = capacity.fileBytes;
-                response["historyEntryBytes"] = capacity.entryBytes;
-                response["historyReserveBytes"] = capacity.reserveBytes;
-                response["historyProjectedBytes"] = capacity.projectedBytes;
-                response["historyMaxBytes"] = capacity.maxBytes;
-                appendStatus(response);
-                sendJson(response, 507);
-                return;
-            }
-            lastError = error;
-            sendError(500, error);
-            return;
-        }
+    DynamicJsonDocument historyPreflightDocument(6144);
+    JsonObject historyPreflight = historyPreflightDocument.to<JsonObject>();
+    brew_history::buildAcceptedEntry(request.as<JsonVariantConst>(), recipe,
+                                     nivona::ProcessStatus{}, "",
+                                     bridge_time::snapshot(), millis(), historyPreflight);
+    historyPreflight["schema"] = 2;
+    historyPreflight["brewId"] = brewId;
+    historyPreflight["requestHash"] = payload["requestHash"] | "";
+    historyPreflight["result"] = "completed";
+    JsonObject evidence = historyPreflight.createNestedObject("completionEvidence");
+    evidence["preparationObserved"] = true;
+    evidence["readyObservations"] = 2;
+    evidence["readySeparationMs"] = BREW_READY_SEPARATION_MS;
+    if (historyPreflightDocument.overflowed()) {
+        updateBrewFailure(brewId, brew_lifecycle::State::Failed,
+                          "history_record_too_large",
+                          "brew history record exceeds its memory limit");
+        DynamicJsonDocument response(256);
+        response["ok"] = true;
+        sendJson(response);
+        return;
+    }
+    brew_history::CapacityCheck capacity;
+    if (!brew_history::canAppendWithoutCompaction(machine->serial,
+                                                  historyPreflight,
+                                                  BREW_HISTORY_PRECHECK_RESERVE_BYTES,
+                                                  capacity,
+                                                  error)) {
+        if (error.isEmpty()) error = "brew history storage is full";
+        updateBrewFailure(brewId, brew_lifecycle::State::Failed,
+                          "history_storage_full", error);
+        DynamicJsonDocument response(256);
+        response["ok"] = true;
+        sendJson(response);
+        return;
     }
 
-    if (!uploadTemporaryStandardRecipe(layout, recipeView, static_cast<uint8_t>(selector), error)) {
-        lastError = error;
-        sendError(500, error);
+    BrewQueueItem payloadItem;
+    if (xSemaphoreTake(brewQueueMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+        const int index = findQueuedBrewLocked(brewId);
+        if (index >= 0) payloadItem = brewQueue[index];
+        xSemaphoreGive(brewQueueMutex);
+    }
+    if (payloadItem.id.isEmpty() ||
+        !persistBrewPayload(payloadItem, request.as<JsonVariantConst>(), recipe, error) ||
+        !uploadTemporaryStandardRecipe(layout, recipe, static_cast<uint8_t>(selector), error)) {
+        updateBrewFailure(brewId, brew_lifecycle::State::Failed,
+                          "brew_preflight_failed", error);
+        DynamicJsonDocument response(256);
+        response["ok"] = true;
+        sendJson(response);
         return;
     }
     noteWorkerProgress(75);
 
-    const ByteVector* sessionKey = resolveStoredSessionIfAvailable();
-    bool brewCommandSent = false;
-    {
-        WorkerMutationWriteScope mutationWrite;
-        brewCommandSent = sendMachineCommand(
-            "HE",
-            nivona::buildHeMakeCoffeePayload(modelInfo, static_cast<uint8_t>(selector)),
-            sessionKey,
-            true,
-            error);
-    }
-    if (!brewCommandSent) {
-        lastError = error;
-        sendError(500, error);
+    nivona::ProcessStatus finalReadyStatus;
+    if (!readMachineProcessStatus(finalReadyStatus, error)) {
+        updateBrewFailure(brewId, brew_lifecycle::State::WaitingForMachine,
+                          "status_unavailable", error, millis() + BREW_ATTENTION_POLL_MS);
+        DynamicJsonDocument response(256);
+        response["ok"] = true;
+        response["waitingForMachine"] = true;
+        sendJson(response);
         return;
     }
+    const brew_lifecycle::Observation finalReadyObservation =
+        brew_lifecycle::classifyStatus(finalReadyStatus.process, finalReadyStatus.message);
+    if (finalReadyObservation != brew_lifecycle::Observation::Ready) {
+        const bool attention = finalReadyObservation == brew_lifecycle::Observation::KnownAttention ||
+            finalReadyObservation == brew_lifecycle::Observation::UnknownAttention;
+        updateBrewWaitingStatus(
+            brewId,
+            finalReadyStatus,
+            attention ? String("machine_attention") : String("machine_busy"),
+            attention
+                ? String("machine needs attention before this brew can start")
+                : String("machine stopped being ready before command dispatch"),
+            millis() + BREW_ATTENTION_POLL_MS);
+        DynamicJsonDocument response(256);
+        response["ok"] = true;
+        response["waitingForMachine"] = true;
+        sendJson(response);
+        return;
+    }
+
+    if (xSemaphoreTake(brewQueueMutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
+        sendError(503, "brew queue is busy");
+        return;
+    }
+    const int beforeSendIndex = findQueuedBrewLocked(brewId);
+    if (beforeSendIndex < 0 ||
+        brew_lifecycle::terminal(brewQueue[beforeSendIndex].tracker.state)) {
+        xSemaphoreGive(brewQueueMutex);
+        DynamicJsonDocument response(256);
+        response["ok"] = true;
+        response["skipped"] = true;
+        sendJson(response);
+        return;
+    }
+    brew_lifecycle::noteCommandMayBeSent(brewQueue[beforeSendIndex].tracker);
+    brewQueue[beforeSendIndex].updatedAtMs = millis();
+    const bool maySendPersisted = persistBrewQueueLocked(error);
+    BrewQueueItem maySendSnapshot = brewQueue[beforeSendIndex];
+    xSemaphoreGive(brewQueueMutex);
+    if (!maySendPersisted) {
+        if (xSemaphoreTake(brewQueueMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+            const int index = findQueuedBrewLocked(brewId);
+            if (index >= 0) brewQueue[index].tracker.commandMayHaveBeenSent = false;
+            xSemaphoreGive(brewQueueMutex);
+        }
+        updateBrewFailure(brewId, brew_lifecycle::State::Failed,
+                          "queue_persistence_failed", error);
+        sendError(507, error);
+        return;
+    }
+    notifyBrewChanged(maySendSnapshot);
+
+    const ByteVector* sessionKey = resolveStoredSessionIfAvailable();
+    bool commandSent = false;
+    {
+        WorkerMutationWriteScope mutationWrite;
+        commandSent = sendMachineCommand(
+            "HE", nivona::buildHeMakeCoffeePayload(modelInfo, static_cast<uint8_t>(selector)),
+            sessionKey, true, error);
+    }
+    if (!commandSent) {
+        updateBrewFailure(brewId, brew_lifecycle::State::Unknown,
+                          "command_delivery_unknown",
+                          error.isEmpty() ? String("brew command delivery could not be verified") : error);
+        DynamicJsonDocument response(256);
+        response["ok"] = true;
+        response["outcomeUnknown"] = true;
+        sendJson(response);
+        return;
+    }
+
+    if (xSemaphoreTake(brewQueueMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+        const int index = findQueuedBrewLocked(brewId);
+        if (index >= 0) {
+            BrewQueueItem& item = brewQueue[index];
+            brew_lifecycle::noteAccepted(item.tracker);
+            item.acceptedAtMs = millis();
+            item.updatedAtMs = item.acceptedAtMs;
+            item.reconnectDelayMs = 1000;
+            if (!persistBrewQueueLocked(error)) lastError = error;
+            maySendSnapshot = item;
+        }
+        xSemaphoreGive(brewQueueMutex);
+        notifyBrewChanged(maySendSnapshot);
+    }
+    invalidateResourceCache(serial, "summary");
     noteWorkerProgress(90);
 
     nivona::ProcessStatus processStatus;
     String processError;
-    readMachineProcessStatus(processStatus, processError);
+    if (readMachineProcessStatus(processStatus, processError)) {
+        if (xSemaphoreTake(brewQueueMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+            const int index = findQueuedBrewLocked(brewId);
+            if (index >= 0) {
+                BrewQueueItem& item = brewQueue[index];
+                item.process = processStatus.process;
+                item.subProcess = processStatus.subProcess;
+                item.message = processStatus.message;
+                item.progress = processStatus.progress;
+                item.statusSummary = processStatus.summary;
+                brew_lifecycle::observe(item.tracker,
+                    brew_lifecycle::classifyStatus(processStatus.process, processStatus.message),
+                    millis(), BREW_READY_SEPARATION_MS);
+                if (item.tracker.preparationObserved && item.preparingAtMs == 0) item.preparingAtMs = millis();
+                item.nextActionAtMs = millis() + BREW_ACTIVE_POLL_MS;
+                item.updatedAtMs = millis();
+                if (!persistBrewQueueLocked(error)) lastError = error;
+                maySendSnapshot = item;
+            }
+            xSemaphoreGive(brewQueueMutex);
+            notifyBrewChanged(maySendSnapshot);
+        }
+    } else {
+        updateBrewFailure(brewId, brew_lifecycle::State::Reconnecting,
+                          "status_unavailable", processError,
+                          millis() + 1000);
+    }
 
-    DynamicJsonDocument response(8192);
+    DynamicJsonDocument response(512);
     response["ok"] = true;
-    response["selector"] = selector;
-    response["temporaryRecipeUploaded"] = true;
-    JsonObject recipeResponse = response.createNestedObject("recipe");
-    recipeResponse.set(recipe);
-    JsonObject status = response.createNestedObject("status");
-    appendProcessStatusJson(status, processStatus, processError);
-    DynamicJsonDocument historyDoc(4096);
-    JsonObject historyEntry = historyDoc.to<JsonObject>();
-    brew_history::buildAcceptedEntry(request.as<JsonVariantConst>(),
-                                     recipeView,
-                                     processStatus,
-                                     processError,
-                                     bridge_time::snapshot(),
-                                     millis(),
-                                     historyEntry);
-    String historyError;
-    bool historyLogged = false;
-    if (littleFsReady) {
-        WorkerMachineWriteGuard machineGuard;
-        if (machineGuard) {
-            historyLogged = brew_history::append(machine->serial, historyEntry, historyError);
+    response["brewId"] = brewId;
+    response["commandAccepted"] = true;
+    sendJson(response);
+}
+
+void handleBrewQueueObserve(const String& serial, const String& brewId) {
+    SavedMachine* machine = findSavedMachineBySerial(serial);
+    String error;
+    if (machine == nullptr || !beginMachineProtocolSession(*machine, error) ||
+        !ensureMachineHuSession(2500, error)) {
+        uint32_t delayMs = 1000;
+        if (xSemaphoreTake(brewQueueMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+            const int index = findQueuedBrewLocked(brewId);
+            if (index >= 0) {
+                delayMs = brewQueue[index].reconnectDelayMs;
+                brewQueue[index].reconnectDelayMs =
+                    std::min<uint32_t>(BREW_RECONNECT_MAX_MS, delayMs * 2U);
+            }
+            xSemaphoreGive(brewQueueMutex);
+        }
+        updateBrewFailure(brewId, brew_lifecycle::State::Reconnecting,
+                          "machine_offline", error, millis() + delayMs);
+        DynamicJsonDocument response(256);
+        response["ok"] = true;
+        response["reconnecting"] = true;
+        sendJson(response);
+        return;
+    }
+
+    nivona::ProcessStatus status;
+    if (!readMachineProcessStatus(status, error)) {
+        updateBrewFailure(brewId, brew_lifecycle::State::Reconnecting,
+                          "status_unavailable", error, millis() + 1000);
+        DynamicJsonDocument response(256);
+        response["ok"] = true;
+        response["reconnecting"] = true;
+        sendJson(response);
+        return;
+    }
+
+    BrewQueueItem snapshot;
+    if (xSemaphoreTake(brewQueueMutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
+        sendError(503, "brew queue is busy");
+        return;
+    }
+    const int index = findQueuedBrewLocked(brewId);
+    if (index >= 0 && !brew_lifecycle::terminal(brewQueue[index].tracker.state)) {
+        BrewQueueItem& item = brewQueue[index];
+        const brew_lifecycle::State priorState = item.tracker.state;
+        const int16_t priorMessage = item.message;
+        const uint8_t priorReadyObservations = item.tracker.readyObservations;
+        item.process = status.process;
+        item.subProcess = status.subProcess;
+        item.message = status.message;
+        item.progress = status.progress;
+        item.statusSummary = status.summary;
+        item.errorCode = "";
+        item.errorMessage = "";
+        item.reconnectDelayMs = 1000;
+        const bool wasPreparing = item.tracker.preparationObserved;
+        brew_lifecycle::observe(item.tracker,
+            brew_lifecycle::classifyStatus(status.process, status.message),
+            millis(), BREW_READY_SEPARATION_MS);
+        if (!wasPreparing && item.tracker.preparationObserved) item.preparingAtMs = millis();
+        if (item.tracker.state == brew_lifecycle::State::Completed) {
+            item.completedAtMs = millis();
+            item.nextActionAtMs = item.completedAtMs + BREW_NEXT_DELAY_MS;
         } else {
-            historyError = "machine was deleted or replaced while the job was running";
+            item.nextActionAtMs = millis() +
+                (item.tracker.state == brew_lifecycle::State::AttentionRequired
+                    ? BREW_ATTENTION_POLL_MS : BREW_ACTIVE_POLL_MS);
         }
-    }
-    response["historyLogged"] = historyLogged;
-    JsonObject history = response.createNestedObject("history");
-    history["recipeFingerprint"] = historyEntry["recipeFingerprint"] | "";
-    history["timeSynced"] = historyEntry["timeSynced"] | false;
-    history["timeUnix"] = historyEntry["timeUnix"] | static_cast<int64_t>(0);
-    history["timeIsoUtc"] = historyEntry["timeIsoUtc"] | "";
-    history["timeSource"] = historyEntry["timeSource"] | "";
-    if (!historyLogged) {
-        if (historyError.isEmpty() && !littleFsReady) {
-            historyError = "LittleFS is unavailable";
+        item.updatedAtMs = millis();
+        if (item.tracker.state != priorState || item.message != priorMessage ||
+            item.tracker.readyObservations != priorReadyObservations ||
+            bridge_runtime_policy::elapsedAtLeast(millis(), item.lastPersistAtMs, 10000)) {
+            if (!persistBrewQueueLocked(error)) lastError = error;
         }
-        response["historyError"] = historyError;
-        addLog("history", String("Brew history append skipped: ") + historyError);
+        snapshot = item;
     }
-    appendStatus(response);
+    xSemaphoreGive(brewQueueMutex);
+    if (!snapshot.id.isEmpty()) notifyBrewChanged(snapshot);
+    invalidateResourceCache(serial, "summary");
+    DynamicJsonDocument response(512);
+    response["ok"] = true;
+    response["brewId"] = brewId;
+    response["state"] = snapshot.id.isEmpty()
+        ? "missing" : brew_lifecycle::stateName(snapshot.tracker.state);
     sendJson(response);
 }
 
@@ -10178,6 +11520,10 @@ bool cancelTargetJobsAndCacheMetadata(const String& serial);
 void removeTargetResourceCacheFiles(const String& serial);
 
 void handleMachineDelete(const String& serial) {
+    if (brewQueueHasUnresolved(serial)) {
+        sendError(409, "machine cannot be deleted while it has unresolved brews");
+        return;
+    }
     for (auto it = savedMachines.begin(); it != savedMachines.end(); ++it) {
         if (it->serial.equalsIgnoreCase(serial)) {
             const String canonicalSerial = it->serial;
@@ -10378,14 +11724,7 @@ bool dispatchMachineApiRoute() {
         return true;
     }
     if (section == "brew" && server.method() == HTTP_POST) {
-        enqueueMachineOperation(serial,
-                                "brew",
-                                BleOperation::MachineBrew,
-                                bridge_jobs::Priority::Mutation,
-                                30000,
-                                "",
-                                false,
-                                true);
+        handleBrewEnqueue(serial);
         return true;
     }
     if (section == "history" && server.method() == HTTP_GET && tail.isEmpty()) {
@@ -10595,6 +11934,10 @@ void handleTimeConfigSave() {
 }
 
 void handleHistoryConfigSave() {
+    if (brewQueueHasUnresolved()) {
+        sendError(409, "brew history limits cannot change while the brew queue is unresolved");
+        return;
+    }
     DynamicJsonDocument request(1024);
     String error;
     if (!parseJsonBody(request, error)) {
@@ -11079,6 +12422,12 @@ void handleBackupRestoreFinished() {
     const String uploadError = backupRestoreUploadError;
     resetBackupRestoreUploadState(false);
 
+    if (brewQueueHasUnresolved()) {
+        removeBackupRestoreUpload();
+        sendError(409, "backup cannot be restored while the brew queue is unresolved");
+        return;
+    }
+
     if (!littleFsReady) {
         lastError = "LittleFS is unavailable";
         sendError(503, lastError.snapshot());
@@ -11200,12 +12549,17 @@ void handleBackupRestoreFinished() {
 }
 
 void handleBackupRestoreUpload() {
+    HTTPUpload& upload = server.upload();
+    if (upload.status == UPLOAD_FILE_START && brewQueueHasUnresolved()) {
+        backupRestoreUploadError =
+            "backup cannot be restored while the brew queue is unresolved";
+        return;
+    }
     history_storage::Guard filesystem;
     if (!filesystem) {
         backupRestoreUploadError = "filesystem is busy";
         return;
     }
-    HTTPUpload& upload = server.upload();
     if (upload.status == UPLOAD_FILE_START) {
         resetBackupRestoreUploadState();
         backupRestoreUploadFilename = upload.filename;
@@ -12928,8 +14282,8 @@ void sendActiveJobConflict(const bridge_jobs::Job& job) {
     DynamicJsonDocument response(1536);
     response["ok"] = false;
     response["pending"] = true;
-    response["code"] = "brew_job_active";
-    response["error"] = "a brew request is already queued or running for this machine";
+    response["code"] = "job_admission_conflict";
+    response["error"] = "an operation with the same admission key is already active";
     JsonObject jobJson = response.createNestedObject("job");
     appendJobJson(jobJson, job);
     sendJson(response, 409);
@@ -13031,9 +14385,6 @@ void enqueueMachineOperation(const String& serial,
     submission.deadlineMs = deadlineMs;
     submission.resource = resource;
     submission.resultUrl = resultUrl.c_str();
-    if (operation == BleOperation::MachineBrew) {
-        submission.admissionKey = (String("brew:") + canonicalSerial).c_str();
-    }
     if (!coalesceKey.isEmpty()) {
         submission.coalesceKey = coalesceKey.c_str();
     } else if (priority != bridge_jobs::Priority::Mutation) {
@@ -13674,7 +15025,8 @@ void invokeQueuedHandler(WorkerExecutionContext& context) {
         case BleOperation::MachineFeatures: handleMachineFeaturesGet(context.target); break;
         case BleOperation::MachineRecipesRefresh: handleMachineRecipesRefresh(context.target); break;
         case BleOperation::MachineRecipeDetail: handleMachineRecipeDetail(context.target, context.argument); break;
-        case BleOperation::MachineBrew: handleMachineBrew(context.target); break;
+        case BleOperation::BrewQueueDispatch: handleBrewQueueDispatch(context.target, context.argument); break;
+        case BleOperation::BrewQueueObserve: handleBrewQueueObserve(context.target, context.argument); break;
         case BleOperation::MachineConfirm: handleMachineConfirm(context.target); break;
         case BleOperation::MachineMyCoffeeList: handleMachineMyCoffeeList(context.target); break;
         case BleOperation::MachineMyCoffeeDetail:
@@ -13846,7 +15198,9 @@ void updateWorkerOwnedHealth() {
 }
 
 bool shouldSpoolJobResult(BleOperation operation) {
-    if (operation == BleOperation::MachineKeepAlive) {
+    if (operation == BleOperation::MachineKeepAlive ||
+        operation == BleOperation::BrewQueueDispatch ||
+        operation == BleOperation::BrewQueueObserve) {
         return false;
     }
     // Keep terminal metadata compact and avoid retaining response-sized String
@@ -13959,7 +15313,9 @@ void bleWorkerTask(void*) {
             context.errorMessage = "machine was deleted or replaced before the job started";
         } else if (context.mutationJob) {
             String preflightError;
-            if (!prepareMutationResultStorage(context, preflightError)) {
+            const bool internalBrewDispatch =
+                context.operation == BleOperation::BrewQueueDispatch;
+            if (!internalBrewDispatch && !prepareMutationResultStorage(context, preflightError)) {
                 context.responded = true;
                 context.responseStatus = 507;
                 context.errorCode = "result_storage_unavailable";
@@ -14068,8 +15424,7 @@ void bleWorkerTask(void*) {
         }
 
         if (context.mutationCommitted &&
-            (context.operation == BleOperation::MachineBrew ||
-             context.operation == BleOperation::MachineConfirm)) {
+            context.operation == BleOperation::MachineConfirm) {
             // An acknowledged action changes HX even when the subsequent
             // status read/result fails. Do not advertise a pre-action summary
             // as fresh to cache-first consumers after the job completes.
@@ -14506,7 +15861,151 @@ void markBackgroundStatsScheduled(const SavedMachine& machine, uint32_t nowMs) {
     }
 }
 
+enum class BrewCoordinatorActivity : uint8_t {
+    None,
+    Waiting,
+    Active,
+};
+
+BrewCoordinatorActivity scheduleBrewQueue(uint32_t nowMs) {
+    if (brewQueueMutex == nullptr || !brewQueue ||
+        xSemaphoreTake(brewQueueMutex, pdMS_TO_TICKS(50)) != pdTRUE) {
+        return BrewCoordinatorActivity::Waiting;
+    }
+    if (brewQueueRecoveryBlocked) {
+        xSemaphoreGive(brewQueueMutex);
+        return BrewCoordinatorActivity::Waiting;
+    }
+    if (brewQueueCount == 0) {
+        xSemaphoreGive(brewQueueMutex);
+        return BrewCoordinatorActivity::None;
+    }
+
+    for (size_t reverse = brewQueueCount; reverse > 1; --reverse) {
+        BrewQueueItem& cancelled = brewQueue[reverse - 1];
+        if (cancelled.tracker.state != brew_lifecycle::State::Cancelled) continue;
+        const String cancelledId = cancelled.id;
+        String error;
+        if (!cancelled.historyLogged) finalizeBrewHistoryLocked(cancelled, error);
+        if (!removeBrewDurablyLocked(reverse - 1, error)) {
+            if (!error.isEmpty()) lastError = error;
+            xSemaphoreGive(brewQueueMutex);
+            return BrewCoordinatorActivity::Waiting;
+        }
+        xSemaphoreGive(brewQueueMutex);
+        server.notifyBrewChanged(cancelledId.c_str());
+        server.markStatusChanged();
+        return BrewCoordinatorActivity::Active;
+    }
+
+    BrewQueueItem& head = brewQueue[0];
+    const String headId = head.id;
+    if (brew_lifecycle::terminal(head.tracker.state)) {
+        String error;
+        const bool wasHistoryLogged = head.historyLogged;
+        if (!head.historyLogged && !finalizeBrewHistoryLocked(head, error)) {
+            const bool explicitlyReleased = head.resolutionAccepted ||
+                head.tracker.state == brew_lifecycle::State::Cancelled;
+            if (explicitlyReleased) {
+                if (!removeBrewDurablyLocked(0, error)) {
+                    if (!error.isEmpty()) lastError = error;
+                    xSemaphoreGive(brewQueueMutex);
+                    return BrewCoordinatorActivity::Waiting;
+                }
+                xSemaphoreGive(brewQueueMutex);
+                server.notifyBrewChanged(headId.c_str());
+                server.markStatusChanged();
+                return BrewCoordinatorActivity::Active;
+            }
+            if (head.errorCode.isEmpty()) head.errorCode = "history_persistence_failed";
+            if (head.errorMessage.isEmpty()) head.errorMessage = error;
+            head.updatedAtMs = nowMs;
+            if (!persistBrewQueueLocked(error)) lastError = error;
+            const BrewQueueItem snapshot = head;
+            xSemaphoreGive(brewQueueMutex);
+            notifyBrewChanged(snapshot);
+            return BrewCoordinatorActivity::Waiting;
+        }
+        const bool removable = (head.resolutionAccepted ||
+                                !brew_lifecycle::blocksQueue(head.tracker.state, head.holdAfter)) &&
+            (head.tracker.state != brew_lifecycle::State::Completed ||
+             bridge_runtime_policy::deadlineReached(nowMs, head.nextActionAtMs));
+        if (removable) {
+            if (!removeBrewDurablyLocked(0, error)) {
+                if (!error.isEmpty()) lastError = error;
+                xSemaphoreGive(brewQueueMutex);
+                return BrewCoordinatorActivity::Waiting;
+            }
+            xSemaphoreGive(brewQueueMutex);
+            server.notifyBrewChanged(headId.c_str());
+            server.markStatusChanged();
+            return BrewCoordinatorActivity::Active;
+        }
+        if (!persistBrewQueueLocked(error) && !error.isEmpty()) lastError = error;
+        const BrewQueueItem snapshot = head;
+        xSemaphoreGive(brewQueueMutex);
+        if (!wasHistoryLogged && snapshot.historyLogged) notifyBrewChanged(snapshot);
+        return BrewCoordinatorActivity::Waiting;
+    }
+
+    if (head.nextActionAtMs != 0 &&
+        !bridge_runtime_policy::deadlineReached(nowMs, head.nextActionAtMs)) {
+        const bool waiting = head.tracker.state == brew_lifecycle::State::WaitingForMachine ||
+            head.tracker.state == brew_lifecycle::State::Reconnecting ||
+            head.tracker.state == brew_lifecycle::State::AttentionRequired;
+        xSemaphoreGive(brewQueueMutex);
+        return waiting ? BrewCoordinatorActivity::Waiting : BrewCoordinatorActivity::Active;
+    }
+
+    const bool dispatch = brew_lifecycle::shouldDispatch(head.tracker);
+    const String headSerial = head.serial;
+    head.nextActionAtMs = nowMs + 500;
+    xSemaphoreGive(brewQueueMutex);
+
+    SavedMachine machine;
+    bool found = false;
+    bool registryRead = false;
+    if (machineMutex != nullptr && xSemaphoreTake(machineMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+        registryRead = true;
+        if (SavedMachine* candidate = findSavedMachineBySerialGlobal(headSerial); candidate != nullptr) {
+            machine = *candidate;
+            found = true;
+        }
+        xSemaphoreGive(machineMutex);
+    }
+    if (!registryRead) return BrewCoordinatorActivity::Active;
+    if (!found) {
+        updateBrewFailure(headId, brew_lifecycle::State::Failed,
+                          "machine_missing", "saved machine no longer exists");
+        return BrewCoordinatorActivity::Waiting;
+    }
+
+    bridge_jobs::Submission submission;
+    submission.kind = dispatch ? "brew_queue_dispatch" : "brew_queue_observe";
+    submission.target = machine.serial.c_str();
+    submission.operationCode = static_cast<uint16_t>(
+        dispatch ? BleOperation::BrewQueueDispatch : BleOperation::BrewQueueObserve);
+    submission.argument = head.id.c_str();
+    submission.identity = serializeMachineIdentity(machine).c_str();
+    submission.coalesceKey = (String(dispatch ? "brew-dispatch:" : "brew-observe:") + head.id).c_str();
+    submission.priority = dispatch ? bridge_jobs::Priority::Mutation : bridge_jobs::Priority::ForcedRead;
+    submission.deadlineMs = dispatch ? 60000 : 15000;
+    submission.executionDeadlineMs = submission.deadlineMs;
+    submission.retainTerminal = false;
+    const BackgroundSubmitResult result = submitBackgroundJob(submission);
+    if (result == BackgroundSubmitResult::Deferred) {
+        if (xSemaphoreTake(brewQueueMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+            const int index = findQueuedBrewLocked(headId);
+            if (index >= 0) brewQueue[index].nextActionAtMs = nowMs + 250;
+            xSemaphoreGive(brewQueueMutex);
+        }
+    }
+    return BrewCoordinatorActivity::Active;
+}
+
 void scheduleBackgroundBleJobs(uint32_t nowMs) {
+    const BrewCoordinatorActivity brewActivity = scheduleBrewQueue(nowMs);
+    if (brewActivity == BrewCoordinatorActivity::Active) return;
     const MachineSessionState sessionState =
         machineSessionState.load(std::memory_order_acquire);
     if (sessionState != MachineSessionState::Offline) {
@@ -14564,6 +16063,8 @@ void scheduleBackgroundBleJobs(uint32_t nowMs) {
             nextIdleScanSubmitAtMs = 0;
         }
     }
+
+    if (brewActivity == BrewCoordinatorActivity::Waiting) return;
 
     if (nextBackgroundStatsDispatchAtMs != 0 &&
         !bridge_runtime_policy::deadlineReached(nowMs, nextBackgroundStatsDispatchAtMs)) {
@@ -14693,6 +16194,33 @@ bridge_http::EventJobLookup renderJobEvent(const String& id,
     return bridge_http::EventJobLookup::Found;
 }
 
+bridge_http::EventJobLookup renderBrewEvent(const String& id,
+                                            String& jsonOut,
+                                            void*) {
+    DynamicJsonDocument document(7168);
+    if (brewQueueMutex == nullptr || xSemaphoreTake(brewQueueMutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+        return bridge_http::EventJobLookup::Busy;
+    }
+    const int index = findQueuedBrewLocked(id);
+    if (index >= 0) appendBrewJson(document.to<JsonObject>(), brewQueue[index], index + 1);
+    xSemaphoreGive(brewQueueMutex);
+    if (index < 0) {
+        String error;
+        DynamicJsonDocument history(6144);
+        if (!findHistoryBrew(id, history, error, false)) {
+            return error.isEmpty()
+                ? bridge_http::EventJobLookup::Missing
+                : bridge_http::EventJobLookup::Busy;
+        }
+        appendHistoricalBrewJson(document.to<JsonObject>(), history.as<JsonObjectConst>());
+    }
+    jsonOut = "";
+    if (document.overflowed() || serializeJson(document, jsonOut) == 0) {
+        return bridge_http::EventJobLookup::Busy;
+    }
+    return bridge_http::EventJobLookup::Found;
+}
+
 void publishJobEvent(const char* id, void*) {
     server.notifyJobChanged(id);
 }
@@ -14703,6 +16231,8 @@ void registerRoutes() {
     server.on("/", HTTP_GET, handleRoot);
     server.on("/icons/recipe", HTTP_GET, handleRecipeIconAsset);
     server.on("/api/status", HTTP_GET, handleStatus);
+    server.on("/api/brew-queue", HTTP_GET, handleBrewQueueList);
+    server.on("/api/brew-queue", HTTP_DELETE, handleBrewQueueCancelUnsent);
     server.on("/api/devices", HTTP_GET, handleDevices);
     server.on("/api/details", HTTP_GET, []() {
         enqueueGenericHttpJob("details", BleOperation::Details, bridge_jobs::Priority::ForcedRead, 12000);
@@ -14789,6 +16319,26 @@ void registerRoutes() {
 
     server.onNotFound([]() {
         const String uri = server.uri();
+        const String brewPrefix = "/api/brews/";
+        if (uri.startsWith(brewPrefix)) {
+            String remainder = uri.substring(brewPrefix.length());
+            const bool resolve = remainder.endsWith("/resolve");
+            if (resolve) remainder.remove(remainder.length() - 8);
+            if (!remainder.isEmpty() && remainder.indexOf('/') < 0) {
+                if (!resolve && server.method() == HTTP_GET) {
+                    handleBrewGet(remainder);
+                    return;
+                }
+                if (!resolve && server.method() == HTTP_DELETE) {
+                    handleBrewDelete(remainder);
+                    return;
+                }
+                if (resolve && server.method() == HTTP_POST) {
+                    handleBrewResolve(remainder);
+                    return;
+                }
+            }
+        }
         const String jobPrefix = "/api/jobs/";
         if (uri.startsWith(jobPrefix)) {
             String remainder = uri.substring(jobPrefix.length());
@@ -14842,6 +16392,12 @@ void setup() {
     healthMutex       = xSemaphoreCreateMutex();
     machineMutex      = xSemaphoreCreateMutex();
     machineGenerationMutex = xSemaphoreCreateRecursiveMutex();
+    brewQueueMutex    = xSemaphoreCreateMutex();
+    brewQueue.reset(new (std::nothrow) BrewQueueItem[BREW_QUEUE_CAPACITY]);
+    if (!brewQueue) {
+        brewQueueRecoveryBlocked = true;
+        addLog("brew", "Failed to allocate the durable brew queue");
+    }
     if (allocationCallbackResult != ESP_OK) {
         addLog("memory", "Failed to register the heap allocation diagnostic callback");
     }
@@ -14850,7 +16406,7 @@ void setup() {
     jobScheduler.reset(bootNonce);
     jobScheduler.setChangeCallback(publishJobEvent);
     server.setRequestLifecycle(beginHttpRequest, finishHttpRequest);
-    server.configureEvents(bootNonce, renderStatusEvent, renderJobEvent);
+    server.configureEvents(bootNonce, renderStatusEvent, renderJobEvent, renderBrewEvent);
 
     preferences.begin(PREFS_WIFI, false);
     machinePreferences.begin(PREFS_MACHINES, false);
@@ -14869,6 +16425,7 @@ void setup() {
         }
     }
     loadSavedMachines();
+    loadBrewQueue();
     configureHistoryBudget();
     refreshCachedStorageTotals();
     connectWifi();

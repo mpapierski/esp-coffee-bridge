@@ -53,6 +53,10 @@ struct Submission {
     // wait may legitimately exceed the operation's own logical deadline.
     uint32_t executionDeadlineMs{0};
     bool resource{false};
+    // Internal worker jobs can opt out of the public five-minute terminal
+    // retention window. Their durable domain record remains the source of
+    // truth after the worker finishes.
+    bool retainTerminal{true};
 };
 
 struct Job {
@@ -84,6 +88,7 @@ struct Job {
     uint8_t progress{0};
     int resultStatus{200};
     bool resource{false};
+    bool retainTerminal{true};
 };
 
 // Bounded lifecycle data safe to copy while publishing events. It deliberately
@@ -178,6 +183,7 @@ private:
     int findFreeRecord() const;
     int findEvictableBackground() const;
     void makeTerminal(Job& job, State state, uint32_t nowMs);
+    void releaseUnretainedTerminal(Job& job);
     void notifyChanged(const Job& job) const;
     void rememberDiscardedPath(const Job& job);
     std::string nextId();

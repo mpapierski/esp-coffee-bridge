@@ -38,7 +38,7 @@ void Scheduler::setChangeCallback(ChangeCallback callback, void* context) {
 }
 
 void Scheduler::notifyChanged(const Job& job) const {
-    if (changeCallback_ != nullptr && job.occupied && !job.id.empty()) {
+    if (changeCallback_ != nullptr && job.occupied && job.retainTerminal && !job.id.empty()) {
         changeCallback_(job.id.c_str(), changeContext_);
     }
 }
@@ -133,6 +133,14 @@ void Scheduler::makeTerminal(Job& job, State state, uint32_t nowMs) {
     std::string{}.swap(job.admissionKey);
 }
 
+void Scheduler::releaseUnretainedTerminal(Job& job) {
+    if (job.retainTerminal) {
+        return;
+    }
+    rememberDiscardedPath(job);
+    job = {};
+}
+
 void Scheduler::rememberDiscardedPath(const Job& job) {
     if (job.resultPath.empty()) {
         return;
@@ -203,6 +211,7 @@ SubmitResult Scheduler::submit(const Submission& submission, uint32_t nowMs) {
         notifyChanged(jobs_[evictable]);
         counters_.cancelled++;
         counters_.backgroundEvicted++;
+        releaseUnretainedTerminal(jobs_[evictable]);
     }
 
     Job job;
@@ -226,6 +235,7 @@ SubmitResult Scheduler::submit(const Submission& submission, uint32_t nowMs) {
     job.deadlineAtMs = nowMs + submission.deadlineMs;
     job.executionDeadlineMs = submission.executionDeadlineMs;
     job.resource = submission.resource;
+    job.retainTerminal = submission.retainTerminal;
     jobs_[slot] = std::move(job);
     counters_.submitted++;
     notifyChanged(jobs_[slot]);
@@ -256,6 +266,7 @@ bool Scheduler::startNext(uint32_t nowMs, Job& out) {
         job.errorMessage = "job deadline expired while queued";
         counters_.failed++;
         notifyChanged(job);
+        releaseUnretainedTerminal(job);
         return startNext(nowMs, out);
     }
 
@@ -296,6 +307,7 @@ bool Scheduler::finish(const std::string& id,
         counters_.failed++;
     }
     notifyChanged(job);
+    releaseUnretainedTerminal(job);
     return true;
 }
 
@@ -323,6 +335,7 @@ bool Scheduler::cancel(const std::string& id, uint32_t nowMs) {
     jobs_[index].errorMessage = "job cancelled";
     counters_.cancelled++;
     notifyChanged(jobs_[index]);
+    releaseUnretainedTerminal(jobs_[index]);
     return true;
 }
 
@@ -341,6 +354,7 @@ size_t Scheduler::cancelTarget(const std::string& target,
         job.errorMessage = "target machine was deleted";
         counters_.cancelled++;
         notifyChanged(job);
+        releaseUnretainedTerminal(job);
         count++;
     }
     return count;
@@ -358,6 +372,7 @@ size_t Scheduler::cancelAll(uint32_t nowMs) {
         job.errorMessage = "job cancelled for bridge restore";
         counters_.cancelled++;
         notifyChanged(job);
+        releaseUnretainedTerminal(job);
         count++;
     }
     return count;
@@ -527,6 +542,7 @@ size_t Scheduler::cancelQueuedKindBelow(const std::string& target,
         job.errorMessage = "queued refresh was superseded by a combined forced refresh";
         counters_.cancelled++;
         notifyChanged(job);
+        releaseUnretainedTerminal(job);
         count++;
     }
     return count;

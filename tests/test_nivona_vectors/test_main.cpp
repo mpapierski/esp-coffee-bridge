@@ -170,6 +170,17 @@ void test_hx_confirmable_messages_are_flagged_for_host_confirm() {
     }
 }
 
+void test_hx_operator_message_takes_priority_over_preparing_process() {
+    std::vector<ByteVector> chunks{
+        nivona::buildPacket("HX", decodeHex("0004000000040000"), nullptr, true),
+    };
+    nivona::ProcessStatus status;
+    String error;
+    TEST_ASSERT_TRUE_MESSAGE(nivona::decodeHxResponse(chunks, true, status, error), error.c_str());
+    TEST_ASSERT_EQUAL_STRING("attention", status.summary.c_str());
+    TEST_ASSERT_EQUAL_STRING("fill up water", status.messageLabel.c_str());
+}
+
 void test_hx_decoder_ignores_leading_ack_frame_in_mixed_batch() {
     std::vector<ByteVector> chunks{
         decodeHex("5341BE45"),
@@ -292,6 +303,7 @@ int main(int argc, char** argv) {
     RUN_TEST(test_hx_ready_vector_decodes_to_apk_backed_labels);
     RUN_TEST(test_unknown_hx_message_code_stays_raw_and_unlabeled);
     RUN_TEST(test_hx_confirmable_messages_are_flagged_for_host_confirm);
+    RUN_TEST(test_hx_operator_message_takes_priority_over_preparing_process);
     RUN_TEST(test_hx_decoder_ignores_leading_ack_frame_in_mixed_batch);
     RUN_TEST(test_family_700_standard_recipe_lookup_and_layout_match_apk_offsets);
     RUN_TEST(test_family_900_standard_recipe_layout_tracks_split_temperatures_and_scaled_fluids);

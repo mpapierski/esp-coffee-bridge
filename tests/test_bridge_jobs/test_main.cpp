@@ -389,6 +389,32 @@ void test_change_callback_covers_the_published_lifecycle() {
     TEST_ASSERT_EQUAL_UINT8(100, publicJob.progress);
 }
 
+void test_unretained_worker_jobs_do_not_fill_registry() {
+    Scheduler scheduler(17);
+    ChangeCapture capture;
+    scheduler.setChangeCallback(captureChange, &capture);
+    Submission worker = job("brew_queue_observe", Priority::ForcedRead);
+    worker.retainTerminal = false;
+    std::string firstId;
+
+    for (size_t index = 0; index < bridge_jobs::RECORD_CAPACITY * 2U; ++index) {
+        const auto submitted = scheduler.submit(worker, static_cast<uint32_t>(index));
+        TEST_ASSERT_EQUAL(static_cast<int>(SubmitStatus::Accepted),
+                          static_cast<int>(submitted.status));
+        if (index == 0) firstId = submitted.id;
+        Job running;
+        TEST_ASSERT_TRUE(scheduler.startNext(static_cast<uint32_t>(index), running));
+        TEST_ASSERT_TRUE(scheduler.finish(
+            running.id, true, static_cast<uint32_t>(index)));
+    }
+
+    Job missing;
+    TEST_ASSERT_FALSE(scheduler.get(firstId, missing));
+    TEST_ASSERT_EQUAL_UINT32(0U, scheduler.activeCount());
+    TEST_ASSERT_TRUE(scheduler.canAcceptBackground());
+    TEST_ASSERT_EQUAL_UINT32(0U, capture.count);
+}
+
 } // namespace
 
 int main(int, char**) {
@@ -410,5 +436,6 @@ int main(int, char**) {
     RUN_TEST(test_retention_capacity_covers_sixteen_machine_poll_rate);
     RUN_TEST(test_explicit_restore_can_discard_jobs_and_spooled_results);
     RUN_TEST(test_change_callback_covers_the_published_lifecycle);
+    RUN_TEST(test_unretained_worker_jobs_do_not_fill_registry);
     return UNITY_END();
 }

@@ -658,6 +658,59 @@ bool clearAll(String& error) {
     return true;
 }
 
+bool findNewestByStringField(const String& serial,
+                             const char* field,
+                             const String& value,
+                             JsonObject entryOut,
+                             String& error,
+                             ProgressCallback progress,
+                             void* progressContext) {
+    error = "";
+    if (serial.isEmpty() || field == nullptr || field[0] == '\0' || value.isEmpty()) {
+        error = "history lookup requires serial, field, and value";
+        return false;
+    }
+    history_storage::Guard filesystem;
+    if (!filesystem) {
+        error = "failed to lock history storage";
+        return false;
+    }
+    const String path = historyPath(serial);
+    if (!history_storage::recoverFile(path, error)) return false;
+    File file = LittleFS.open(path, "r");
+    if (!file) return false;
+
+    bool found = false;
+    String line;
+    line.reserve(512);
+    DynamicJsonDocument document(4096);
+    size_t bytesSinceProgress = 0;
+    while (file.available()) {
+        line = file.readStringUntil('\n');
+        bytesSinceProgress += line.length() + 1;
+        if (progress != nullptr && bytesSinceProgress >= 32 * 1024) {
+            progress(progressContext);
+            bytesSinceProgress = 0;
+        }
+        if (line.endsWith("\r")) line.remove(line.length() - 1);
+        if (line.isEmpty() || line.length() > history_storage::MAX_JSON_LINE_BYTES) continue;
+        document.clear();
+        if (deserializeJson(document, line)) continue;
+        JsonObjectConst candidate = document.as<JsonObjectConst>();
+        if ((candidate[field] | String("")) == value) {
+            if (!entryOut.set(candidate)) {
+                file.close();
+                error = "matching history entry exceeds the response capacity";
+                return false;
+            }
+            found = true;
+        }
+    }
+    file.close();
+    if (progress != nullptr) progress(progressContext);
+    return found;
+}
+
 String sanitizeMetadataText(JsonVariantConst value, size_t maxLength) {
     if (value.isNull()) {
         return "";
@@ -1035,7 +1088,8 @@ bool buildImportedEntry(JsonObjectConst request, JsonObject target, String& erro
         return false;
     }
 
-    target["schema"] = 1;
+    const uint32_t schema = request["schema"] | 1U;
+    target["schema"] = std::min<uint32_t>(schema, 2U);
     if (!request["loggedAtMs"].isNull()) {
         copyUInt32Field(target, request, "loggedAtMs");
     } else {
@@ -1067,6 +1121,22 @@ bool buildImportedEntry(JsonObjectConst request, JsonObject target, String& erro
     copySanitizedStringField(target, request, "label", 80);
     copySanitizedStringField(target, request, "note", 160);
     copySanitizedStringField(target, request, "correlationId", 64);
+    copySanitizedStringField(target, request, "brewId", 31);
+    copySanitizedStringField(target, request, "requestHash", 64);
+    copyBoolField(target, request, "commandAccepted");
+    copyBoolField(target, request, "commandMayHaveBeenSent");
+    copyUInt32Field(target, request, "createdAtMs");
+    copyUInt32Field(target, request, "acceptedAtMs");
+    copyUInt32Field(target, request, "preparingAtMs");
+    copyUInt32Field(target, request, "completedAtMs");
+    copySanitizedStringField(target, request, "errorCode", 48);
+    const JsonObjectConst evidenceInput = request["completionEvidence"].as<JsonObjectConst>();
+    if (!evidenceInput.isNull()) {
+        JsonObject evidence = target.createNestedObject("completionEvidence");
+        copyBoolField(evidence, evidenceInput, "preparationObserved");
+        copyIntField(evidence, evidenceInput, "readyObservations");
+        copyUInt32Field(evidence, evidenceInput, "readySeparationMs");
+    }
 
     JsonObject compactRecipe = target.createNestedObject("recipe");
     appendCompactRecipe(compactRecipe, recipeInput);

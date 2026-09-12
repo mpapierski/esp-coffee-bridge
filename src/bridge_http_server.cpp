@@ -127,11 +127,13 @@ void BridgeHttpServer::setRequestLifecycle(BeforeRequest before,
 void BridgeHttpServer::configureEvents(uint32_t bootNonce,
                                        StatusRenderer statusRenderer,
                                        JobRenderer jobRenderer,
+                                       BrewRenderer brewRenderer,
                                        void* context) {
     eventBootNonce_ = bootNonce;
     eventCounter_ = 1;
     statusRenderer_ = statusRenderer;
     jobRenderer_ = jobRenderer;
+    brewRenderer_ = brewRenderer;
     eventContext_ = context;
 }
 
@@ -783,7 +785,7 @@ bool BridgeHttpServer::renderStatusEventMessage(const char* type,
     const int prefixLength = hello
         ? std::snprintf(statusMessage_.data(),
                         statusMessage_.size(),
-                        "{\"type\":\"hello\",\"eventProtocolVersion\":1,"
+                        "{\"type\":\"hello\",\"eventProtocolVersion\":2,"
                         "\"apiVersion\":2,\"sequence\":\"%s\",\"status\":",
                         sequence)
         : std::snprintf(statusMessage_.data(),
@@ -889,6 +891,29 @@ void BridgeHttpServer::sendJobToWatchers(const char* id) {
     }
 }
 
+void BridgeHttpServer::sendBrewToAll(const char* id) {
+    if (brewRenderer_ == nullptr) return;
+    String brew;
+    const EventJobLookup lookup = brewRenderer_(String(id), brew, eventContext_);
+    if (lookup != EventJobLookup::Found) {
+        sendStatusToAll("resync");
+        return;
+    }
+    DynamicJsonDocument event(384);
+    event["type"] = "brew";
+    event["sequence"] = nextEventSequence();
+    event["brew"] = serialized(brew.c_str(), brew.length());
+    String payload;
+    payload.reserve(brew.length() + 112);
+    if (event.overflowed() || serializeJson(event, payload) == 0) {
+        sendStatusToAll("resync");
+        return;
+    }
+    for (EventClient& client : eventClients_) {
+        if (client.fd >= 0) sendEvent(client, payload);
+    }
+}
+
 esp_err_t BridgeHttpServer::handleWebsocket(httpd_req_t* request) {
     updateTaskHeartbeat();
     const int fd = httpd_req_to_sockfd(request);
@@ -957,6 +982,12 @@ esp_err_t BridgeHttpServer::handleWebsocket(httpd_req_t* request) {
 void BridgeHttpServer::notifyJobChanged(const char* id) {
     portENTER_CRITICAL(&eventChangesMutex_);
     eventChanges_.markJob(id);
+    portEXIT_CRITICAL(&eventChangesMutex_);
+}
+
+void BridgeHttpServer::notifyBrewChanged(const char* id) {
+    portENTER_CRITICAL(&eventChangesMutex_);
+    eventChanges_.markBrew(id);
     portEXIT_CRITICAL(&eventChangesMutex_);
 }
 
@@ -1065,8 +1096,12 @@ void BridgeHttpServer::drainEventWork() {
         return;
     }
     if (batch.statusDirty) sendStatusToAll();
-    for (size_t index = 0; index < batch.jobCount; ++index) {
-        sendJobToWatchers(batch.jobIds[index].data());
+    for (size_t index = 0; index < batch.count; ++index) {
+        if (batch.kinds[index] == EventChangeKind::Brew) {
+            sendBrewToAll(batch.ids[index].data());
+        } else {
+            sendJobToWatchers(batch.ids[index].data());
+        }
     }
 }
 

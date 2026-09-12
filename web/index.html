@@ -794,13 +794,11 @@
   const PROTOCOL_API = "/api/protocol";
   const HISTORY_PAGE_SIZE = 20;
   const STATS_HISTORY_PAGE_SIZE = 20;
-  const EVENT_PROTOCOL_VERSION = 1;
+  const EVENT_PROTOCOL_VERSION = 2;
   const BLE_UI_ACTIONS = new Set([
     "scan-devices",
     "probe-device",
     "reconnect-machine",
-    "brew-standard",
-    "brew-history-again",
     "confirm-machine",
     "refresh-standard-recipes",
     "refresh-standard-recipe",
@@ -816,7 +814,6 @@
     "save-setting",
     "factory-reset",
     "save-recipe",
-    "brew-standard-custom",
     "diag-session-set",
     "diag-confirm-prompt",
     "diag-raw-write",
@@ -828,6 +825,7 @@
     flash: { message: "Loading bridge status…", kind: "" },
     status: null,
     machines: [],
+    brewQueue: { brews: [] },
     scanResults: [],
     showCoffeeMachines: true,
     probedMachine: null,
@@ -1099,6 +1097,18 @@
       settleJobWaiters(event.job);
       return;
     }
+    if (event.type === "brew") {
+      const brews = Array.isArray(state.brewQueue?.brews) ? state.brewQueue.brews : [];
+      const index = brews.findIndex((brew) => brew.id === event.brew?.id);
+      if (index >= 0) brews[index] = event.brew;
+      else if (event.brew?.id) brews.push(event.brew);
+      if (event.brew?.state === "completed") setFlash("Drink completed and the machine returned to ready.", "ok");
+      if (event.brew?.state === "attention_required") {
+        setFlash(event.brew.machineStatus?.messageLabel || "The coffee machine needs attention.", "error");
+      }
+      void refreshCore().then(() => renderRoute({ showLoading: false })).catch(console.error);
+      return;
+    }
     if (event.type === "resync") {
       updateStatusFromEvent(event.status);
       watchPendingJobs();
@@ -1322,7 +1332,7 @@
     if (method !== "POST" || !url.pathname.startsWith("/api/machines/")) {
       return false;
     }
-    return /\/(refresh|brew|confirm|settings|mycoffee(?:\/.*)?|recipes\/refresh)$/.test(url.pathname);
+    return /\/(refresh|confirm|settings|mycoffee(?:\/.*)?|recipes\/refresh)$/.test(url.pathname);
   }
 
   async function api(path, options = {}) {
@@ -1334,7 +1344,7 @@
     // most of the helper's logical deadline. Job status/result polls remain
     // individually capped at ten seconds above.
     const result = await fetchJson(path, options, deadlineAt - Date.now());
-    if (result.response.status === 202 || result.data?.pending === true) {
+    if ((result.response.status === 202 || result.data?.pending === true) && !result.data?.brew) {
       return resolveBridgeJob(result.data, result.response.headers.get("Location"), deadlineAt);
     }
     return result.data;
@@ -1945,7 +1955,11 @@
   }
 
   async function refreshCore() {
-    const machinesResponse = await api("/api/machines");
+    const [machinesResponse, brewQueue] = await Promise.all([
+      api("/api/machines"),
+      api("/api/brew-queue")
+    ]);
+    state.brewQueue = brewQueue;
     state.machines = (machinesResponse.machines || []).slice().sort((a, b) => {
       if (a.online !== b.online) {
         return a.online ? -1 : 1;
@@ -2077,15 +2091,55 @@
 
   async function refreshAfterBrew(serial, response) {
     state.diagnostics.output = response;
-    invalidateMachine(serial);
-    try {
-      await loadMachineSummary(serial, true);
-    } catch (error) {
-      // The brew already succeeded. A failed follow-up read must not turn it
-      // into a failed brew or encourage the user to submit another command.
-      setFlash(`Brew command sent, but live status could not refresh: ${error.message}. Do not retry the brew.`, "error");
-    }
+    await refreshCore();
+    const brew = response?.brew;
+    setFlash(brew ? `Brew queued as ${brew.id}.` : "Brew queued.", "ok");
     await renderRoute();
+  }
+
+  function newCorrelationId() {
+    if (globalThis.crypto?.randomUUID) return globalThis.crypto.randomUUID();
+    return `ui-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  }
+
+  function renderBrewQueue(serial = "") {
+    const all = Array.isArray(state.brewQueue?.brews) ? state.brewQueue.brews : [];
+    const brews = serial ? all.filter((brew) => String(brew.serial) === String(serial)) : all;
+    const recoveryWarning = state.brewQueue?.recoveryBlocked
+      ? `<p class="notice error">Durable brew queue recovery failed. New drinks and automatic dispatch are disabled until the stored queue is repaired.</p>`
+      : "";
+    if (!brews.length && !recoveryWarning) return "";
+    const cards = brews.map((brew) => {
+      const status = brew.machineStatus || {};
+      const canCancel = !brew.commandMayHaveBeenSent && ["queued", "waiting_for_machine", "dispatching"].includes(brew.state);
+      const risky = ["failed", "interrupted", "unknown"].includes(brew.state);
+      const canContinue = risky || (brew.state === "completed" && (brew.holdAfter || brew.blocked));
+      const canAbandon = brew.commandMayHaveBeenSent && !brew.terminal;
+      const canCancelRemaining = Number(brew.position) === 1 && all.length > 1;
+      return `<article class="recipe-card">
+        <div class="row" style="justify-content:space-between;align-items:flex-start;">
+          <div><h3>${escapeHtml(brew.state || "queued")}</h3><div class="tiny muted">${escapeHtml(brew.id)} · ${escapeHtml(brew.serial)}</div></div>
+          <span class="badge ${brew.state === "completed" ? "good" : (brew.blocked || brew.state === "attention_required" ? "warn" : "")}">#${escapeHtml(String(brew.position || "-"))}</span>
+        </div>
+        <div class="value-list">
+          <div class="value-item"><span>Command accepted</span><span>${brew.commandAccepted ? "yes" : "no"}</span></div>
+          <div class="value-item"><span>Machine</span><span>${escapeHtml(status.messageLabel || status.summary || "waiting")}</span></div>
+          <div class="value-item"><span>Completion evidence</span><span>${brew.completionEvidence?.preparationObserved ? `${brew.completionEvidence.readyObservations || 0}/2 ready checks` : "preparing not observed"}</span></div>
+        </div>
+        <div class="row">
+          ${canCancel ? `<button class="secondary" data-action="cancel-brew" data-brew-id="${escapeHtml(brew.id)}">Cancel</button>` : ""}
+          ${canAbandon ? `<button class="secondary" data-action="abandon-brew" data-brew-id="${escapeHtml(brew.id)}">Mark unknown</button>` : ""}
+          ${canContinue ? `<button data-action="continue-brew" data-brew-id="${escapeHtml(brew.id)}" data-risky="${risky ? "true" : "false"}">Continue queue</button>` : ""}
+          ${canCancelRemaining ? `<button class="secondary" data-action="cancel-remaining-brews" data-brew-id="${escapeHtml(brew.id)}">Cancel remaining</button>` : ""}
+        </div>
+      </article>`;
+    }).join("");
+    return `<section class="panel">
+      <div class="row" style="justify-content:space-between;"><h2 class="section-title" style="margin:0;">Brew queue</h2><span class="badge">${brews.length}/${state.brewQueue?.capacity || 16}</span></div>
+      ${recoveryWarning}
+      <p class="muted">The bridge verifies dispensing by observing preparing and a stable return to ready. It cannot detect whether a cup is present.</p>
+      <div class="recipes-grid">${cards}</div>
+    </section>`;
   }
 
   function looksLikeCoffeeMachine(device) {
@@ -2236,7 +2290,7 @@
     return sectionShell(
       "Dashboard",
       "Online means the bridge has a validated BLE protocol session. Nearby is based on periodic BLE scans.",
-      `${stats}${machineCards}`
+      `${stats}${renderBrewQueue()}${machineCards}`
     );
   }
 
@@ -2377,6 +2431,7 @@
     const canConfirm = machine.online && statusSuggestsHostConfirm(liveStatus);
     return `
       ${renderCacheNotice(summary, "Machine summary")}
+      ${renderBrewQueue(machine.serial)}
       <section class="hero-card machine-hero">
         <div class="row" style="justify-content:space-between;align-items:flex-start;">
           <div>
@@ -2691,6 +2746,7 @@
               <div class="field-grid">
                 ${recipeEditableFields(recipe, { includeName: false, includeIcon: false })}
               </div>
+              <label class="check-row" style="margin-top:14px;"><input type="checkbox" name="holdAfter"> Pause the queue after this drink completes</label>
               <div class="row" style="margin-top:14px;">
                 <button type="submit">Make coffee with these values</button>
               </div>
@@ -2882,7 +2938,7 @@
       throw new Error("This history entry cannot be replayed because it has no recipe selector.");
     }
 
-    const payload = { selector, source: "ui-history-replay" };
+    const payload = { selector, source: "ui-history-replay", correlationId: newCorrelationId() };
     const numericFields = [
       "strength",
       "strengthBeans",
@@ -3868,7 +3924,7 @@
       if (action === "brew-standard") {
         const serial = button.dataset.serial;
         const selector = Number(button.dataset.selector);
-        const response = await runWithFlash("Sending brew command…", () => api(`/api/machines/${encodeURIComponent(serial)}/brew`, { json: { selector, source: "ui" } }), "Brew command sent.");
+        const response = await runWithFlash("Adding brew to queue…", () => api(`/api/machines/${encodeURIComponent(serial)}/brew`, { json: { selector, source: "ui", correlationId: newCorrelationId() } }), "Brew queued.");
         await refreshAfterBrew(serial, response);
       }
 
@@ -3893,11 +3949,39 @@
           return;
         }
         const response = await runWithFlash(
-          "Sending brew command…",
+          "Adding brew to queue…",
           () => api(`/api/machines/${encodeURIComponent(serial)}/brew`, { json: payload }),
-          "Brew command sent."
+          "Brew queued."
         );
         await refreshAfterBrew(serial, response);
+      }
+
+      if (action === "cancel-brew") {
+        await runWithFlash("Cancelling queued brew…", () => api(`/api/brews/${encodeURIComponent(button.dataset.brewId)}`, { method: "DELETE" }), "Queued brew cancelled.");
+        await refreshCore();
+        await renderRoute({ showLoading: false });
+      }
+
+      if (action === "abandon-brew") {
+        if (!window.confirm("Stop monitoring this brew and mark its physical outcome unknown?")) return;
+        await runWithFlash("Marking brew outcome unknown…", () => api(`/api/brews/${encodeURIComponent(button.dataset.brewId)}/resolve`, { json: { action: "abandon" } }), "Brew marked unknown; the queue remains paused.");
+        await refreshCore();
+        await renderRoute({ showLoading: false });
+      }
+
+      if (action === "continue-brew") {
+        const risky = button.dataset.risky === "true";
+        if (risky && !window.confirm("The previous drink outcome is unverified. Continue the queue anyway?")) return;
+        await runWithFlash("Continuing brew queue…", () => api(`/api/brews/${encodeURIComponent(button.dataset.brewId)}/resolve`, { json: { action: "continue", acknowledgeRisk: risky } }), "Brew queue continued.");
+        await refreshCore();
+        await renderRoute({ showLoading: false });
+      }
+
+      if (action === "cancel-remaining-brews") {
+        if (!window.confirm("Cancel every definitely unsent drink after the queue head?")) return;
+        await runWithFlash("Cancelling remaining brews…", () => api(`/api/brews/${encodeURIComponent(button.dataset.brewId)}/resolve`, { json: { action: "cancel_remaining" } }), "Remaining unsent brews cancelled.");
+        await refreshCore();
+        await renderRoute({ showLoading: false });
       }
 
       if (action === "confirm-machine") {
@@ -4215,9 +4299,13 @@
       if (action === "brew-standard-custom") {
         const serial = form.dataset.serial;
         const selector = Number(form.dataset.selector);
-        const payload = { selector, source: "ui" };
+        const payload = { selector, source: "ui", correlationId: newCorrelationId() };
         Array.from(form.elements).forEach((field) => {
           if (!field.name || field.disabled) {
+            return;
+          }
+          if (field.name === "holdAfter") {
+            payload.holdAfter = field.checked;
             return;
           }
           if (field.name === "strengthBeans") {
@@ -4236,7 +4324,7 @@
             }
           }
         });
-        const response = await runWithFlash(`Brewing recipe ${selector}…`, () => api(`/api/machines/${encodeURIComponent(serial)}/brew`, { json: payload }), "Brew command sent.");
+        const response = await runWithFlash(`Queueing recipe ${selector}…`, () => api(`/api/machines/${encodeURIComponent(serial)}/brew`, { json: payload }), "Brew queued.");
         await refreshAfterBrew(serial, response);
       }
 
@@ -4419,7 +4507,7 @@
       state.events.supported = capabilities.websocketEvents === true &&
         Number(capabilities.eventProtocolVersion) === EVENT_PROTOCOL_VERSION;
       if (!state.events.supported) {
-        throw new Error("This UI requires bridge WebSocket event protocol 1.");
+        throw new Error("This UI requires bridge WebSocket event protocol 2.");
       }
       await refreshCore();
       renderSidebar();
