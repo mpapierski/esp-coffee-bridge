@@ -17,10 +17,15 @@ Firmware API v2 uses ESP-IDF `esp_http_server` on core 1. Every scan, connection
     "asyncBleJobs": true,
     "websocketEvents": true,
     "eventProtocolVersion": 1,
-    "eventsUrl": "/api/events"
+    "eventsUrl": "/api/events",
+    "crashDumpDownload": true
   }
 }
 ```
+
+`crashDumpDownload` is `true` only when the running partition table contains
+the dedicated core-dump partition. Installing that partition table is a
+one-time USB operation; an application-only OTA cannot add it.
 
 API v2 deliberately has no blocking BLE fallback. A client that needs to work with both firmware generations must retain its API v1 response handling and add transparent API v2 job resolution. The companion Home Assistant integration does this so it can be released before the firmware upgrade.
 
@@ -31,7 +36,8 @@ API v2 deliberately has no blocking BLE fallback. A client that needs to work wi
 - A job owns copied machine identity and normalized request data. It never retains a `SavedMachine*` or HTTP-server request state.
 - Adjacent work for one machine reuses a valid connection, discovered handles, notification subscription, and `HU` session. The worker disconnects after ten idle seconds. A failed transport operation clears the client, handles, and session before the next job.
 - Logical deadlines are 12 seconds for summary/features, 15 seconds for stats/settings, 20 seconds for one recipe/slot, 30 seconds for mutations, and 60 seconds for bulk refreshes and diagnostics. Notification waits are capped at three seconds and at the remaining job time.
-- A supervisor watches the worker heartbeat. If a running BLE call makes no progress for 45 seconds, it records the job in RTC memory and reboots instead of trying to kill the worker or disconnect NimBLE concurrently. The marker and reset reason are published in `/api/status` after boot.
+- A supervisor watches the BLE worker and an independently queued HTTP-task heartbeat. It also watches for a recent failed allocation followed by an HTTP stall, and for free internal heap below 12 KiB or a largest free internal block below 4 KiB continuously for five seconds. Normal HTTP stalls use a 45-second limit; a stall immediately following an allocation failure uses ten seconds.
+- Automatic recovery records its reason, job identity, heap state, HTTP-heartbeat age, and latest failed allocation in RTC memory, then enters the ESP panic path. This is intentionally different from the administrative reboot and OTA paths: a panic lets ESP-IDF persist all task stacks to the core-dump partition before restarting. The older `bleWatchdog` marker remains available for BLE-specific stalls, while `bridgeRecovery` covers every automatic recovery reason.
 - The worker owns three-second idle scans scheduled once per minute. Scan interval/window are configured at `100`/`30`, duplicate filtering is enabled, and a background scan yields at a safe boundary when interactive work arrives.
 - One coalesced, low-priority statistics refresh is scheduled per remembered machine every 15 minutes. A counter-history entry is appended only after a successful sample whose values differ from the last stored sample.
 
@@ -107,7 +113,7 @@ BLE-backed routes return jobs, including scans and probes; connect, disconnect, 
 
 `GET /api/events` upgrades to a WebSocket when `capabilities.websocketEvents` is true. The bridge supports four concurrent event clients and up to eight watched jobs per client. Browser clients send `{"type":"watch_job","jobId":"..."}` and receive a current job snapshot immediately followed by change events until the job is terminal. `unwatch_job` releases a subscription and `ping` receives `pong`.
 
-The first server message is `hello`, containing `eventProtocolVersion`, `apiVersion`, a boot-scoped sequence value, and the full status snapshot. Subsequent `status`, `job`, and `resync` messages use the same sequence scope. Changes are coalesced in a fixed-capacity buffer; overflow emits `resync`, after which clients re-establish outstanding watches. Status updates are limited to once per second while busy and once every five seconds while idle.
+The first server message is `hello`, containing `eventProtocolVersion`, `apiVersion`, a boot-scoped sequence value, and the full status snapshot. Subsequent `status`, `job`, and `resync` messages use the same sequence scope. Changes are coalesced in a fixed-capacity buffer; overflow emits `resync`, after which clients re-establish outstanding watches. Status updates are limited to once per second while busy and once every five seconds while idle. Status JSON uses a bounded document allocated once at boot and a fixed response/event buffer, so concurrent BLE work and WebSocket clients do not create a large transient allocation for every status request.
 
 The bridge accepts an absent `Origin` for non-browser tools. When browsers provide it, the value must equal the request's `http://Host` origin; a mismatch is closed immediately. WebSocket payloads expose only public job metadata and never request bodies, credentials, machine secrets, or retained diagnostic result contents. Broken or slow clients are disconnected rather than allowed to stall the event stream.
 
@@ -117,11 +123,40 @@ The bridge accepts an absent `Origin` for non-browser tools. When browsers provi
 
 - `bleQueue`: capacity, queued/running counts, and submitted, completed, failed, cancelled, rejected, coalesced, and background-eviction counters.
 - `bleWorker`: readiness, busy state, current job identity and age, heartbeat age, and stack high-water mark.
-- `bleWatchdog`: the retained stall marker with the affected job identity.
-- `memory`: free heap, minimum free heap, and largest free 8-bit-capable block.
+- `bleWatchdog`: the retained BLE-stall marker with the affected job identity.
+- `bridgeRecovery`: the retained reason and resource context for the last automatic recovery.
+- `memory`: free internal heap, minimum free internal heap, largest free internal
+  8-bit-capable block, N16R8 PSRAM size/free/minimum/largest-block values, and
+  count/details of the latest failed allocation.
 - `resetReason`, `durableMachineWriteCount`, and cached LittleFS/history totals.
-- `http.lastDurationUs` and `http.maxDurationUs` for on-device handler timing.
+- `http`: readiness, handler timing, heartbeat age, task stack high-water mark, pending health-probe state, and probe queue failures.
+- `crashDump`: partition availability, dump presence/integrity, byte length, crashed task/PC, and the crashing application's ELF SHA when a summary is available.
 - asynchronous NTP diagnostic state, including pending/running flags and diagnostic worker stack high-water mark.
+
+### Crash-dump diagnostics
+
+The ESP32-S3-N16R8 target uses 16 MB quad-I/O flash and 8 MB octal-I/O PSRAM.
+Its partition layout reserves 256 KiB at `0xfc0000`, the end of flash, for an
+ESP-IDF ELF core dump. NVS and both OTA slots are unchanged. LittleFS retains
+its `0x310000` start address and grows from 960 KiB to 8 MiB; the remaining
+4.6875 MiB between it and the core-dump partition is unallocated. The bundled
+LittleFS driver grows an existing filesystem on first mount without formatting
+it. After an abnormal recovery or another panic, the dump survives reboot and
+is never erased automatically.
+
+- `GET /api/crash-dump` streams the validated raw partition image. It requires
+  `X-Bridge-Diagnostics-Confirm: download-crash-dump`.
+- `DELETE /api/crash-dump` erases the retained image. It requires
+  `X-Bridge-Diagnostics-Confirm: erase-crash-dump`.
+
+These routes deliberately omit permissive CORS headers, and the non-simple
+confirmation header prevents an ordinary cross-origin browser request. This is
+a safety guard, not authentication against another device already on the LAN.
+A dump may contain credentials, protocol material, and other RAM contents, so
+store and transfer it as sensitive data. Retain the exact
+`.pio/build/esp32dev/firmware.elf` whose ELF SHA matches `crashDump.appElfSha256`;
+symbolication with a different build is unreliable. Power removal, a brownout,
+or a hard failure before the panic handler runs may leave no dump.
 
 ### Embedded UI and storage behavior
 
@@ -233,9 +268,16 @@ Current embedded bridge UI is now organized around remembered machines rather th
     - includes a stable `bridgeId` derived from the ESP32 eFuse MAC and an integer `apiVersion`
     - includes `ntpDiagnosticCode`, `ntpDiagnosticMessage`, `ntpDiagnosticServer`, `ntpDiagnosticAddress`, and `ntpDiagnosticRoundTripMs`
     - the system page uses those fields to tell DNS failure apart from a missing UDP/123 reply
+  - `GET /api/crash-dump`
+    - requires `X-Bridge-Diagnostics-Confirm: download-crash-dump`
+    - streams the retained, validated ESP-IDF core-dump image without erasing it
+  - `DELETE /api/crash-dump`
+    - requires `X-Bridge-Diagnostics-Confirm: erase-crash-dump`
+    - explicitly erases the retained core dump after it has been archived and investigated
   - `GET /api/backup/export`
     - preflights and streams an immutable NDJSON backup snapshot with saved machines, the configured history budgets, and all valid persisted brew/counter-history entries
-    - validates each history entry independently, streams complete NDJSON records through a bounded output buffer, skips malformed/torn physical lines, and refuses to start an oversized response; bridge-generated bundles are capped at 720 KiB, enough for the complete writable history set plus bundle metadata on the current partition
+    - validates each history entry independently, groups normalized entries into bounded array records, streams complete NDJSON records through a bounded output buffer, skips malformed/torn physical lines, and refuses to start an oversized response
+    - bridge-generated bundles are capped at 7,500 KiB; a compile-time and native-test boundary calculation covers the smallest valid entries, maximum escaped record envelopes, all 32 history files, and non-history records at the full 6,000 KiB writable-history limit on the 8 MiB partition
     - never compacts or otherwise mutates live history before export
     - excludes Wi-Fi credentials, protocol-session cache, and LittleFS recipe caches
   - `POST /api/backup/restore`

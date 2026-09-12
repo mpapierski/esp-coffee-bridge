@@ -2,6 +2,9 @@
 
 `esp-coffee-bridge` is an ESP32 Wi-Fi/BLE bridge for coffee machines that use a proprietary Bluetooth Low Energy protocol.
 
+The firmware target is an ESP32-S3-N16R8 module: 16 MB quad-I/O flash and
+8 MB octal-I/O PSRAM.
+
 The official mobile apps are constrained by the same short-range BLE link as the machine itself, so in practice they are most useful when you are already standing right next to the coffee machine. This project takes the opposite approach: put a small ESP32 next to the machine permanently, let it handle the BLE conversation locally, and expose the machine over normal Wi-Fi through a local web UI and HTTP API.
 
 That only works because the bridge reimplements the vendor protocol from reverse-engineered traffic, APK analysis, and family-specific register mapping. The reverse-engineering notes live in [docs/NIVONA.md](docs/NIVONA.md).
@@ -13,6 +16,7 @@ Core pieces:
 - onboard saved-machine web UI
 - JSON API for pairing, remembered machines, recipes, settings, stats, and diagnostics
 - HTTP OTA upload for remote firmware updates
+- persistent ESP-IDF crash dumps with guarded post-reboot download
 
 ## Home Assistant
 
@@ -73,11 +77,21 @@ pio run
 
 ## First Flash Over USB
 
-Adjust `upload_port` in `platformio.ini` if needed or pass it on the command line:
+The first flash installs the N16R8 memory configuration, an 8 MiB LittleFS
+partition, and the dedicated core-dump partition as well as the firmware.
+Adjust `upload_port` in `platformio.ini` if needed or pass it on the command
+line:
 
 ```bash
 pio run -t upload
 ```
+
+An existing bridge flashed with an older partition table also needs this
+one-time USB upload; application-only OTA updates cannot change the partition
+table. The LittleFS start address is unchanged, and the filesystem grows on
+first mount without formatting existing data. Back up the bridge before this
+layout upgrade, and do not later reinstall a partition table that shrinks
+LittleFS back to 960 KiB.
 
 ## Network / Access
 
