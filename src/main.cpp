@@ -63,6 +63,7 @@ constexpr size_t BREW_HISTORY_PRECHECK_RESERVE_BYTES = 448;
 constexpr uint32_t STATS_HISTORY_POLL_INTERVAL_MS = 15 * 60 * 1000;
 constexpr uint32_t IDLE_SCAN_INTERVAL_MS = 60 * 1000;
 constexpr uint32_t BLE_IDLE_DISCONNECT_MS = 10 * 1000;
+constexpr uint32_t MACHINE_KEEPALIVE_INTERVAL_MS = 10 * 1000;
 constexpr uint32_t WORKER_STALL_WATCHDOG_MS = 45 * 1000;
 constexpr uint32_t HTTP_STALL_WATCHDOG_MS = 45 * 1000;
 constexpr uint32_t HTTP_ALLOC_FAILURE_STALL_MS = 10 * 1000;
@@ -223,6 +224,12 @@ struct MachineGenerationEntry {
     uint32_t lastStatsScheduledAtMs{0};
 };
 
+enum class MachineSessionState : uint8_t {
+    Offline,
+    Connecting,
+    Online,
+};
+
 enum class BleOperation : uint16_t {
     MachineSummary = 1,
     MachineStats,
@@ -237,6 +244,7 @@ enum class BleOperation : uint16_t {
     MachineMyCoffeeUpdate,
     MachineSettingsPost,
     MachineRefresh,
+    MachineKeepAlive,
     Scan,
     MachineProbe,
     MachinesCreate,
@@ -480,6 +488,10 @@ String selectedMachineSerial;
 String wifiStaSsid;
 SharedStatusText<32> pairingStatus("idle");
 SharedStatusText<128> lastError;
+SharedStatusText<64> machineSessionSerial;
+std::atomic<MachineSessionState> machineSessionState{MachineSessionState::Offline};
+std::atomic<uint32_t> machineSessionLastPongAtMs{0};
+std::atomic<uint32_t> machineSessionNextPingAtMs{0};
 String lastHuSeedHex;
 String lastHuRequestHex;
 String lastHuResponseHex;
@@ -653,6 +665,49 @@ void clearRemoteHandles() {
     notificationsEnabled = false;
 }
 
+const char* machineSessionStateName(MachineSessionState state) {
+    switch (state) {
+        case MachineSessionState::Offline: return "offline";
+        case MachineSessionState::Connecting: return "connecting";
+        case MachineSessionState::Online: return "online";
+    }
+    return "offline";
+}
+
+bool machineSessionTargets(const String& serial) {
+    return !serial.isEmpty() &&
+        machineSessionSerial.snapshot().equalsIgnoreCase(serial);
+}
+
+bool machineSessionIsOnline(const String& serial = "") {
+    return machineSessionState.load(std::memory_order_acquire) ==
+            MachineSessionState::Online &&
+        (serial.isEmpty() || machineSessionTargets(serial));
+}
+
+void markMachineSessionConnecting(const String& serial) {
+    machineSessionSerial = serial;
+    machineSessionLastPongAtMs.store(0, std::memory_order_release);
+    machineSessionNextPingAtMs.store(0, std::memory_order_release);
+    machineSessionState.store(MachineSessionState::Connecting, std::memory_order_release);
+}
+
+void markMachineSessionOnline(const String& serial) {
+    const uint32_t nowMs = millis();
+    machineSessionSerial = serial;
+    machineSessionLastPongAtMs.store(nowMs, std::memory_order_release);
+    machineSessionNextPingAtMs.store(
+        nowMs + MACHINE_KEEPALIVE_INTERVAL_MS, std::memory_order_release);
+    machineSessionState.store(MachineSessionState::Online, std::memory_order_release);
+}
+
+void markMachineSessionOffline() {
+    machineSessionState.store(MachineSessionState::Offline, std::memory_order_release);
+    machineSessionSerial = "";
+    machineSessionLastPongAtMs.store(0, std::memory_order_release);
+    machineSessionNextPingAtMs.store(0, std::memory_order_release);
+}
+
 void invalidateRemoteHandlesForFullDiscovery() {
     // NimBLE's refresh=true discovery deletes its cached remote objects. Drop
     // every application pointer before those objects are released.
@@ -673,6 +728,7 @@ void applyClientDisconnectedEvent() {
     clearRemoteHandles();
     cachedDetails = DeviceDetails{};
     protocolSessions.clear();
+    markMachineSessionOffline();
 }
 
 String normalizeNotificationMode(const String& mode) {
@@ -3297,6 +3353,10 @@ void syncProtocolSessionTarget(const SavedMachine& machine) {
 }
 
 void appendSavedMachineJson(JsonObject target, const SavedMachine& machine) {
+    const bool sessionTargetsMachine = machineSessionTargets(machine.serial);
+    const MachineSessionState sessionState = sessionTargetsMachine
+        ? machineSessionState.load(std::memory_order_acquire)
+        : MachineSessionState::Offline;
     target["serial"] = machine.serial;
     target["alias"] = machine.alias;
     target["address"] = machine.address;
@@ -3314,7 +3374,9 @@ void appendSavedMachineJson(JsonObject target, const SavedMachine& machine) {
     target["lastSeenRssi"] = machine.lastSeenRssi;
     target["lastSeenAtMs"] = machine.lastSeenAtMs;
     target["savedAtMs"] = machine.savedAtMs;
-    target["online"] = machine.lastSeenAtMs > 0;
+    target["nearby"] = machine.lastSeenAtMs > 0;
+    target["online"] = sessionState == MachineSessionState::Online;
+    target["sessionState"] = machineSessionStateName(sessionState);
 }
 
 void appendBackupMachineJson(JsonObject target, const SavedMachine& machine) {
@@ -6278,7 +6340,16 @@ bool mergeWorkerMachineDetailsIfChanged(const WorkerExecutionContext& execution)
     return reconciled;
 }
 
+bool ensureMachineHuSession(uint32_t waitMs, String& error);
+bool pingMachineProtocol(String& error);
+
 bool beginMachineProtocolSession(SavedMachine& machine, String& error, bool clearSession = true) {
+    WorkerExecutionContext* execution = currentWorkerExecution();
+    const bool persistentSession = execution == nullptr || !execution->backgroundJob;
+    const bool alreadyOnline = machineSessionIsOnline(machine.serial);
+    if (persistentSession && !alreadyOnline) {
+        markMachineSessionConnecting(machine.serial);
+    }
     if (!selectSavedMachine(machine, error)) {
         return false;
     }
@@ -6305,6 +6376,15 @@ bool beginMachineProtocolSession(SavedMachine& machine, String& error, bool clea
         }
     }
     updateSavedMachineFromCachedDetails(machine);
+    if (!ensureMachineHuSession(2500, error)) {
+        return false;
+    }
+    if (persistentSession && !alreadyOnline) {
+        if (!pingMachineProtocol(error)) {
+            return false;
+        }
+        markMachineSessionOnline(machine.serial);
+    }
     lastBleActivityAtMs = millis();
     return true;
 }
@@ -6316,6 +6396,55 @@ bool ensureMachineHuSession(uint32_t waitMs, String& error) {
     DynamicJsonDocument scratch(4096);
     JsonArray scenarios = scratch.createNestedArray("scenarios");
     return establishHuSessionForProbe(waitMs, "machine_hu_internal", "machine-hu", scenarios, error);
+}
+
+bool pingMachineProtocol(String& error) {
+    ByteVector requestPacket;
+    std::vector<ByteVector> chunks;
+    std::vector<uint32_t> times;
+    bool writeWithResponse = true;
+    bool canWrite = false;
+    bool canWriteNoResponse = false;
+    if (!sendPreparedFramePacket("Hp",
+                                 ByteVector{0x00, 0x00},
+                                 nullptr,
+                                 false,
+                                 true,
+                                 0,
+                                 2500,
+                                 writeWithResponse,
+                                 canWrite,
+                                 canWriteNoResponse,
+                                 requestPacket,
+                                 chunks,
+                                 times,
+                                 error)) {
+        return false;
+    }
+    return nivona::decodeHpResponse(chunks, error);
+}
+
+void handleMachineKeepAlive(const String& serial) {
+    if (!machineSessionIsOnline(serial)) {
+        DynamicJsonDocument response(512);
+        response["ok"] = true;
+        response["skipped"] = true;
+        sendJson(response);
+        return;
+    }
+    String error;
+    if (!pingMachineProtocol(error)) {
+        lastError = error;
+        markMachineSessionOffline();
+        sendError(503, error.isEmpty() ? String("machine liveness probe failed") : error);
+        return;
+    }
+    markMachineSessionOnline(serial);
+    DynamicJsonDocument response(512);
+    response["ok"] = true;
+    response["online"] = true;
+    response["lastPongAtMs"] = machineSessionLastPongAtMs.load(std::memory_order_acquire);
+    sendJson(response);
 }
 
 bool readMachineNumericRegister(uint16_t registerId, int32_t& valueOut, String& error, uint32_t waitMs = 2500) {
@@ -6687,6 +6816,15 @@ void appendStatus(JsonDocument& doc, bool includeRuntimeDiagnostics = false) {
     doc["pairingStatus"] = health.pairingStatus;
     doc["lastError"]     = health.lastError;
     doc["protocolSessionCount"] = health.protocolSessionCount;
+    JsonObject machineSession = doc.createNestedObject("machineSession");
+    const MachineSessionState currentMachineSessionState =
+        machineSessionState.load(std::memory_order_acquire);
+    machineSession["state"] = machineSessionStateName(currentMachineSessionState);
+    machineSession["serial"] = machineSessionSerial.snapshot();
+    machineSession["online"] = currentMachineSessionState == MachineSessionState::Online;
+    machineSession["lastPongAtMs"] =
+        machineSessionLastPongAtMs.load(std::memory_order_acquire);
+    machineSession["pingIntervalMs"] = MACHINE_KEEPALIVE_INTERVAL_MS;
     doc["standardRecipeCacheReady"] = littleFsReady;
     doc["littleFsReady"] = littleFsReady;
     doc["littleFsTotalBytes"] = health.littleFsTotalBytes;
@@ -6696,6 +6834,7 @@ void appendStatus(JsonDocument& doc, bool includeRuntimeDiagnostics = false) {
     capabilities["websocketEvents"] = true;
     capabilities["eventProtocolVersion"] = 1;
     capabilities["eventsUrl"] = "/api/events";
+    capabilities["implicitMachineSessions"] = true;
     if (includeRuntimeDiagnostics) {
         capabilities["crashDumpDownload"] = dump.supported;
     }
@@ -11201,6 +11340,7 @@ void handleDisconnect() {
         sendError(400, error);
         return;
     }
+    markMachineSessionOffline();
     DynamicJsonDocument response(8192);
     response["ok"] = true;
     appendStatus(response);
@@ -12987,7 +13127,8 @@ void handleMachineResourceRequest(const String& serial, const String& resource) 
         return;
     }
     const String canonicalSerial = machine->serial;
-    const bool forced = parseRefreshArg();
+    const bool forced = parseRefreshArg() ||
+        (resource == "summary" && !machineSessionIsOnline(canonicalSerial));
     ResourceCacheEntry cache;
     const bool hasMetadata = copyResourceCache(canonicalSerial, resource, cache);
     if (hasMetadata) {
@@ -13448,6 +13589,7 @@ void restartAfterStuckBleCleanup(const String& reason) {
 }
 
 void resetBleClientAfterFailure() {
+    markMachineSessionOffline();
     if (client != nullptr) {
         // Never ask NimBLE to delete a client whose asynchronous termination
         // is still pending. The callback owns the transition to disconnected;
@@ -13487,12 +13629,38 @@ void requestBleWorkerReset() {
     }
 }
 
+bool operationNeedsImplicitMachineSession(BleOperation operation) {
+    switch (operation) {
+        case BleOperation::ProtocolSendFrame:
+        case BleOperation::GattServices:
+        case BleOperation::GattRead:
+        case BleOperation::GattWrite:
+        case BleOperation::ProtocolRawRead:
+        case BleOperation::ProtocolRawWrite:
+            return true;
+        default:
+            return false;
+    }
+}
+
 void invokeQueuedHandler(WorkerExecutionContext& context) {
     context.forceRefresh = true;
     if (context.machineLoaded) {
         selectMachineTarget(context.machine);
     } else if (!context.targetAddress.isEmpty()) {
         selectAddressTarget(context.targetAddress, context.targetAddressType);
+    }
+    if (context.machineLoaded &&
+        operationNeedsImplicitMachineSession(context.operation) &&
+        !machineSessionIsOnline(context.machine.serial)) {
+        String error;
+        if (!beginMachineProtocolSession(context.machine, error)) {
+            lastError = error;
+            sendError(503, error.isEmpty()
+                ? String("machine session could not be established")
+                : error);
+            return;
+        }
     }
     switch (context.operation) {
         case BleOperation::MachineSummary: handleMachineSummary(context.target); break;
@@ -13511,6 +13679,7 @@ void invokeQueuedHandler(WorkerExecutionContext& context) {
             handleMachineMyCoffeeDetail(context.target, context.argument, true);
             break;
         case BleOperation::MachineSettingsPost: handleMachineSettingsPost(context.target); break;
+        case BleOperation::MachineKeepAlive: handleMachineKeepAlive(context.target); break;
         case BleOperation::Scan: handleScan(); break;
         case BleOperation::MachineProbe: handleMachineProbe(); break;
         case BleOperation::MachinesCreate: handleMachinesCreate(); break;
@@ -13672,7 +13841,9 @@ void updateWorkerOwnedHealth() {
 }
 
 bool shouldSpoolJobResult(BleOperation operation) {
-    (void)operation;
+    if (operation == BleOperation::MachineKeepAlive) {
+        return false;
+    }
     // Keep terminal metadata compact and avoid retaining response-sized String
     // allocations for five minutes. Every mutation/diagnostic result is served
     // from its bounded LittleFS spool file.
@@ -13723,7 +13894,8 @@ void bleWorkerTask(void*) {
             }
         }
         if (!haveJob) {
-            if (client != nullptr && client->isConnected() &&
+            if (!machineSessionIsOnline() &&
+                client != nullptr && client->isConnected() &&
                 static_cast<uint32_t>(millis() - lastBleActivityAtMs) >= BLE_IDLE_DISCONNECT_MS) {
                 String disconnectError;
                 if (!disconnectClientAndWait(disconnectError, 1500, true)) {
@@ -14330,6 +14502,44 @@ void markBackgroundStatsScheduled(const SavedMachine& machine, uint32_t nowMs) {
 }
 
 void scheduleBackgroundBleJobs(uint32_t nowMs) {
+    const MachineSessionState sessionState =
+        machineSessionState.load(std::memory_order_acquire);
+    if (sessionState != MachineSessionState::Offline) {
+        if (sessionState == MachineSessionState::Online &&
+            bridge_runtime_policy::deadlineReached(
+                nowMs, machineSessionNextPingAtMs.load(std::memory_order_acquire))) {
+            const String serial = machineSessionSerial.snapshot();
+            SavedMachine machine;
+            bool found = false;
+            if (machineMutex != nullptr &&
+                xSemaphoreTake(machineMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                if (SavedMachine* stored = findSavedMachineBySerialGlobal(serial); stored != nullptr) {
+                    machine = *stored;
+                    found = true;
+                }
+                xSemaphoreGive(machineMutex);
+            }
+            if (!found) {
+                markMachineSessionOffline();
+                return;
+            }
+            bridge_jobs::Submission ping;
+            ping.kind = "machine_keepalive";
+            ping.target = machine.serial.c_str();
+            ping.operationCode = static_cast<uint16_t>(BleOperation::MachineKeepAlive);
+            ping.identity = serializeMachineIdentity(machine).c_str();
+            ping.coalesceKey = (String("machine-keepalive:") + machine.serial).c_str();
+            ping.priority = bridge_jobs::Priority::ForcedRead;
+            ping.deadlineMs = 8000;
+            const BackgroundSubmitResult result = submitBackgroundJob(ping);
+            machineSessionNextPingAtMs.store(
+                nowMs + (result == BackgroundSubmitResult::Deferred
+                    ? 250U
+                    : MACHINE_KEEPALIVE_INTERVAL_MS),
+                std::memory_order_release);
+        }
+        return;
+    }
     const bool idleScanRetryDue = nextIdleScanSubmitAtMs == 0 ||
         bridge_runtime_policy::deadlineReached(nowMs, nextIdleScanSubmitAtMs);
     if (idleScanRetryDue &&

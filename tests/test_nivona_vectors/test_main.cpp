@@ -40,6 +40,26 @@ void test_build_packet_matches_documented_request_vectors() {
     assertHexEquals("5348521F1D014D033DEE45", nivona::buildPacket("HR", decodeHex("00D5000004D2"), nullptr, true));
 }
 
+void test_hp_liveness_response_requires_valid_24_byte_payload() {
+    ByteVector payload(24, 0x2A);
+    const ByteVector packet = nivona::buildPacket("Hp", payload, nullptr, false);
+    std::vector<ByteVector> split{
+        ByteVector(packet.begin(), packet.begin() + 20),
+        ByteVector(packet.begin() + 20, packet.end()),
+    };
+    String error;
+    TEST_ASSERT_TRUE_MESSAGE(nivona::decodeHpResponse(split, error), error.c_str());
+
+    std::vector<ByteVector> mixed{decodeHex("534100BE45"), split[0], split[1]};
+    TEST_ASSERT_TRUE_MESSAGE(nivona::decodeHpResponse(mixed, error), error.c_str());
+
+    std::vector<ByteVector> shortResponse{
+        nivona::buildPacket("Hp", ByteVector(23, 0x2A), nullptr, false),
+    };
+    TEST_ASSERT_FALSE(nivona::decodeHpResponse(shortResponse, error));
+    TEST_ASSERT_EQUAL_STRING("Hp response payload must contain exactly 24 bytes", error.c_str());
+}
+
 void test_live_hu_vector_round_trips_through_decoder_and_payload_validator() {
     const ByteVector seed = decodeHex("12314BF7");
     const ByteVector verifier = nivona::deriveHuVerifier(seed, 0, seed.size());
@@ -265,6 +285,7 @@ int main(int argc, char** argv) {
     UNITY_BEGIN();
     RUN_TEST(test_rc4_transform_vectors_match_documented_examples);
     RUN_TEST(test_build_packet_matches_documented_request_vectors);
+    RUN_TEST(test_hp_liveness_response_requires_valid_24_byte_payload);
     RUN_TEST(test_live_hu_vector_round_trips_through_decoder_and_payload_validator);
     RUN_TEST(test_live_hr_response_decodes_without_session_echo);
     RUN_TEST(test_live_hr_response_rejects_incorrect_session_echo_expectation);
