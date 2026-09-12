@@ -68,7 +68,10 @@ public:
     using Handler = std::function<void()>;
     using BeforeRequest = bool (*)(void* context);
     using AfterRequest = void (*)(uint32_t durationUs, void* context);
-    using StatusRenderer = bool (*)(String& jsonOut, void* context);
+    using StatusRenderer = bool (*)(char* jsonOut,
+                                    size_t capacity,
+                                    size_t& lengthOut,
+                                    void* context);
     using JobRenderer = EventJobLookup (*)(const String& id,
                                            String& jsonOut,
                                            bool& terminalOut,
@@ -99,12 +102,14 @@ public:
     String arg(const String& name) const;
     bool hasHeader(const String& name) const;
     String header(const String& name) const;
+    bool headerEquals(const char* name, const char* expected) const;
     HTTPUpload& upload();
 
     void sendHeader(const String& name, const String& value, bool first = false);
     void setContentLength(size_t length);
     void send(int code, const char* contentType, const String& body);
     void send(int code, const char* contentType, const char* body);
+    void send(int code, const char* contentType, const char* body, size_t length);
     void send_P(int code,
                 const char* contentType,
                 PGM_P body,
@@ -118,8 +123,18 @@ public:
 
     void notifyJobChanged(const char* id);
     void markStatusChanged();
+    bool sendStatusSnapshot();
     void tickEvents(uint32_t nowMs, bool active);
     size_t websocketClientCount() const;
+    bool running() const;
+    uint32_t taskHeartbeatAtMs() const;
+    uint32_t taskHeartbeatAgeMs(uint32_t nowMs) const;
+    uint32_t taskStackHighWaterBytes() const;
+    bool healthProbePending() const;
+    uint32_t healthProbeQueueFailures() const;
+    // Long synchronous handlers call this while making bounded progress. The
+    // queued health probe runs on this same task and cannot do so for them.
+    void markTaskProgress();
 
 private:
     friend class BridgeHttpClient;
@@ -138,8 +153,6 @@ private:
         String body;
         std::vector<std::pair<String, String>> args;
         std::vector<std::pair<String, String>> responseHeaders;
-        String responseType;
-        String responseStatus;
         size_t contentLength{0};
         size_t streamedBytes{0};
         bool contentLengthSet{false};
@@ -161,10 +174,13 @@ private:
     static constexpr uint32_t EVENT_DIRTY_MIN_INTERVAL_MS = 200;
     static constexpr uint32_t EVENT_ACTIVE_STATUS_INTERVAL_MS = 1000;
     static constexpr uint32_t EVENT_IDLE_STATUS_INTERVAL_MS = 5000;
+    static constexpr uint32_t HEALTH_PROBE_INTERVAL_MS = 5000;
+    static constexpr size_t STATUS_MESSAGE_CAPACITY = 5120;
 
     static esp_err_t dispatchThunk(httpd_req_t* request);
     static esp_err_t websocketThunk(httpd_req_t* request);
     static void eventWorkThunk(void* context);
+    static void healthProbeThunk(void* context);
     static void closeSessionThunk(httpd_handle_t handle, int fd);
     static void ignoreGlobalContextFree(void*) {}
 
@@ -194,9 +210,15 @@ private:
                         const char* message,
                         const char* jobId = nullptr);
     bool sendEvent(EventClient& client, const String& payload);
+    bool sendEvent(EventClient& client, const char* payload, size_t length);
+    bool renderStatusEventMessage(const char* type,
+                                  bool hello,
+                                  size_t& lengthOut);
     String nextEventSequence();
     void drainEventWork();
     void requestEventWork();
+    void updateTaskHeartbeat();
+    void tickHealthProbe(uint32_t nowMs);
 
     uint16_t port_{80};
     httpd_handle_t handle_{nullptr};
@@ -215,11 +237,18 @@ private:
     void* eventContext_{nullptr};
     std::array<EventClient, MAX_EVENT_CLIENTS> eventClients_{};
     std::atomic<size_t> eventClientCount_{0};
+    std::array<char, STATUS_MESSAGE_CAPACITY> statusMessage_{};
     portMUX_TYPE eventChangesMutex_ = portMUX_INITIALIZER_UNLOCKED;
     EventChanges eventChanges_;
     bool eventWorkQueued_{false};
     uint32_t lastEventDispatchAtMs_{0};
     std::atomic<uint32_t> lastStatusEventAtMs_{0};
+    std::atomic<bool> running_{false};
+    std::atomic<uint32_t> taskHeartbeatAtMs_{0};
+    std::atomic<uint32_t> taskStackHighWaterBytes_{0};
+    std::atomic<bool> healthProbePending_{false};
+    std::atomic<uint32_t> healthProbeQueueFailures_{0};
+    std::atomic<uint32_t> lastHealthProbeQueuedAtMs_{0};
 };
 
 } // namespace bridge_http

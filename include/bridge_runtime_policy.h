@@ -29,12 +29,53 @@ constexpr uint32_t clampWaitToDeadline(uint32_t requestedMs,
     return std::min(std::min(requestedMs, maximumWaitMs), deadlineRemaining(nowMs, deadlineAtMs));
 }
 
+// A heartbeat can advance on another core immediately after the caller reads
+// nowMs. Treat that tiny apparent future timestamp as fresh, not as a wrapped
+// multi-week stall.
+constexpr bool heartbeatExpired(uint32_t nowMs,
+                                uint32_t heartbeatAtMs,
+                                uint32_t stallTimeoutMs) {
+    const int32_t ageMs = static_cast<int32_t>(nowMs - heartbeatAtMs);
+    return ageMs >= 0 && static_cast<uint32_t>(ageMs) >= stallTimeoutMs;
+}
+
 constexpr bool watchdogShouldReboot(bool jobActive,
                                     bool transportCallActive,
                                     uint32_t nowMs,
                                     uint32_t heartbeatAtMs,
                                     uint32_t stallTimeoutMs) {
-    return jobActive && transportCallActive && elapsedAtLeast(nowMs, heartbeatAtMs, stallTimeoutMs);
+    return jobActive && transportCallActive &&
+        heartbeatExpired(nowMs, heartbeatAtMs, stallTimeoutMs);
+}
+
+constexpr bool httpHeartbeatExpired(bool serverRunning,
+                                    uint32_t nowMs,
+                                    uint32_t heartbeatAtMs,
+                                    uint32_t stallTimeoutMs) {
+    return serverRunning && heartbeatExpired(nowMs, heartbeatAtMs, stallTimeoutMs);
+}
+
+constexpr bool criticalMemory(uint32_t freeHeap,
+                              uint32_t largestFreeBlock,
+                              uint32_t minimumFreeHeap,
+                              uint32_t minimumLargestBlock) {
+    return freeHeap < minimumFreeHeap || largestFreeBlock < minimumLargestBlock;
+}
+
+constexpr bool sustainedCondition(bool condition,
+                                  bool observationActive,
+                                  uint32_t nowMs,
+                                  uint32_t observedAtMs,
+                                  uint32_t durationMs) {
+    return condition && observationActive &&
+        elapsedAtLeast(nowMs, observedAtMs, durationMs);
+}
+
+constexpr bool recentFailure(uint32_t failureCount,
+                             uint32_t nowMs,
+                             uint32_t failureAtMs,
+                             uint32_t recentWindowMs) {
+    return failureCount != 0 && !elapsedAtLeast(nowMs, failureAtMs, recentWindowMs);
 }
 
 constexpr bool retainWorkerResultFile(bool resource,

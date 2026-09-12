@@ -6,6 +6,7 @@
 #include <Update.h>
 #include <WiFi.h>
 #include <esp_attr.h>
+#include <esp_core_dump.h>
 #include <esp_heap_caps.h>
 #include <esp_partition.h>
 #include <esp_system.h>
@@ -18,6 +19,7 @@
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <new>
 #include <string>
@@ -48,10 +50,9 @@ constexpr char AP_SSID[]        = "esp-coffee-maker";
 constexpr char AP_PASSWORD[]    = "coffee-setup";
 constexpr char APP_BUILD_TIME[] = __DATE__ " " __TIME__;
 constexpr uint32_t API_VERSION  = 2;
-// A serialized status snapshot is currently below 3 KiB. Reserve enough
-// ArduinoJson metadata without requiring an 8 KiB contiguous heap block while
-// the BLE worker owns its larger bounded response document.
-constexpr size_t STATUS_JSON_CAPACITY = 4096;
+// Status is rendered from fixed-capacity storage reused for every request
+// because it is also the primary health endpoint under allocation pressure.
+constexpr size_t STATUS_JSON_CAPACITY = 6144;
 constexpr uint32_t SCAN_MS      = 3000;
 constexpr uint32_t HTTP_TIMEOUT = 10000;
 constexpr uint32_t DEFAULT_RECONNECT_DELAY_MS = 750;
@@ -62,6 +63,12 @@ constexpr uint32_t STATS_HISTORY_POLL_INTERVAL_MS = 15 * 60 * 1000;
 constexpr uint32_t IDLE_SCAN_INTERVAL_MS = 60 * 1000;
 constexpr uint32_t BLE_IDLE_DISCONNECT_MS = 10 * 1000;
 constexpr uint32_t WORKER_STALL_WATCHDOG_MS = 45 * 1000;
+constexpr uint32_t HTTP_STALL_WATCHDOG_MS = 45 * 1000;
+constexpr uint32_t HTTP_ALLOC_FAILURE_STALL_MS = 10 * 1000;
+constexpr uint32_t ALLOCATION_FAILURE_RECENT_MS = 60 * 1000;
+constexpr uint32_t CRITICAL_MEMORY_DURATION_MS = 5 * 1000;
+constexpr uint32_t CRITICAL_FREE_HEAP_BYTES = 12 * 1024;
+constexpr uint32_t CRITICAL_LARGEST_BLOCK_BYTES = 4 * 1024;
 constexpr uint32_t JOB_POLL_AFTER_MS = 500;
 constexpr uint32_t SUMMARY_CACHE_TTL_MS = 60 * 1000;
 constexpr uint32_t DEEP_CACHE_TTL_MS = 15 * 60 * 1000;
@@ -94,6 +101,9 @@ constexpr uint32_t BACKUP_RESTORE_STATE_MAGIC = 0x42525332;
 constexpr size_t MAX_BACKUP_RESTORE_UPLOAD_BYTES =
     history_capacity::MAX_GENERATED_BACKUP_BYTES;
 constexpr size_t MAX_BACKUP_JSON_LINE_BYTES = history_storage::MAX_JSON_LINE_BYTES + 1024;
+constexpr char DIAGNOSTIC_CONFIRM_HEADER[] = "X-Bridge-Diagnostics-Confirm";
+constexpr char CRASH_DUMP_DOWNLOAD_CONFIRM[] = "download-crash-dump";
+constexpr char CRASH_DUMP_ERASE_CONFIRM[] = "erase-crash-dump";
 
 constexpr size_t MAX_MACHINE_SERIAL_BYTES = 48;
 constexpr size_t MAX_MACHINE_ALIAS_BYTES = 64;
@@ -295,6 +305,11 @@ struct BridgeHealthSnapshot {
     uint32_t durableMachineWrites{0};
     uint32_t httpLastDurationUs{0};
     uint32_t httpMaxDurationUs{0};
+    uint32_t httpHeartbeatAgeMs{0};
+    uint32_t httpStackHighWaterBytes{0};
+    uint32_t httpHealthProbeQueueFailures{0};
+    bool httpReady{false};
+    bool httpHealthProbePending{false};
     uint32_t resetReason{0};
     uint32_t deviceCount{0};
     uint32_t supportedDeviceCount{0};
@@ -308,6 +323,14 @@ struct BridgeHealthSnapshot {
     uint32_t freeHeap{0};
     uint32_t minimumFreeHeap{0};
     uint32_t largestFreeHeapBlock{0};
+    uint32_t psramSize{0};
+    uint32_t freePsram{0};
+    uint32_t minimumFreePsram{0};
+    uint32_t largestFreePsramBlock{0};
+    uint32_t failedAllocationCount{0};
+    uint32_t failedAllocationAtMs{0};
+    uint32_t failedAllocationBytes{0};
+    uint32_t failedAllocationCaps{0};
     size_t littleFsTotalBytes{0};
     size_t littleFsUsedBytes{0};
     size_t historyFileCount{0};
@@ -325,6 +348,7 @@ struct BridgeHealthSnapshot {
     char watchdogJobId[32]{};
     char watchdogJobKind[40]{};
     char watchdogJobTarget[48]{};
+    char failedAllocationFunction[48]{};
 };
 
 struct RtcWatchdogMarker {
@@ -333,6 +357,41 @@ struct RtcWatchdogMarker {
     char jobId[32]{};
     char kind[40]{};
     char target[48]{};
+};
+
+struct RtcRecoveryMarker {
+    uint32_t magic{0};
+    uint32_t atMs{0};
+    uint32_t freeHeap{0};
+    uint32_t largestFreeHeapBlock{0};
+    uint32_t httpHeartbeatAgeMs{0};
+    uint32_t failedAllocationCount{0};
+    uint32_t failedAllocationAtMs{0};
+    uint32_t failedAllocationBytes{0};
+    uint32_t failedAllocationCaps{0};
+    char reason[48]{};
+    char detail[96]{};
+    char jobId[32]{};
+    char kind[40]{};
+    char target[48]{};
+    char failedAllocationFunction[48]{};
+};
+
+struct CrashDumpState {
+    const esp_partition_t* partition{nullptr};
+    bool supported{false};
+    bool present{false};
+    bool valid{false};
+    bool summaryAvailable{false};
+    uint32_t partitionBytes{0};
+    uint32_t imageAddress{0};
+    uint32_t imageBytes{0};
+    int32_t imageError{ESP_ERR_NOT_FOUND};
+    int32_t checkError{ESP_ERR_NOT_FOUND};
+    int32_t summaryError{ESP_ERR_NOT_FOUND};
+    uint32_t crashedPc{0};
+    char crashedTask[17]{};
+    char appElfSha256[APP_ELF_SHA256_SZ + 1]{};
 };
 
 template <size_t Capacity>
@@ -377,12 +436,18 @@ private:
 };
 
 constexpr uint32_t RTC_WATCHDOG_MAGIC = 0x42574447;
+constexpr uint32_t RTC_RECOVERY_MAGIC = 0x42524356;
 RTC_DATA_ATTR RtcWatchdogMarker rtcWatchdogMarker;
+RTC_DATA_ATTR RtcRecoveryMarker rtcRecoveryMarker;
 
 bridge_http::BridgeHttpServer server(80);
+// Allocate the bounded document once at startup. All status renders run on the
+// single ESP-IDF HTTP task, so its pool is reused and never fragments the heap.
+DynamicJsonDocument statusJsonDocument(STATUS_JSON_CAPACITY);
 Preferences preferences;
 Preferences machinePreferences;
 uint32_t bootNonce = 0;
+char bridgeIdentifier[40]{};
 
 SemaphoreHandle_t logMutex          = nullptr;
 SemaphoreHandle_t notifyDataMutex   = nullptr;
@@ -485,11 +550,19 @@ std::atomic<bool> workerResetRequested{false};
 std::atomic<bool> clientDisconnectedEvent{false};
 std::atomic<bool> clientDisconnectPending{false};
 std::atomic<bool> wifiReconnectRequested{false};
+std::atomic<bool> recoveryInProgress{false};
+std::atomic<uint32_t> failedAllocationCount{0};
+std::atomic<uint32_t> failedAllocationAtMs{0};
+std::atomic<uint32_t> failedAllocationBytes{0};
+std::atomic<uint32_t> failedAllocationCaps{0};
+std::atomic<const char*> failedAllocationFunction{nullptr};
 String workerCurrentJobId;
 String workerCurrentJobKind;
 String workerCurrentJobTarget;
 String activeResultStreamPath;
 uint32_t lastBleActivityAtMs = 0;
+portMUX_TYPE crashDumpStateMutex = portMUX_INITIALIZER_UNLOCKED;
+CrashDumpState crashDumpState;
 
 NimBLEClient* client                              = nullptr;
 NimBLERemoteService* disService                   = nullptr;
@@ -3265,11 +3338,8 @@ String formatByteHex(uint8_t value) {
     return String("0x") + text;
 }
 
-String bridgeId() {
-    const uint64_t efuseMac = ESP.getEfuseMac() & 0xFFFFFFFFFFFFULL;
-    char suffix[13];
-    std::snprintf(suffix, sizeof(suffix), "%012llX", static_cast<unsigned long long>(efuseMac));
-    return String(APP_NAME) + "-" + suffix;
+const char* bridgeId() {
+    return bridgeIdentifier;
 }
 
 void appendSettingOptions(JsonArray options, const nivona::SettingProbeDescriptor& probe) {
@@ -6478,7 +6548,82 @@ void performScan() {
 
 void updateWorkerOwnedHealth();
 
-void appendStatus(JsonDocument& doc) {
+void recordFailedAllocation(size_t size, uint32_t caps, const char* functionName) {
+    failedAllocationBytes.store(static_cast<uint32_t>(size), std::memory_order_release);
+    failedAllocationCaps.store(caps, std::memory_order_release);
+    failedAllocationFunction.store(functionName, std::memory_order_release);
+    failedAllocationAtMs.store(millis(), std::memory_order_release);
+    failedAllocationCount.fetch_add(1, std::memory_order_acq_rel);
+}
+
+CrashDumpState copyCrashDumpState() {
+    CrashDumpState copy;
+    portENTER_CRITICAL(&crashDumpStateMutex);
+    copy = crashDumpState;
+    portEXIT_CRITICAL(&crashDumpStateMutex);
+    return copy;
+}
+
+void refreshCrashDumpState() {
+    CrashDumpState next;
+    next.partition = esp_partition_find_first(
+        ESP_PARTITION_TYPE_DATA,
+        ESP_PARTITION_SUBTYPE_DATA_COREDUMP,
+        nullptr);
+    if (next.partition == nullptr) {
+        portENTER_CRITICAL(&crashDumpStateMutex);
+        crashDumpState = next;
+        portEXIT_CRITICAL(&crashDumpStateMutex);
+        return;
+    }
+
+    next.supported = true;
+    next.partitionBytes = next.partition->size;
+    size_t imageAddress = 0;
+    size_t imageBytes = 0;
+    const esp_err_t imageResult = esp_core_dump_image_get(&imageAddress, &imageBytes);
+    next.imageError = imageResult;
+    if (imageResult == ESP_OK && imageBytes != 0) {
+        next.present = true;
+        next.imageAddress = static_cast<uint32_t>(imageAddress);
+        next.imageBytes = static_cast<uint32_t>(imageBytes);
+        const size_t partitionEnd = next.partition->address + next.partition->size;
+        if (imageAddress < next.partition->address ||
+            imageAddress > partitionEnd || imageBytes > partitionEnd - imageAddress) {
+            next.imageError = ESP_ERR_INVALID_SIZE;
+            next.checkError = ESP_ERR_INVALID_SIZE;
+        } else {
+            next.checkError = esp_core_dump_image_check();
+            next.valid = next.checkError == ESP_OK;
+            if (next.valid) {
+                esp_core_dump_summary_t summary{};
+                next.summaryError = esp_core_dump_get_summary(&summary);
+                if (next.summaryError == ESP_OK) {
+                    next.summaryAvailable = true;
+                    next.crashedPc = summary.exc_pc;
+                    std::memcpy(next.crashedTask,
+                                summary.exc_task,
+                                sizeof(summary.exc_task));
+                    next.crashedTask[sizeof(summary.exc_task)] = '\0';
+                    size_t shaLength = 0;
+                    while (shaLength < APP_ELF_SHA256_SZ &&
+                           summary.app_elf_sha256[shaLength] != 0) {
+                        next.appElfSha256[shaLength] =
+                            static_cast<char>(summary.app_elf_sha256[shaLength]);
+                        shaLength++;
+                    }
+                    next.appElfSha256[shaLength] = '\0';
+                }
+            }
+        }
+    }
+
+    portENTER_CRITICAL(&crashDumpStateMutex);
+    crashDumpState = next;
+    portEXIT_CRITICAL(&crashDumpStateMutex);
+}
+
+void appendStatus(JsonDocument& doc, bool includeRuntimeDiagnostics = false) {
     if (currentWorkerExecution() != nullptr) {
         // Mutation results retain the former synchronous status shape. The
         // worker is the sole NimBLE owner, so publish its just-completed state
@@ -6492,6 +6637,9 @@ void appendStatus(JsonDocument& doc) {
         health = bridgeHealth;
         xSemaphoreGive(healthMutex);
     }
+    const CrashDumpState dump = includeRuntimeDiagnostics
+        ? copyCrashDumpState()
+        : CrashDumpState{};
 
     doc["appName"]       = APP_NAME;
     doc["appVersion"]    = APP_VERSION;
@@ -6514,7 +6662,7 @@ void appendStatus(JsonDocument& doc) {
     doc["staSsid"]       = wifiStaSsid;
     doc["staIp"]         = staConnected ? WiFi.localIP().toString() : String("");
     doc["selectedAddress"] = health.selectedAddress;
-    doc["notificationsEnabled"] = String(health.notificationMode) != "off";
+    doc["notificationsEnabled"] = std::strcmp(health.notificationMode, "off") != 0;
     doc["notificationMode"] = health.notificationMode;
     doc["pairingStatus"] = health.pairingStatus;
     doc["lastError"]     = health.lastError;
@@ -6528,6 +6676,9 @@ void appendStatus(JsonDocument& doc) {
     capabilities["websocketEvents"] = true;
     capabilities["eventProtocolVersion"] = 1;
     capabilities["eventsUrl"] = "/api/events";
+    if (includeRuntimeDiagnostics) {
+        capabilities["crashDumpDownload"] = dump.supported;
+    }
     doc["timeConfigured"] = timeStatus.configured;
     doc["timeAvailable"] = timeStatus.available;
     doc["timeSynced"] = timeStatus.synced;
@@ -6614,16 +6765,84 @@ void appendStatus(JsonDocument& doc) {
     watchdog["kind"] = health.watchdogJobKind;
     watchdog["target"] = health.watchdogJobTarget;
 
+    if (includeRuntimeDiagnostics) {
+        const bool recoveryMarkerPresent =
+            rtcRecoveryMarker.magic == RTC_RECOVERY_MAGIC;
+        JsonObject recovery = doc.createNestedObject("bridgeRecovery");
+        recovery["markerPresent"] = recoveryMarkerPresent;
+        recovery["atMs"] = recoveryMarkerPresent ? rtcRecoveryMarker.atMs : 0;
+        recovery["reason"] = recoveryMarkerPresent ? rtcRecoveryMarker.reason : "";
+        recovery["detail"] = recoveryMarkerPresent ? rtcRecoveryMarker.detail : "";
+        recovery["jobId"] = recoveryMarkerPresent ? rtcRecoveryMarker.jobId : "";
+        recovery["kind"] = recoveryMarkerPresent ? rtcRecoveryMarker.kind : "";
+        recovery["target"] = recoveryMarkerPresent ? rtcRecoveryMarker.target : "";
+        recovery["freeHeap"] = recoveryMarkerPresent ? rtcRecoveryMarker.freeHeap : 0;
+        recovery["largestFreeHeapBlock"] = recoveryMarkerPresent
+            ? rtcRecoveryMarker.largestFreeHeapBlock
+            : 0;
+        recovery["httpHeartbeatAgeMs"] = recoveryMarkerPresent
+            ? rtcRecoveryMarker.httpHeartbeatAgeMs
+            : 0;
+        recovery["failedAllocationCount"] = recoveryMarkerPresent
+            ? rtcRecoveryMarker.failedAllocationCount
+            : 0;
+        recovery["failedAllocationAtMs"] = recoveryMarkerPresent
+            ? rtcRecoveryMarker.failedAllocationAtMs
+            : 0;
+        recovery["failedAllocationBytes"] = recoveryMarkerPresent
+            ? rtcRecoveryMarker.failedAllocationBytes
+            : 0;
+        recovery["failedAllocationCaps"] = recoveryMarkerPresent
+            ? rtcRecoveryMarker.failedAllocationCaps
+            : 0;
+        recovery["failedAllocationFunction"] = recoveryMarkerPresent
+            ? rtcRecoveryMarker.failedAllocationFunction
+            : "";
+    }
+
     JsonObject memory = doc.createNestedObject("memory");
     memory["freeHeap"] = health.freeHeap;
     memory["minimumFreeHeap"] = health.minimumFreeHeap;
     memory["largestFreeHeapBlock"] = health.largestFreeHeapBlock;
+    if (includeRuntimeDiagnostics) {
+        memory["psramAvailable"] = health.psramSize != 0;
+        memory["psramSize"] = health.psramSize;
+        memory["freePsram"] = health.freePsram;
+        memory["minimumFreePsram"] = health.minimumFreePsram;
+        memory["largestFreePsramBlock"] = health.largestFreePsramBlock;
+        memory["failedAllocationCount"] = health.failedAllocationCount;
+        memory["lastFailedAllocationAtMs"] = health.failedAllocationAtMs;
+        memory["lastFailedAllocationBytes"] = health.failedAllocationBytes;
+        memory["lastFailedAllocationCaps"] = health.failedAllocationCaps;
+        memory["lastFailedAllocationFunction"] = health.failedAllocationFunction;
+    }
     doc["resetReason"] = health.resetReason;
     doc["durableMachineWriteCount"] = health.durableMachineWrites;
     JsonObject http = doc.createNestedObject("http");
     http["lastDurationUs"] = health.httpLastDurationUs;
     http["maxDurationUs"] = health.httpMaxDurationUs;
     http["websocketClients"] = server.websocketClientCount();
+    if (includeRuntimeDiagnostics) {
+        http["ready"] = health.httpReady;
+        http["heartbeatAgeMs"] = health.httpHeartbeatAgeMs;
+        http["stackHighWaterBytes"] = health.httpStackHighWaterBytes;
+        http["healthProbePending"] = health.httpHealthProbePending;
+        http["healthProbeQueueFailures"] = health.httpHealthProbeQueueFailures;
+
+        JsonObject crashDump = doc.createNestedObject("crashDump");
+        crashDump["supported"] = dump.supported;
+        crashDump["present"] = dump.present;
+        crashDump["valid"] = dump.valid;
+        crashDump["summaryAvailable"] = dump.summaryAvailable;
+        crashDump["partitionBytes"] = dump.partitionBytes;
+        crashDump["imageBytes"] = dump.imageBytes;
+        crashDump["imageError"] = dump.imageError;
+        crashDump["checkError"] = dump.checkError;
+        crashDump["summaryError"] = dump.summaryError;
+        crashDump["crashedTask"] = dump.crashedTask;
+        crashDump["crashedPc"] = dump.crashedPc;
+        crashDump["appElfSha256"] = dump.appElfSha256;
+    }
 }
 
 bool parseAddressTypeRequest(JsonVariantConst value, uint8_t& addressType) {
@@ -10127,10 +10346,7 @@ void handleRecipeIconAsset() {
 
 void handleStatus() {
     maybeApplyClientTimeHeader();
-    DynamicJsonDocument doc(STATUS_JSON_CAPACITY);
-    doc["ok"] = true;
-    appendStatus(doc);
-    sendJson(doc);
+    server.sendStatusSnapshot();
 }
 
 void handleDevices() {
@@ -11880,6 +12096,103 @@ void handleLogsClear() {
     sendJson(doc);
 }
 
+void sendDiagnosticError(int code, const char* body) {
+    server.sendHeader("Cache-Control", "no-store");
+    server.send(code,
+                "application/json",
+                body != nullptr ? body : "{\"ok\":false}");
+}
+
+void handleCrashDumpDownload() {
+    if (!server.headerEquals(DIAGNOSTIC_CONFIRM_HEADER,
+                             CRASH_DUMP_DOWNLOAD_CONFIRM)) {
+        sendDiagnosticError(
+            403,
+            "{\"ok\":false,\"error\":\"explicit crash dump download confirmation is required\"}");
+        return;
+    }
+
+    const CrashDumpState dump = copyCrashDumpState();
+    if (!dump.supported) {
+        sendDiagnosticError(
+            404,
+            "{\"ok\":false,\"error\":\"crash dump storage is unavailable\"}");
+        return;
+    }
+    if (!dump.present) {
+        sendDiagnosticError(
+            404,
+            "{\"ok\":false,\"error\":\"no crash dump is stored\"}");
+        return;
+    }
+    if (!dump.valid || dump.partition == nullptr) {
+        sendDiagnosticError(
+            409,
+            "{\"ok\":false,\"error\":\"the stored crash dump failed validation\"}");
+        return;
+    }
+
+    server.sendHeader("Cache-Control", "no-store");
+    server.sendHeader("Content-Disposition",
+                      "attachment; filename=\"esp-coffee-bridge-coredump.bin\"");
+    server.sendHeader("X-Content-Type-Options", "nosniff");
+    if (dump.appElfSha256[0] != '\0') {
+        server.sendHeader("X-Bridge-App-Elf-Sha256", dump.appElfSha256);
+    }
+    server.setContentLength(dump.imageBytes);
+    server.send(200, "application/octet-stream", "");
+
+    std::array<uint8_t, 1024> buffer{};
+    size_t emitted = 0;
+    const size_t partitionOffset = dump.imageAddress - dump.partition->address;
+    while (emitted < dump.imageBytes) {
+        const size_t count = std::min(buffer.size(),
+                                      static_cast<size_t>(dump.imageBytes) - emitted);
+        if (esp_partition_read(dump.partition,
+                               partitionOffset + emitted,
+                               buffer.data(),
+                               count) != ESP_OK ||
+            !server.sendContent(
+                reinterpret_cast<const char*>(buffer.data()), count)) {
+            server.client().stop();
+            return;
+        }
+        emitted += count;
+    }
+}
+
+void handleCrashDumpErase() {
+    if (!server.headerEquals(DIAGNOSTIC_CONFIRM_HEADER,
+                             CRASH_DUMP_ERASE_CONFIRM)) {
+        sendDiagnosticError(
+            403,
+            "{\"ok\":false,\"error\":\"explicit crash dump erase confirmation is required\"}");
+        return;
+    }
+    const CrashDumpState dump = copyCrashDumpState();
+    if (!dump.supported) {
+        sendDiagnosticError(
+            404,
+            "{\"ok\":false,\"error\":\"crash dump storage is unavailable\"}");
+        return;
+    }
+    if (!dump.present) {
+        sendDiagnosticError(
+            404,
+            "{\"ok\":false,\"error\":\"no crash dump is stored\"}");
+        return;
+    }
+    if (esp_core_dump_image_erase() != ESP_OK) {
+        sendDiagnosticError(
+            500,
+            "{\"ok\":false,\"error\":\"failed to erase the stored crash dump\"}");
+        return;
+    }
+    refreshCrashDumpState();
+    server.sendHeader("Cache-Control", "no-store");
+    server.send(200, "application/json", "{\"ok\":true}");
+}
+
 void handleReboot() {
     DynamicJsonDocument doc(512);
     doc["ok"] = true;
@@ -12977,27 +13290,83 @@ void handleJobApiRoute(const String& id, bool resultRequested) {
     sendError(404, "job has no direct result");
 }
 
-void restartAfterStuckBleCleanup(const String& reason) {
-    addLog("ble", String("Restarting after unsafe BLE cleanup state: ") + reason);
-    rtcWatchdogMarker.magic = RTC_WATCHDOG_MAGIC;
-    rtcWatchdogMarker.atMs = millis();
-    rtcWatchdogMarker.jobId[0] = '\0';
-    rtcWatchdogMarker.kind[0] = '\0';
-    rtcWatchdogMarker.target[0] = '\0';
+[[noreturn]] void triggerBridgeRecovery(const char* reason,
+                                        const char* detail,
+                                        bool recordBleWatchdog) {
+    bool expected = false;
+    if (!recoveryInProgress.compare_exchange_strong(
+            expected, true, std::memory_order_acq_rel)) {
+        for (;;) vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+
+    const uint32_t nowMs = millis();
+    rtcRecoveryMarker = {};
+    rtcRecoveryMarker.atMs = nowMs;
+    rtcRecoveryMarker.freeHeap = ESP.getFreeHeap();
+    rtcRecoveryMarker.largestFreeHeapBlock =
+        heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    rtcRecoveryMarker.httpHeartbeatAgeMs = server.running()
+        ? server.taskHeartbeatAgeMs(nowMs)
+        : 0;
+    rtcRecoveryMarker.failedAllocationCount =
+        failedAllocationCount.load(std::memory_order_acquire);
+    rtcRecoveryMarker.failedAllocationAtMs =
+        failedAllocationAtMs.load(std::memory_order_acquire);
+    rtcRecoveryMarker.failedAllocationBytes =
+        failedAllocationBytes.load(std::memory_order_acquire);
+    rtcRecoveryMarker.failedAllocationCaps =
+        failedAllocationCaps.load(std::memory_order_acquire);
+    strlcpy(rtcRecoveryMarker.reason,
+            reason != nullptr ? reason : "unknown",
+            sizeof(rtcRecoveryMarker.reason));
+    strlcpy(rtcRecoveryMarker.detail,
+            detail != nullptr ? detail : "",
+            sizeof(rtcRecoveryMarker.detail));
+    const char* allocationFunction =
+        failedAllocationFunction.load(std::memory_order_acquire);
+    strlcpy(rtcRecoveryMarker.failedAllocationFunction,
+            allocationFunction != nullptr ? allocationFunction : "",
+            sizeof(rtcRecoveryMarker.failedAllocationFunction));
+
     if (jobMutex != nullptr && xSemaphoreTake(jobMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-        strlcpy(rtcWatchdogMarker.jobId,
+        strlcpy(rtcRecoveryMarker.jobId,
                 workerCurrentJobId.c_str(),
-                sizeof(rtcWatchdogMarker.jobId));
-        strlcpy(rtcWatchdogMarker.kind,
+                sizeof(rtcRecoveryMarker.jobId));
+        strlcpy(rtcRecoveryMarker.kind,
                 workerCurrentJobKind.c_str(),
-                sizeof(rtcWatchdogMarker.kind));
-        strlcpy(rtcWatchdogMarker.target,
+                sizeof(rtcRecoveryMarker.kind));
+        strlcpy(rtcRecoveryMarker.target,
                 workerCurrentJobTarget.c_str(),
-                sizeof(rtcWatchdogMarker.target));
+                sizeof(rtcRecoveryMarker.target));
         xSemaphoreGive(jobMutex);
     }
+
+    if (recordBleWatchdog) {
+        rtcWatchdogMarker.magic = 0;
+        rtcWatchdogMarker.atMs = nowMs;
+        strlcpy(rtcWatchdogMarker.jobId,
+                rtcRecoveryMarker.jobId,
+                sizeof(rtcWatchdogMarker.jobId));
+        strlcpy(rtcWatchdogMarker.kind,
+                rtcRecoveryMarker.kind,
+                sizeof(rtcWatchdogMarker.kind));
+        strlcpy(rtcWatchdogMarker.target,
+                rtcRecoveryMarker.target,
+                sizeof(rtcWatchdogMarker.target));
+        rtcWatchdogMarker.magic = RTC_WATCHDOG_MAGIC;
+    }
+    rtcRecoveryMarker.magic = RTC_RECOVERY_MAGIC;
+
+    Serial.printf("Bridge recovery: %s (%s)\n",
+                  rtcRecoveryMarker.reason,
+                  rtcRecoveryMarker.detail);
     delay(20);
-    ESP.restart();
+    esp_system_abort(rtcRecoveryMarker.reason);
+    for (;;) {}
+}
+
+void restartAfterStuckBleCleanup(const String& reason) {
+    triggerBridgeRecovery("ble_cleanup_stall", reason.c_str(), true);
 }
 
 void resetBleClientAfterFailure() {
@@ -13536,6 +13905,8 @@ void bleWorkerTask(void*) {
 }
 
 void workerSupervisorTask(void*) {
+    bool criticalMemoryObserved = false;
+    uint32_t criticalMemoryObservedAtMs = 0;
     for (;;) {
         const uint32_t nowMs = millis();
         const bool supervisedWorkActive = workerJobActive.load(std::memory_order_acquire) ||
@@ -13546,25 +13917,63 @@ void workerSupervisorTask(void*) {
                 nowMs,
                 workerHeartbeatAtMs.load(std::memory_order_acquire),
                 WORKER_STALL_WATCHDOG_MS)) {
-            rtcWatchdogMarker.magic = RTC_WATCHDOG_MAGIC;
-            rtcWatchdogMarker.atMs = nowMs;
-            rtcWatchdogMarker.jobId[0] = '\0';
-            rtcWatchdogMarker.kind[0] = '\0';
-            rtcWatchdogMarker.target[0] = '\0';
-            if (jobMutex != nullptr && xSemaphoreTake(jobMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-                strlcpy(rtcWatchdogMarker.jobId,
-                        workerCurrentJobId.c_str(),
-                        sizeof(rtcWatchdogMarker.jobId));
-                strlcpy(rtcWatchdogMarker.kind,
-                        workerCurrentJobKind.c_str(),
-                        sizeof(rtcWatchdogMarker.kind));
-                strlcpy(rtcWatchdogMarker.target,
-                        workerCurrentJobTarget.c_str(),
-                        sizeof(rtcWatchdogMarker.target));
-                xSemaphoreGive(jobMutex);
-            }
-            delay(20);
-            ESP.restart();
+            triggerBridgeRecovery(
+                "ble_transport_stall",
+                "BLE call made no progress for 45 seconds",
+                true);
+        }
+
+        const bool httpRunning = server.running();
+        const uint32_t httpHeartbeatAtMs = server.taskHeartbeatAtMs();
+        const uint32_t allocationFailures =
+            failedAllocationCount.load(std::memory_order_acquire);
+        const bool recentAllocationFailure = bridge_runtime_policy::recentFailure(
+            allocationFailures,
+            nowMs,
+            failedAllocationAtMs.load(std::memory_order_acquire),
+            ALLOCATION_FAILURE_RECENT_MS);
+        if (recentAllocationFailure && bridge_runtime_policy::httpHeartbeatExpired(
+                httpRunning,
+                nowMs,
+                httpHeartbeatAtMs,
+                HTTP_ALLOC_FAILURE_STALL_MS)) {
+            triggerBridgeRecovery(
+                "http_stall_after_alloc_failure",
+                "HTTP heartbeat stopped after a recent allocation failure",
+                false);
+        }
+        if (bridge_runtime_policy::httpHeartbeatExpired(
+                httpRunning,
+                nowMs,
+                httpHeartbeatAtMs,
+                HTTP_STALL_WATCHDOG_MS)) {
+            triggerBridgeRecovery(
+                "http_task_stall",
+                "HTTP heartbeat made no progress for 45 seconds",
+                false);
+        }
+
+        const bool memoryCritical = bridge_runtime_policy::criticalMemory(
+            ESP.getFreeHeap(),
+            heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+            CRITICAL_FREE_HEAP_BYTES,
+            CRITICAL_LARGEST_BLOCK_BYTES);
+        if (memoryCritical && !criticalMemoryObserved) {
+            criticalMemoryObserved = true;
+            criticalMemoryObservedAtMs = nowMs;
+        } else if (!memoryCritical) {
+            criticalMemoryObserved = false;
+        }
+        if (bridge_runtime_policy::sustainedCondition(
+                memoryCritical,
+                criticalMemoryObserved,
+                nowMs,
+                criticalMemoryObservedAtMs,
+                CRITICAL_MEMORY_DURATION_MS)) {
+            triggerBridgeRecovery(
+                "sustained_low_memory",
+                "Heap remained below the safe recovery threshold for 5 seconds",
+                false);
         }
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
@@ -13577,19 +13986,39 @@ void publishBridgeHealth() {
         xSemaphoreGive(healthMutex);
     }
     const bool workerBusy = workerJobActive.load(std::memory_order_acquire);
+    const uint32_t nowMs = millis();
     next.workerBusy = workerBusy;
     next.currentProgress = workerBusy
         ? workerCurrentProgress.load(std::memory_order_acquire)
         : 0;
     next.currentJobAgeMs = workerBusy
-        ? static_cast<uint32_t>(millis() - workerCurrentStartedAtMs.load(std::memory_order_acquire))
+        ? static_cast<uint32_t>(nowMs - workerCurrentStartedAtMs.load(std::memory_order_acquire))
         : 0;
     next.workerHeartbeatAgeMs = workerBusy
-        ? static_cast<uint32_t>(millis() - workerHeartbeatAtMs.load(std::memory_order_acquire))
+        ? static_cast<uint32_t>(nowMs - workerHeartbeatAtMs.load(std::memory_order_acquire))
         : 0;
     next.freeHeap = ESP.getFreeHeap();
     next.minimumFreeHeap = ESP.getMinFreeHeap();
-    next.largestFreeHeapBlock = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+    next.largestFreeHeapBlock =
+        heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    next.psramSize = ESP.getPsramSize();
+    next.freePsram = ESP.getFreePsram();
+    next.minimumFreePsram = ESP.getMinFreePsram();
+    next.largestFreePsramBlock = ESP.getMaxAllocPsram();
+    next.failedAllocationCount = failedAllocationCount.load(std::memory_order_acquire);
+    next.failedAllocationAtMs = failedAllocationAtMs.load(std::memory_order_acquire);
+    next.failedAllocationBytes = failedAllocationBytes.load(std::memory_order_acquire);
+    next.failedAllocationCaps = failedAllocationCaps.load(std::memory_order_acquire);
+    const char* allocationFunction =
+        failedAllocationFunction.load(std::memory_order_acquire);
+    strlcpy(next.failedAllocationFunction,
+            allocationFunction != nullptr ? allocationFunction : "",
+            sizeof(next.failedAllocationFunction));
+    next.httpReady = server.running();
+    next.httpHeartbeatAgeMs = next.httpReady ? server.taskHeartbeatAgeMs(nowMs) : 0;
+    next.httpStackHighWaterBytes = server.taskStackHighWaterBytes();
+    next.httpHealthProbePending = server.healthProbePending();
+    next.httpHealthProbeQueueFailures = server.healthProbeQueueFailures();
     next.durableMachineWrites = durableMachineWriteCount;
     if (machineMutex != nullptr && xSemaphoreTake(machineMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
         next.savedMachineCount = savedMachines.size();
@@ -13923,15 +14352,23 @@ void finishHttpRequest(uint32_t durationUs, void*) {
     }
 }
 
-bool renderStatusEvent(String& jsonOut, void*) {
-    DynamicJsonDocument status(STATUS_JSON_CAPACITY);
-    status["ok"] = true;
-    appendStatus(status);
-    if (status.overflowed()) {
+bool renderStatusEvent(char* jsonOut,
+                       size_t capacity,
+                       size_t& lengthOut,
+                       void*) {
+    lengthOut = 0;
+    statusJsonDocument.clear();
+    statusJsonDocument["ok"] = true;
+    appendStatus(statusJsonDocument, true);
+    if (statusJsonDocument.overflowed()) {
         return false;
     }
-    jsonOut = "";
-    return serializeJson(status, jsonOut) != 0;
+    const size_t required = measureJson(statusJsonDocument);
+    if (required == 0 || required >= capacity) {
+        return false;
+    }
+    lengthOut = serializeJson(statusJsonDocument, jsonOut, capacity);
+    return lengthOut == required;
 }
 
 bridge_http::EventJobLookup renderJobEvent(const String& id,
@@ -13978,6 +14415,8 @@ void registerRoutes() {
         enqueueGenericHttpJob("details", BleOperation::Details, bridge_jobs::Priority::ForcedRead, 12000);
     });
     server.on("/api/logs", HTTP_GET, handleLogs);
+    server.on("/api/crash-dump", HTTP_GET, handleCrashDumpDownload);
+    server.on("/api/crash-dump", HTTP_DELETE, handleCrashDumpErase);
     server.on("/api/machines", HTTP_GET, handleMachinesList);
     server.on("/api/machines", HTTP_POST, []() {
         enqueueGenericHttpJob("machine_create", BleOperation::MachinesCreate, bridge_jobs::Priority::Mutation, 30000, true);
@@ -14088,6 +14527,14 @@ void setup() {
     Serial.begin(115200);
     delay(200);
     Serial.printf("\n%s %s booting (%s)\n", APP_NAME, APP_VERSION, APP_BUILD_TIME);
+    const uint64_t efuseMac = ESP.getEfuseMac() & 0xFFFFFFFFFFFFULL;
+    std::snprintf(bridgeIdentifier,
+                  sizeof(bridgeIdentifier),
+                  "%s-%012llX",
+                  APP_NAME,
+                  static_cast<unsigned long long>(efuseMac));
+    const esp_err_t allocationCallbackResult =
+        heap_caps_register_failed_alloc_callback(recordFailedAllocation);
 
     logMutex          = xSemaphoreCreateMutex();
     notifyDataMutex   = xSemaphoreCreateMutex();
@@ -14098,6 +14545,10 @@ void setup() {
     healthMutex       = xSemaphoreCreateMutex();
     machineMutex      = xSemaphoreCreateMutex();
     machineGenerationMutex = xSemaphoreCreateRecursiveMutex();
+    if (allocationCallbackResult != ESP_OK) {
+        addLog("memory", "Failed to register the heap allocation diagnostic callback");
+    }
+    refreshCrashDumpState();
     bootNonce = esp_random();
     jobScheduler.reset(bootNonce);
     jobScheduler.setChangeCallback(publishJobEvent);
@@ -14141,13 +14592,13 @@ void setup() {
         addLog("worker", "Failed to create BLE worker task");
     }
     if (xTaskCreatePinnedToCore(workerSupervisorTask,
-                                "ble-supervisor",
+                                "bridge-supervisor",
                                 3072,
                                 nullptr,
-                                2,
+                                4,
                                 &workerSupervisorTaskHandle,
                                 1) != pdPASS) {
-        addLog("worker", "Failed to create BLE supervisor task");
+        addLog("worker", "Failed to create bridge supervisor task");
     }
     publishBridgeHealth();
     addLog("http", "HTTP server started");

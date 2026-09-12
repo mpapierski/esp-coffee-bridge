@@ -77,6 +77,44 @@ void test_deadlines_wait_clamping_and_watchdog_heartbeat_are_wraparound_safe() {
     TEST_ASSERT_TRUE(bridge_runtime_policy::watchdogShouldReboot(true, true, 19U, heartbeat, 45U));
     TEST_ASSERT_FALSE(bridge_runtime_policy::watchdogShouldReboot(true, false, 100U, heartbeat, 45U));
     TEST_ASSERT_FALSE(bridge_runtime_policy::watchdogShouldReboot(false, true, 100U, heartbeat, 45U));
+    TEST_ASSERT_FALSE(bridge_runtime_policy::watchdogShouldReboot(
+        true, true, 100U, 101U, 45U));
+}
+
+void test_global_recovery_thresholds_are_bounded_and_wraparound_safe() {
+    const uint32_t heartbeat = UINT32_MAX - 25U;
+    TEST_ASSERT_FALSE(bridge_runtime_policy::httpHeartbeatExpired(
+        true, 18U, heartbeat, 45U));
+    TEST_ASSERT_TRUE(bridge_runtime_policy::httpHeartbeatExpired(
+        true, 19U, heartbeat, 45U));
+    TEST_ASSERT_FALSE(bridge_runtime_policy::httpHeartbeatExpired(
+        false, 100U, heartbeat, 45U));
+    TEST_ASSERT_FALSE(bridge_runtime_policy::httpHeartbeatExpired(
+        true, 100U, 101U, 45U));
+
+    TEST_ASSERT_FALSE(bridge_runtime_policy::criticalMemory(
+        12U * 1024U, 4U * 1024U, 12U * 1024U, 4U * 1024U));
+    TEST_ASSERT_TRUE(bridge_runtime_policy::criticalMemory(
+        12U * 1024U - 1U, 8U * 1024U, 12U * 1024U, 4U * 1024U));
+    TEST_ASSERT_TRUE(bridge_runtime_policy::criticalMemory(
+        24U * 1024U, 4U * 1024U - 1U, 12U * 1024U, 4U * 1024U));
+
+    const uint32_t pressureStarted = UINT32_MAX - 1000U;
+    TEST_ASSERT_FALSE(bridge_runtime_policy::sustainedCondition(
+        true, true, 3998U, pressureStarted, 5000U));
+    TEST_ASSERT_TRUE(bridge_runtime_policy::sustainedCondition(
+        true, true, 3999U, pressureStarted, 5000U));
+    TEST_ASSERT_FALSE(bridge_runtime_policy::sustainedCondition(
+        false, true, 5000U, pressureStarted, 5000U));
+    TEST_ASSERT_FALSE(bridge_runtime_policy::sustainedCondition(
+        true, false, 5000U, pressureStarted, 5000U));
+
+    TEST_ASSERT_TRUE(bridge_runtime_policy::recentFailure(
+        1U, 18U, heartbeat, 45U));
+    TEST_ASSERT_FALSE(bridge_runtime_policy::recentFailure(
+        1U, 19U, heartbeat, 45U));
+    TEST_ASSERT_FALSE(bridge_runtime_policy::recentFailure(
+        0U, 18U, heartbeat, 45U));
 }
 
 void test_successful_cache_and_spool_results_survive_until_publication() {
@@ -270,6 +308,7 @@ int main(int, char**) {
     RUN_TEST(test_cache_freshness_and_backoff_are_wraparound_safe);
     RUN_TEST(test_forced_refresh_bypasses_cache_and_failure_keeps_last_good_snapshot);
     RUN_TEST(test_deadlines_wait_clamping_and_watchdog_heartbeat_are_wraparound_safe);
+    RUN_TEST(test_global_recovery_thresholds_are_bounded_and_wraparound_safe);
     RUN_TEST(test_successful_cache_and_spool_results_survive_until_publication);
     RUN_TEST(test_oversized_legacy_history_becomes_a_lossless_preservation_floor);
     RUN_TEST(test_full_history_rejects_append_without_removing_existing_bytes);
