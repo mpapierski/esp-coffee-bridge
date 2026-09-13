@@ -16075,7 +16075,16 @@ BrewCoordinatorActivity scheduleBrewQueue(uint32_t nowMs) {
             server.markStatusChanged();
             return BrewCoordinatorActivity::Active;
         }
-        if (!persistBrewQueueLocked(error) && !error.isEmpty()) lastError = error;
+        // Persist the transition to historyLogged once. A blocked terminal
+        // item otherwise reaches this branch on every loop iteration and can
+        // monopolize both the queue mutex and the shared LittleFS mutex.
+        if (!wasHistoryLogged && head.historyLogged &&
+            !persistBrewQueueLocked(error)) {
+            // Keep the transition dirty so the next pass retries it. The
+            // history lookup makes retrying the already-appended entry safe.
+            head.historyLogged = false;
+            if (!error.isEmpty()) lastError = error;
+        }
         const BrewQueueItem snapshot = head;
         xSemaphoreGive(brewQueueMutex);
         if (!wasHistoryLogged && snapshot.historyLogged) notifyBrewChanged(snapshot);
