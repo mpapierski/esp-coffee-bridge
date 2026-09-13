@@ -506,6 +506,7 @@ char bridgeIdentifier[40]{};
 SemaphoreHandle_t logMutex          = nullptr;
 SemaphoreHandle_t notifyDataMutex   = nullptr;
 SemaphoreHandle_t notificationLatch = nullptr;
+SemaphoreHandle_t bleWorkerWake     = nullptr;
 SemaphoreHandle_t scanDataMutex     = nullptr;
 SemaphoreHandle_t jobMutex          = nullptr;
 SemaphoreHandle_t cacheMutex        = nullptr;
@@ -14433,8 +14434,8 @@ bool submitJob(const bridge_jobs::Submission& submission,
         }
         return false;
     }
-    if (bleWorkerTaskHandle != nullptr) {
-        xTaskNotifyGive(bleWorkerTaskHandle);
+    if (bleWorkerWake != nullptr) {
+        xSemaphoreGive(bleWorkerWake);
     }
     return true;
 }
@@ -15100,8 +15101,8 @@ void resetBleClientAfterFailure() {
 
 void requestBleWorkerReset() {
     workerResetRequested.store(true, std::memory_order_release);
-    if (bleWorkerTaskHandle != nullptr) {
-        xTaskNotifyGive(bleWorkerTaskHandle);
+    if (bleWorkerWake != nullptr) {
+        xSemaphoreGive(bleWorkerWake);
     }
 }
 
@@ -15390,7 +15391,16 @@ void bleWorkerTask(void*) {
                 lastBleActivityAtMs = millis();
             }
             updateWorkerOwnedHealth();
-            ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(250));
+            // NimBLE's synchronous client operations use FreeRTOS task
+            // notification slot 0 internally. A bridge job wake on that same
+            // slot can release writeValue() before its GATT callback, leaving
+            // the callback with a dangling stack TaskData pointer. Keep bridge
+            // scheduling on a dedicated semaphore instead.
+            if (bleWorkerWake != nullptr) {
+                xSemaphoreTake(bleWorkerWake, pdMS_TO_TICKS(250));
+            } else {
+                vTaskDelay(pdMS_TO_TICKS(250));
+            }
             continue;
         }
 
@@ -15950,8 +15960,8 @@ BackgroundSubmitResult submitBackgroundJob(const bridge_jobs::Submission& submis
     xSemaphoreGive(jobMutex);
     const bool accepted = result.status == bridge_jobs::SubmitStatus::Accepted ||
         result.status == bridge_jobs::SubmitStatus::Coalesced;
-    if (accepted && bleWorkerTaskHandle != nullptr) {
-        xTaskNotifyGive(bleWorkerTaskHandle);
+    if (accepted && bleWorkerWake != nullptr) {
+        xSemaphoreGive(bleWorkerWake);
     }
     return accepted ? BackgroundSubmitResult::Accepted : BackgroundSubmitResult::Deferred;
 }
@@ -16510,6 +16520,7 @@ void setup() {
     logMutex          = xSemaphoreCreateMutex();
     notifyDataMutex   = xSemaphoreCreateMutex();
     notificationLatch = xSemaphoreCreateBinary();
+    bleWorkerWake     = xSemaphoreCreateBinary();
     scanDataMutex     = xSemaphoreCreateMutex();
     jobMutex          = xSemaphoreCreateMutex();
     cacheMutex        = xSemaphoreCreateMutex();
@@ -16521,6 +16532,9 @@ void setup() {
     if (!brewQueue) {
         brewQueueRecoveryBlocked = true;
         addLog("brew", "Failed to allocate the durable brew queue");
+    }
+    if (bleWorkerWake == nullptr) {
+        addLog("worker", "Failed to create the BLE worker wake semaphore");
     }
     if (allocationCallbackResult != ESP_OK) {
         addLog("memory", "Failed to register the heap allocation diagnostic callback");
