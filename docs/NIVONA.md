@@ -101,6 +101,31 @@ Connect `1.2.0` provides no evidence of official NICR 570/560/5xx application
 support. This does not by itself prove that such machines use an incompatible
 wire protocol.
 
+### Issue #1 identity correction: NICR 758 / Type 573
+
+The machine reported in
+[esp-coffee-bridge issue #1](https://github.com/mpapierski/esp-coffee-bridge/issues/1)
+was initially described as an NICR 570, but the follow-up rating-plate photo
+identifies it as **NICR 758**, article number `300 600 758`, hardware
+**Type 573**. Its printed identity starts `758573...`, matching both the
+Connect virtual identity `758573012345678---` and the `756573...` identity
+captured from live Type 573 hardware.
+
+That correction materially changes the support conclusion for the issue:
+
+- `758` is an explicit NIVONA Connect `1.2.0` article matcher under `EF573`.
+- The legacy app maps model 758 to `Eugster758` / Family 700.
+- The bridge already maps model 758 to Family 700, including its recipe,
+  settings, statistics, and one-slot MyCoffee layout.
+- `573` is the controller-platform/type field embedded after the three-digit
+  article prefix; it is not the retail model number.
+
+The remaining issue is therefore BLE authentication compatibility, not a
+missing coffee-protocol model graph. `EF573` exposes the older three-profile
+set (`Dynamic`, `Constant`, `Intense`) and no Flying Picture feature; a manual
+listing `Quick` and `Harmonic` in addition to those modes describes a newer
+five-profile model graph and does not match this NICR 758.
+
 ### Feature model
 
 The new app no longer infers most UI features from a coarse family enum. A
@@ -250,6 +275,35 @@ Characteristics under `AD00`:
 - `ReadUInt16LittleEndian(data, 2) == customerId`
 
 The Android connector uses `customerId = 65535`.
+
+## Link-Layer Security And Pairing
+
+NIVONA Connect configures fresh authentication with bonding enabled, no MITM
+requirement, `IoCapabilities.None`, and no Secure-Connections-only
+requirement. When it finds a stored bond, it first requests encryption. If the
+peripheral reports `AuthenticationKeyMissing`, the app deletes that stale bond
+and continues with fresh authentication. A `PairingNotSupported` result is
+tolerated by the app; other authentication errors propagate.
+
+The security routine belongs to the shared `CoffeeMachine.Initialize` path and
+runs before article lookup. All physical machine kinds in Connect `1.2.0` use
+the same `BleCoffeeMachine` implementation, covering `EF573`, `EF253`, `EF698`,
+`EF1190`, `EF1040`, `EF1187`, and `EF1109`. The app therefore cannot select
+link security from a machine identity or model family.
+
+The original bridge forced LE Secure Connections for every machine. That is a
+stricter policy than the official app and can prevent an older controller from
+reaching the otherwise-compatible application protocol. The bridge now mirrors
+the app globally with NimBLE authentication flags `bonding=true`, `mitm=false`,
+and `secureConnections=false`. No model check or user-facing “legacy protocol”
+option is needed.
+
+The bridge logs the selected security flags, initial encryption and bond state,
+NimBLE return code and text on failure, and reconnect result. If NimBLE reports
+the precise missing-key error and the selected peer has a local bond, the bridge
+deletes only that peer's stale bond, reconnects, and retries once. This behavior
+still needs cross-family hardware validation, including the issue reporter's
+NICR 758.
 
 ## Customer-Key Bootstrap
 
@@ -2733,6 +2787,9 @@ So current live evidence says:
   - still complete the per-item `HD` reset target tables for recipe-item defaults by family
 - Extend live validation to additional command families
   - especially `HA`, `HS`, and any additional `HI` feature bits beyond `ImageTransfer`
+  - validate the Connect-compatible pairing policy on both the known NICR 756
+    and the issue reporter's NICR 758, retaining complete `pair` / `ble` logs
+    from the first attempt and a subsequent bonded reconnect
   - capture Article ID and PCB-serial reads from NIVONA Connect to determine
     whether `HF` / `HQ` ever appear on the wire or whether `HA 00 02` /
     `HA 00 04` are the intended final protocol

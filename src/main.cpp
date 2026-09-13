@@ -11,6 +11,7 @@
 #include <esp_system.h>
 
 #include <NimBLEDevice.h>
+#include <NimBLEUtils.h>
 
 #include <algorithm>
 #include <array>
@@ -4828,7 +4829,9 @@ class BridgeClientCallbacks : public NimBLEClientCallbacks {
     }
 
     void onDisconnect(NimBLEClient* pClient, int reason) override {
-        addLog("ble", String("Disconnected from ") + pClient->getPeerAddress().toString().c_str() + " reason=" + String(reason));
+        addLog("ble",
+               String("Disconnected from ") + pClient->getPeerAddress().toString().c_str() +
+                   " reason=" + String(reason) + " (" + NimBLEUtils::returnCodeToString(reason) + ")");
         pairingStatus = "disconnected";
         clientDisconnectedEvent.store(true, std::memory_order_release);
         // Publish the event before releasing the waiter. An acquire-load of
@@ -4921,7 +4924,7 @@ bool initializeBleStack(String& error) {
             WorkerBleCallScope bleCall;
             NimBLEDevice::init("");
         }
-        NimBLEDevice::setSecurityAuth(true, false, true);
+        NimBLEDevice::setSecurityAuth(true, false, false);
         NimBLEDevice::setSecurityIOCap(BLE_HS_IO_NO_INPUT_OUTPUT);
         addLog("ble", "NimBLE stack initialized");
     }
@@ -5064,13 +5067,18 @@ bool connectToSelectedDevice(String& error) {
         }
     }
 
+    String advertisedIdentity = selectedMachineSerial;
     if (currentWorkerExecution() == nullptr) {
         ScanRecord* record = findScannedDevice(selectedAddress);
         if (record != nullptr) {
             selectedAddressType = record->addressType;
+            advertisedIdentity = record->name;
         }
     }
 
+    addLog("ble",
+           String("Connecting address=") + selectedAddress + " addressType=" + String(selectedAddressType) +
+               " identity=" + (advertisedIdentity.isEmpty() ? String("<unknown>") : advertisedIdentity));
     NimBLEAddress address(std::string(selectedAddress.c_str()), selectedAddressType);
     bool connected = false;
     {
@@ -5078,7 +5086,13 @@ bool connectToSelectedDevice(String& error) {
         connected = client->connect(address, true, false, true);
     }
     if (!connected || workerDeadlineExceeded()) {
-        error = String("failed to connect to ") + selectedAddress;
+        const int rc = client->getLastError();
+        error = String("failed to connect to ") + selectedAddress + ": rc=" + String(rc) + " (" +
+                NimBLEUtils::returnCodeToString(rc) + ")";
+        if (workerDeadlineExceeded()) {
+            error += "; job deadline exceeded";
+        }
+        addLog("ble", error);
         return false;
     }
     if (client->isConnected()) {
@@ -5087,9 +5101,14 @@ bool connectToSelectedDevice(String& error) {
     }
 
     if (!refreshRemoteHandles(error)) {
+        const int rc = client->getLastError();
+        addLog("ble",
+               String("GATT discovery failed: ") + error + "; rc=" + String(rc) + " (" +
+                   NimBLEUtils::returnCodeToString(rc) + ")");
         return false;
     }
     lastBleActivityAtMs = millis();
+    addLog("ble", "Required AD00 characteristics discovered");
     return true;
 }
 
@@ -5124,12 +5143,45 @@ bool reconnectToSelectedDevice(uint32_t delayMs, String& error) {
     return connectToSelectedDevice(error);
 }
 
+bool secureConnectionWithLog(const String& phase, int& errorCodeOut) {
+    addLog("pair", phase + ": starting secureConnection");
+    bool secured = false;
+    {
+        WorkerBleCallScope bleCall;
+        secured = client->secureConnection();
+    }
+    const bool deadlineExceeded = workerDeadlineExceeded();
+    if (!secured || deadlineExceeded) {
+        errorCodeOut = client->getLastError();
+        addLog("pair",
+               phase + ": secureConnection failed rc=" + String(errorCodeOut) + " (" +
+                   NimBLEUtils::returnCodeToString(errorCodeOut) + ")" +
+                   (deadlineExceeded ? String("; job deadline exceeded") : String("")));
+        return false;
+    }
+
+    errorCodeOut = 0;
+    const NimBLEConnInfo info = client->getConnInfo();
+    addLog("pair",
+           phase + ": secureConnection succeeded encrypted=" + (info.isEncrypted() ? String("yes") : String("no")) +
+               " bonded=" + (info.isBonded() ? String("yes") : String("no")));
+    return true;
+}
+
 bool pairWithDevice(String& error, bool reconnectAfterPair, uint32_t reconnectDelayMs) {
     if (!connectToSelectedDevice(error)) {
         return false;
     }
 
+    const NimBLEAddress peerAddress(std::string(selectedAddress.c_str()), selectedAddressType);
+    const bool localBonded = NimBLEDevice::isBonded(peerAddress);
+    addLog("pair", "Security bonding=yes mitm=no secureConnections=no (NIVONA Connect policy)");
+
     NimBLEConnInfo info = client->getConnInfo();
+    addLog("pair",
+           String("Initial link state encrypted=") + (info.isEncrypted() ? String("yes") : String("no")) +
+               " peerBonded=" + (info.isBonded() ? String("yes") : String("no")) +
+               " localBond=" + (localBonded ? String("yes") : String("no")));
     if (info.isEncrypted()) {
         pairingStatus = info.isBonded() ? "bonded" : "encrypted";
         addLog("pair",
@@ -5139,15 +5191,50 @@ bool pairWithDevice(String& error, bool reconnectAfterPair, uint32_t reconnectDe
     }
 
     pairingStatus = "pairing";
-    bool secured = false;
-    {
-        WorkerBleCallScope bleCall;
-        secured = client->secureConnection();
-    }
-    if (!secured || workerDeadlineExceeded()) {
-        error = "secureConnection failed";
-        pairingStatus = "pairing-failed";
-        return false;
+    int securityError = 0;
+    if (!secureConnectionWithLog("initial pairing", securityError)) {
+        if (workerDeadlineExceeded()) {
+            error = String("secureConnection exceeded the job deadline: rc=") + String(securityError) + " (" +
+                    NimBLEUtils::returnCodeToString(securityError) + ")";
+            pairingStatus = "pairing-failed";
+            return false;
+        }
+
+        const int missingKeyError = BLE_HS_ERR_HCI_BASE + BLE_ERR_PINKEY_MISSING;
+        if (securityError == missingKeyError && localBonded) {
+            addLog("pair", "Peer rejected the stored key; deleting this device bond and retrying fresh pairing");
+            bool bondDeleted = false;
+            {
+                WorkerBleCallScope bleCall;
+                bondDeleted = NimBLEDevice::deleteBond(peerAddress);
+            }
+            if (!bondDeleted || workerDeadlineExceeded()) {
+                error = workerDeadlineExceeded()
+                    ? String("stale-bond deletion exceeded the job deadline")
+                    : String("failed to delete stale bond after missing-key response");
+                addLog("pair", error);
+                pairingStatus = "pairing-failed";
+                return false;
+            }
+            if (!reconnectToSelectedDevice(DEFAULT_RECONNECT_DELAY_MS, error)) {
+                addLog("pair", String("Reconnect after stale-bond deletion failed: ") + error);
+                pairingStatus = "pairing-failed";
+                return false;
+            }
+            if (!secureConnectionWithLog("fresh pairing after stale-bond deletion", securityError)) {
+                error = workerDeadlineExceeded()
+                    ? String("fresh pairing after stale-bond deletion exceeded the job deadline")
+                    : String("secureConnection failed after stale-bond deletion: rc=") + String(securityError) +
+                          " (" + NimBLEUtils::returnCodeToString(securityError) + ")";
+                pairingStatus = "pairing-failed";
+                return false;
+            }
+        } else {
+            error = String("secureConnection failed: rc=") + String(securityError) + " (" +
+                    NimBLEUtils::returnCodeToString(securityError) + ")";
+            pairingStatus = "pairing-failed";
+            return false;
+        }
     }
 
     info = client->getConnInfo();
@@ -5170,13 +5257,12 @@ bool pairWithDevice(String& error, bool reconnectAfterPair, uint32_t reconnectDe
 
     NimBLEConnInfo reconnectedInfo = client->getConnInfo();
     if (!reconnectedInfo.isEncrypted()) {
-        bool resecured = false;
-        {
-            WorkerBleCallScope bleCall;
-            resecured = client->secureConnection();
-        }
-        if (!resecured || workerDeadlineExceeded()) {
-            error = "secureConnection failed after reconnect";
+        int reconnectSecurityError = 0;
+        if (!secureConnectionWithLog("bonded reconnect", reconnectSecurityError)) {
+            error = workerDeadlineExceeded()
+                ? String("secureConnection after reconnect exceeded the job deadline")
+                : String("secureConnection failed after reconnect: rc=") + String(reconnectSecurityError) + " (" +
+                      NimBLEUtils::returnCodeToString(reconnectSecurityError) + ")";
             pairingStatus = "pairing-failed";
             return false;
         }
