@@ -245,6 +245,10 @@ struct BrewQueueItem {
     bool holdAfter{false};
     bool resolutionAccepted{false};
     bool historyLogged{false};
+    // Volatile recovery hint. Fresh brews cannot already exist in history, but
+    // a queue item restored after reboot may have been appended immediately
+    // before power was lost and needs an idempotency lookup.
+    bool historyDeduplicationRequired{false};
     int16_t process{0};
     int16_t subProcess{0};
     int16_t message{0};
@@ -9605,13 +9609,16 @@ bool brewQueueHasUnresolved(const String& serial) {
 
 bool finalizeBrewHistoryLocked(BrewQueueItem& item, String& error) {
     if (item.historyLogged) return true;
-    DynamicJsonDocument existing(6144);
-    if (brew_history::findNewestByStringField(
-            item.serial, "brewId", item.id, existing.to<JsonObject>(), error)) {
-        item.historyLogged = true;
-        return true;
+    if (item.historyDeduplicationRequired) {
+        DynamicJsonDocument existing(6144);
+        if (brew_history::findNewestByStringField(
+                item.serial, "brewId", item.id, existing.to<JsonObject>(), error)) {
+            item.historyLogged = true;
+            item.historyDeduplicationRequired = false;
+            return true;
+        }
+        if (!error.isEmpty()) return false;
     }
-    if (!error.isEmpty()) return false;
     DynamicJsonDocument payload(20 * 1024);
     if (!loadBrewPayload(item.id, payload, error)) return false;
     DynamicJsonDocument historyDocument(6144);
@@ -9656,8 +9663,14 @@ bool finalizeBrewHistoryLocked(BrewQueueItem& item, String& error) {
         error = "brew history record exceeds its memory limit";
         return false;
     }
-    if (!brew_history::append(item.serial, entry, error)) return false;
+    if (!brew_history::append(item.serial, entry, error)) {
+        // A failed append can still have written bytes before LittleFS reported
+        // the error. Require a lookup before the next attempt.
+        item.historyDeduplicationRequired = true;
+        return false;
+    }
     item.historyLogged = true;
+    item.historyDeduplicationRequired = false;
     refreshCachedStorageTotals();
     return true;
 }
@@ -9802,6 +9815,7 @@ void loadBrewQueue() {
         item.holdAfter = entry["holdAfter"] | false;
         item.resolutionAccepted = entry["resolutionAccepted"] | false;
         item.historyLogged = entry["historyLogged"] | false;
+        item.historyDeduplicationRequired = !item.historyLogged;
         item.process = entry["process"] | 0;
         item.subProcess = entry["subProcess"] | 0;
         item.message = entry["message"] | 0;
@@ -16077,6 +16091,7 @@ BrewCoordinatorActivity scheduleBrewQueue(uint32_t nowMs) {
             // Keep the transition dirty so the next pass retries it. The
             // history lookup makes retrying the already-appended entry safe.
             head.historyLogged = false;
+            head.historyDeduplicationRequired = true;
             if (!error.isEmpty()) lastError = error;
         }
         const BrewQueueItem snapshot = head;

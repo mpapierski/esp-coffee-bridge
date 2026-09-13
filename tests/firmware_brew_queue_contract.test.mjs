@@ -14,4 +14,20 @@ test("a blocked terminal brew persists history completion only once", () => {
     /if \(!wasHistoryLogged && head\.historyLogged &&\s*!persistBrewQueueLocked\(error\)\)/,
   );
   assert.match(coordinator, /head\.historyLogged = false;/);
+  assert.match(coordinator, /head\.historyDeduplicationRequired = true;/);
+});
+
+test("ordinary brew completion skips the recovery-only history scan", () => {
+  const finalizer = source.slice(
+    source.indexOf("bool finalizeBrewHistoryLocked("),
+    source.indexOf("bool removeBrewDurablyLocked("),
+  );
+  const loader = source.slice(
+    source.indexOf("void loadBrewQueue("),
+    source.indexOf("void handleBrewQueueList("),
+  );
+
+  assert.match(finalizer, /if \(item\.historyDeduplicationRequired\)/);
+  assert.match(finalizer, /brew_history::findNewestByStringField/);
+  assert.match(loader, /item\.historyDeduplicationRequired = !item\.historyLogged;/);
 });
