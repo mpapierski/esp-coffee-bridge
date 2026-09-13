@@ -45,17 +45,36 @@ struct FileValidation {
     uint32_t checksum{2166136261u};
 };
 
+struct LockDiagnostics {
+    uint32_t acquisitions{0};
+    uint32_t contendedAcquisitions{0};
+    uint32_t timedOutAcquisitions{0};
+    uint32_t maxWaitMs{0};
+    uint32_t maxHoldMs{0};
+    uint32_t currentHoldMs{0};
+    bool held{false};
+    String currentOperation;
+    String maxWaitOperation;
+    String maxHoldOperation;
+    String lastTimeoutOperation;
+    String lastTimeoutBlockedBy;
+};
+
 // Initialize the one recursive mutex used to serialize all LittleFS access.
 // Calls are idempotent; history operations also initialize it lazily.
 bool begin();
 inline constexpr uint32_t DEFAULT_LOCK_TIMEOUT_MS = 5000;
 
 bool lock(uint32_t timeoutMs = DEFAULT_LOCK_TIMEOUT_MS);
+bool lockTagged(const char* operation, uint32_t timeoutMs = DEFAULT_LOCK_TIMEOUT_MS);
 void unlock();
+LockDiagnostics lockDiagnostics();
 
 class Guard {
 public:
     explicit Guard(uint32_t timeoutMs = DEFAULT_LOCK_TIMEOUT_MS) : locked_(lock(timeoutMs)) {}
+    Guard(const char* operation, uint32_t timeoutMs = DEFAULT_LOCK_TIMEOUT_MS)
+        : locked_(lockTagged(operation, timeoutMs)) {}
     ~Guard() {
         if (locked_) {
             unlock();

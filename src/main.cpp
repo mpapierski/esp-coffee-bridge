@@ -1717,7 +1717,7 @@ bool initializeLittleFs(String& error) {
 }
 
 bool littleFsExistsLocked(const String& path) {
-    history_storage::Guard filesystem(5000);
+    history_storage::Guard filesystem("file_exists", 5000);
     return filesystem && LittleFS.exists(path);
 }
 
@@ -2272,7 +2272,7 @@ void refreshCachedStorageTotals() {
     size_t largestBrewHistoryFileBytes = 0;
     size_t largestStatsHistoryFileBytes = 0;
     {
-        history_storage::Guard filesystem(100);
+        history_storage::Guard filesystem("storage_totals", 100);
         if (!filesystem || !littleFsReady) {
             return;
         }
@@ -7039,6 +7039,23 @@ void appendStatus(JsonDocument& doc, bool includeRuntimeDiagnostics = false) {
     historyStorage["largestBrewFileBytes"] = health.largestBrewHistoryFileBytes;
     historyStorage["largestStatsFileBytes"] = health.largestStatsHistoryFileBytes;
     historyStorage["losslessAcrossFirmwareUpdates"] = true;
+    if (includeRuntimeDiagnostics) {
+        const history_storage::LockDiagnostics filesystemLock =
+            history_storage::lockDiagnostics();
+        JsonObject lock = historyStorage.createNestedObject("lock");
+        lock["held"] = filesystemLock.held;
+        lock["currentOperation"] = filesystemLock.currentOperation;
+        lock["currentHoldMs"] = filesystemLock.currentHoldMs;
+        lock["acquisitions"] = filesystemLock.acquisitions;
+        lock["contendedAcquisitions"] = filesystemLock.contendedAcquisitions;
+        lock["timedOutAcquisitions"] = filesystemLock.timedOutAcquisitions;
+        lock["maxWaitMs"] = filesystemLock.maxWaitMs;
+        lock["maxWaitOperation"] = filesystemLock.maxWaitOperation;
+        lock["maxHoldMs"] = filesystemLock.maxHoldMs;
+        lock["maxHoldOperation"] = filesystemLock.maxHoldOperation;
+        lock["lastTimeoutOperation"] = filesystemLock.lastTimeoutOperation;
+        lock["lastTimeoutBlockedBy"] = filesystemLock.lastTimeoutBlockedBy;
+    }
 
     doc["clientCreated"] = health.clientCreated;
     doc["clientConnected"] = health.clientConnected;
@@ -9437,7 +9454,7 @@ bool writeBrewJsonAtomically(const String& path,
         error = "brew queue record exceeds its storage limit";
         return false;
     }
-    history_storage::Guard filesystem(5000);
+    history_storage::Guard filesystem("brew_queue_write", 5000);
     if (!filesystem) {
         error = "filesystem is busy";
         return false;
@@ -12371,7 +12388,7 @@ void handleBackupExport() {
 
     // Hold the shared filesystem lock for the explicit backup operation. This
     // makes the size preflight and emitted bundle the same immutable snapshot.
-    history_storage::Guard exportFilesystem(5000);
+    history_storage::Guard exportFilesystem("backup_export", 5000);
     if (!exportFilesystem) {
         server.sendHeader("Retry-After", "1");
         sendError(503, "filesystem is busy");
@@ -14100,7 +14117,7 @@ bool stageAtomicFileReplacement(const String& temporaryPath,
                                 String& backupPathOut,
                                 bool& hadOriginalOut,
                                 String& error) {
-    history_storage::Guard filesystem(5000);
+    history_storage::Guard filesystem("resource_cache_publish", 5000);
     if (!filesystem) {
         error = "filesystem is busy";
         return false;
@@ -14154,7 +14171,7 @@ void finishAtomicFileReplacement(const String& finalPath,
                                  const String& backupPath,
                                  bool hadOriginal,
                                  bool commit) {
-    history_storage::Guard filesystem(5000);
+    history_storage::Guard filesystem("resource_cache_finalize", 5000);
     if (!filesystem) {
         return;
     }
@@ -14527,7 +14544,7 @@ bool loadCachedResourcePayload(const ResourceCacheEntry& cache,
         *busyOut = false;
     }
     payloadOut = "";
-    history_storage::Guard filesystem(1000);
+    history_storage::Guard filesystem("resource_cache_read", 1000);
     if (!filesystem) {
         if (busyOut != nullptr) {
             *busyOut = true;
@@ -14836,7 +14853,7 @@ bool streamJsonFileResponse(const String& path,
     error = "";
     size_t resultBytes = 0;
     {
-        history_storage::Guard filesystem(1000);
+        history_storage::Guard filesystem("job_result_read", 1000);
         if (!filesystem) {
             error = "filesystem is busy";
             return false;
@@ -14874,7 +14891,7 @@ bool streamJsonFileResponse(const String& path,
         size_t readCount = 0;
         String readError;
         {
-            history_storage::Guard filesystem(1000);
+            history_storage::Guard filesystem("job_result_read", 1000);
             if (!filesystem) {
                 readError = "filesystem became busy while streaming the job result";
             } else {

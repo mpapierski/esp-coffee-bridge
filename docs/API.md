@@ -209,6 +209,10 @@ The bridge accepts an absent `Origin` for non-browser tools. When browsers provi
 - `crashDump`: partition availability, dump presence/integrity, byte length, crashed task/PC, and the crashing application's ELF SHA when a summary is available.
 - `machineSession`: active saved-machine serial, `offline`/`connecting`/`online` state, last successful `Hp` time, the ten-second probe interval, registered NimBLE client count, retry deadline/remaining delay, failure count, and the latest failed session stage.
 - `brewQueue`: capacity, count, blocked/recovery state, and current head ID/state.
+- `historyStorage.lock`: current holder and hold time, acquisition/contention/
+  timeout counts, maximum wait and hold durations with their operation names,
+  and the requester/holder involved in the latest timeout. Values accumulate
+  since boot.
 - asynchronous NTP diagnostic state, including pending/running flags and diagnostic worker stack high-water mark.
 
 ### Crash-dump diagnostics

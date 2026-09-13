@@ -275,7 +275,7 @@ bool canAppendWithoutCompaction(const String& serial,
         return false;
     }
 
-    history_storage::Guard filesystem;
+    history_storage::Guard filesystem("brew_history_capacity");
     if (!filesystem) {
         error = "failed to lock history storage";
         return false;
@@ -308,7 +308,7 @@ bool appendSerializedLines(const String& serial, const std::vector<String>& line
         return true;
     }
 
-    history_storage::Guard filesystem;
+    history_storage::Guard filesystem("brew_history_append");
     if (!filesystem) {
         error = "failed to lock history storage";
         return false;
@@ -382,7 +382,7 @@ bool collectStorageStats(StorageStats& statsOut, String& error) {
     statsOut.budgetMinBytes = budgetMinBytes();
     statsOut.budgetUpperBytes = budgetUpperBytes();
 
-    history_storage::Guard filesystem;
+    history_storage::Guard filesystem("brew_history_stats");
     if (!filesystem) {
         error = "failed to lock history storage";
         return false;
@@ -670,7 +670,7 @@ bool findNewestByStringField(const String& serial,
         error = "history lookup requires serial, field, and value";
         return false;
     }
-    history_storage::Guard filesystem;
+    history_storage::Guard filesystem("brew_history_lookup");
     if (!filesystem) {
         error = "failed to lock history storage";
         return false;
