@@ -331,6 +331,7 @@ Capture `/api/status` before and after at least one 15-minute period. The pass c
 - `bleQueue.rejected` does not increase;
 - no pair of independent stats/settings jobs appears for one deep-coordinator cycle;
 - identical overlapping reads return the same job ID or increment `bleQueue.coalesced`, rather than consuming two active slots; and
+- `machineSession.nimbleClientCount` stays at zero before first use or one after first use, including across repeated connection failures; session retry delay rises to at most 60 seconds instead of creating a client on every poll; and
 - `durableMachineWriteCount` does not change solely because of ordinary bridge polling, presence scans, or unchanged live-resource refreshes.
 
 ## Bounded history-memory check

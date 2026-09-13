@@ -57,6 +57,7 @@ The intended workflow is:
 ## Web App Features
 
 - `Dashboard`: lists remembered machines with alias/model/family, validated online or offline session state, separate nearby/last-seen presence, and quick open or forget actions.
+- Machine sessions reuse one NimBLE client and apply bounded reconnect backoff, so a sleeping or unavailable machine cannot exhaust the bridge's BLE client table.
 - `Add machine flow`: scans nearby BLE devices, highlights likely supported coffee machines, probes a device before saving it, and also supports manual offline add by BLE address, serial number, and optional model.
 - `Live machine summary`: shows current status summary, process label/code, operator message label/code, progress, and whether the APK-backed `HY` host-confirm path is currently suggested.
 - `Standard drinks`: lists the built-in drink selectors, supports quick brew, and opens a per-drink customization view.
