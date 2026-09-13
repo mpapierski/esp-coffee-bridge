@@ -78,6 +78,22 @@ constexpr bool recentFailure(uint32_t failureCount,
     return failureCount != 0 && !elapsedAtLeast(nowMs, failureAtMs, recentWindowMs);
 }
 
+constexpr uint32_t exponentialRetryDelay(uint32_t failureCount,
+                                         uint32_t initialDelayMs,
+                                         uint32_t maximumDelayMs) {
+    if (failureCount == 0 || initialDelayMs == 0 || maximumDelayMs == 0) {
+        return 0;
+    }
+    uint32_t delayMs = std::min(initialDelayMs, maximumDelayMs);
+    for (uint32_t failure = 1; failure < failureCount && delayMs < maximumDelayMs; ++failure) {
+        if (delayMs > maximumDelayMs / 2U) {
+            return maximumDelayMs;
+        }
+        delayMs *= 2U;
+    }
+    return std::min(delayMs, maximumDelayMs);
+}
+
 constexpr bool retainWorkerResultFile(bool resource,
                                       bool spoolResult,
                                       int responseStatus) {
@@ -162,13 +178,14 @@ struct SessionSnapshot {
     bool connected{false};
     bool handlesDiscovered{false};
     bool huSessionReady{false};
-    bool recreateBeforeNextJob{false};
+    bool resetBeforeNextJob{false};
     std::string target;
 };
 
 // Small, transport-agnostic state machine for the worker's reuse contract.
 // Transport must expose createClient(), connect(target), discoverHandles(),
-// establishHuSession(), read(operation), disconnect(), and destroyClient().
+// establishHuSession(), read(operation), disconnect(), and resetClient(). The
+// reset clears connection-scoped state while retaining the registered client.
 template <typename Transport>
 class ReusableSession {
 public:
@@ -204,11 +221,15 @@ private:
     TransportOutcome prepare(Transport& transport,
                              const std::string& target,
                              bool requireHuSession) {
-        if (state_.recreateBeforeNextJob) {
+        if (state_.resetBeforeNextJob) {
             if (state_.clientCreated) {
-                transport.destroyClient();
+                transport.resetClient();
             }
-            state_ = {};
+            state_.connected = false;
+            state_.handlesDiscovered = false;
+            state_.huSessionReady = false;
+            state_.resetBeforeNextJob = false;
+            state_.target.clear();
         }
 
         if (state_.connected && state_.target != target) {
@@ -251,7 +272,7 @@ private:
     }
 
     void invalidateAfterFailure() {
-        state_.recreateBeforeNextJob = true;
+        state_.resetBeforeNextJob = true;
         state_.connected = false;
         state_.handlesDiscovered = false;
         state_.huSessionReady = false;

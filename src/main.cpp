@@ -74,6 +74,8 @@ constexpr uint32_t STATS_HISTORY_POLL_INTERVAL_MS = 15 * 60 * 1000;
 constexpr uint32_t IDLE_SCAN_INTERVAL_MS = 60 * 1000;
 constexpr uint32_t BLE_IDLE_DISCONNECT_MS = 10 * 1000;
 constexpr uint32_t MACHINE_KEEPALIVE_INTERVAL_MS = 10 * 1000;
+constexpr uint32_t MACHINE_RETRY_INITIAL_MS = 5 * 1000;
+constexpr uint32_t MACHINE_RETRY_MAX_MS = 60 * 1000;
 constexpr uint32_t WORKER_STALL_WATCHDOG_MS = 45 * 1000;
 constexpr uint32_t HTTP_STALL_WATCHDOG_MS = 45 * 1000;
 constexpr uint32_t HTTP_ALLOC_FAILURE_STALL_MS = 10 * 1000;
@@ -338,6 +340,7 @@ struct BridgeHealthSnapshot {
     bool workerBusy{false};
     bool clientCreated{false};
     bool clientConnected{false};
+    uint8_t nimbleClientCount{0};
     bool scanInProgress{false};
     bool watchdogMarkerPresent{false};
     uint8_t currentProgress{0};
@@ -531,9 +534,14 @@ String wifiStaSsid;
 SharedStatusText<32> pairingStatus("idle");
 SharedStatusText<128> lastError;
 SharedStatusText<64> machineSessionSerial;
+SharedStatusText<64> machineSessionRetrySerial;
+SharedStatusText<32> machineSessionLastFailureStage;
 std::atomic<MachineSessionState> machineSessionState{MachineSessionState::Offline};
 std::atomic<uint32_t> machineSessionLastPongAtMs{0};
 std::atomic<uint32_t> machineSessionNextPingAtMs{0};
+std::atomic<uint32_t> machineSessionFailureCount{0};
+std::atomic<uint32_t> machineSessionRetryAtMs{0};
+std::atomic<uint32_t> machineSessionLastFailureAtMs{0};
 String lastHuSeedHex;
 String lastHuRequestHex;
 String lastHuResponseHex;
@@ -730,6 +738,23 @@ bool machineSessionIsOnline(const String& serial = "") {
         (serial.isEmpty() || machineSessionTargets(serial));
 }
 
+uint32_t machineSessionRetryRemainingMs(const String& serial, uint32_t nowMs = millis()) {
+    const uint32_t retryAtMs = machineSessionRetryAtMs.load(std::memory_order_acquire);
+    if (retryAtMs == 0 || serial.isEmpty() ||
+        !machineSessionRetrySerial.snapshot().equalsIgnoreCase(serial)) {
+        return 0;
+    }
+    return bridge_runtime_policy::deadlineRemaining(nowMs, retryAtMs);
+}
+
+void clearMachineSessionRetry() {
+    machineSessionFailureCount.store(0, std::memory_order_release);
+    machineSessionRetryAtMs.store(0, std::memory_order_release);
+    machineSessionLastFailureAtMs.store(0, std::memory_order_release);
+    machineSessionRetrySerial = "";
+    machineSessionLastFailureStage = "";
+}
+
 void markMachineSessionConnecting(const String& serial) {
     machineSessionSerial = serial;
     machineSessionLastPongAtMs.store(0, std::memory_order_release);
@@ -739,6 +764,7 @@ void markMachineSessionConnecting(const String& serial) {
 
 void markMachineSessionOnline(const String& serial) {
     const uint32_t nowMs = millis();
+    clearMachineSessionRetry();
     machineSessionSerial = serial;
     machineSessionLastPongAtMs.store(nowMs, std::memory_order_release);
     machineSessionNextPingAtMs.store(
@@ -751,6 +777,34 @@ void markMachineSessionOffline() {
     machineSessionSerial = "";
     machineSessionLastPongAtMs.store(0, std::memory_order_release);
     machineSessionNextPingAtMs.store(0, std::memory_order_release);
+}
+
+void noteMachineSessionFailure(const String& serial,
+                               const char* stage,
+                               const String& error) {
+    const String previousSerial = machineSessionRetrySerial.snapshot();
+    uint32_t failureCount = previousSerial.equalsIgnoreCase(serial)
+        ? machineSessionFailureCount.load(std::memory_order_acquire) + 1U
+        : 1U;
+    if (failureCount == 0) {
+        failureCount = UINT32_MAX;
+    }
+    const uint32_t nowMs = millis();
+    const uint32_t retryDelayMs = bridge_runtime_policy::exponentialRetryDelay(
+        failureCount, MACHINE_RETRY_INITIAL_MS, MACHINE_RETRY_MAX_MS);
+    machineSessionRetrySerial = serial;
+    machineSessionLastFailureStage = stage != nullptr ? stage : "unknown";
+    machineSessionFailureCount.store(failureCount, std::memory_order_release);
+    machineSessionLastFailureAtMs.store(nowMs, std::memory_order_release);
+    uint32_t retryAtMs = nowMs + retryDelayMs;
+    if (retryAtMs == 0) {
+        retryAtMs = 1;
+    }
+    machineSessionRetryAtMs.store(retryAtMs, std::memory_order_release);
+    markMachineSessionOffline();
+    addLog("session",
+           String("Session failed at ") + (stage != nullptr ? stage : "unknown") +
+               ", retryMs=" + retryDelayMs + ": " + error);
 }
 
 void invalidateRemoteHandlesForFullDiscovery() {
@@ -5021,7 +5075,15 @@ void appendDecodeAttempt(JsonObject target,
 
 class BridgeClientCallbacks : public NimBLEClientCallbacks {
     void onConnect(NimBLEClient* pClient) override {
-        addLog("ble", String("Connected to ") + pClient->getPeerAddress().toString().c_str());
+        addLog("ble", String("Transport connected to ") + pClient->getPeerAddress().toString().c_str());
+    }
+
+    void onConnectFail(NimBLEClient* pClient, int reason) override {
+        addLog("ble",
+               String("Transport connection failed for ") +
+                   pClient->getPeerAddress().toString().c_str() +
+                   ", reason=" + reason);
+        pairingStatus = "connect-failed";
     }
 
     void onDisconnect(NimBLEClient* pClient, int reason) override {
@@ -5096,19 +5158,27 @@ bool ensureClient(String& error) {
         return true;
     }
 
-    {
+    client = NimBLEDevice::getDisconnectedClient();
+    const bool reusedRegisteredClient = client != nullptr;
+    if (client == nullptr) {
         WorkerBleCallScope bleCall;
         client = NimBLEDevice::createClient();
     }
     if (client == nullptr) {
-        error = "failed to create NimBLE client";
+        error = String("failed to create NimBLE client; registered clients=") +
+            NimBLEDevice::getCreatedClientCount();
         return false;
     }
 
+    client->setSelfDelete(false, false);
     client->setClientCallbacks(&clientCallbacks, false);
     client->setConnectionParams(12, 12, 0, 150);
     client->setConnectTimeout(5000);
     clientDisconnectPending.store(false, std::memory_order_release);
+    clientDisconnectedEvent.store(false, std::memory_order_release);
+    if (reusedRegisteredClient) {
+        addLog("ble", "Recovered a disconnected NimBLE client");
+    }
     return true;
 }
 
@@ -6389,13 +6459,18 @@ bool ensureMachineHuSession(uint32_t waitMs, String& error);
 bool pingMachineProtocol(String& error);
 
 bool beginMachineProtocolSession(SavedMachine& machine, String& error, bool clearSession = true) {
+    applyClientDisconnectedEvent();
+    const uint32_t retryRemainingMs = machineSessionRetryRemainingMs(machine.serial);
+    if (retryRemainingMs > 0) {
+        error = String("machine session retry backoff active; retry in ") +
+            retryRemainingMs + " ms";
+        return false;
+    }
     WorkerExecutionContext* execution = currentWorkerExecution();
     const bool persistentSession = execution == nullptr || !execution->backgroundJob;
     const bool alreadyOnline = machineSessionIsOnline(machine.serial);
-    if (persistentSession && !alreadyOnline) {
-        markMachineSessionConnecting(machine.serial);
-    }
     if (!selectSavedMachine(machine, error)) {
+        noteMachineSessionFailure(machine.serial, "select", error);
         return false;
     }
     const bool sameConnectedTarget = client != nullptr && client->isConnected() &&
@@ -6403,13 +6478,19 @@ bool beginMachineProtocolSession(SavedMachine& machine, String& error, bool clea
         nivonaService != nullptr && nivonaRx != nullptr && nivonaTx != nullptr;
     const bool reusableSession = sameConnectedTarget &&
         resolveStoredSessionIfAvailable(machine.serial, machine.address) != nullptr;
+    const bool requiresValidation = persistentSession && (!alreadyOnline || !reusableSession);
+    if (requiresValidation) {
+        markMachineSessionConnecting(machine.serial);
+    }
     if (clearSession && !reusableSession) {
         clearStoredSessionKey(machine.serial, machine.address);
     }
     if (!pairWithDevice(error, true, DEFAULT_RECONNECT_DELAY_MS)) {
+        noteMachineSessionFailure(machine.serial, "connect_or_pair", error);
         return false;
     }
     if (!setNotificationsEnabled(true, error, "notify")) {
+        noteMachineSessionFailure(machine.serial, "notifications", error);
         return false;
     }
     suppressIdleScans();
@@ -6417,18 +6498,24 @@ bool beginMachineProtocolSession(SavedMachine& machine, String& error, bool clea
         String detailsError;
         if (!fetchDeviceDetails(detailsError)) {
             error = detailsError.isEmpty() ? String("failed to read machine details") : detailsError;
+            noteMachineSessionFailure(machine.serial, "details", error);
             return false;
         }
     }
     updateSavedMachineFromCachedDetails(machine);
     if (!ensureMachineHuSession(2500, error)) {
+        noteMachineSessionFailure(machine.serial, "hu", error);
         return false;
     }
-    if (persistentSession && !alreadyOnline) {
+    if (requiresValidation) {
         if (!pingMachineProtocol(error)) {
+            noteMachineSessionFailure(machine.serial, "ping", error);
             return false;
         }
         markMachineSessionOnline(machine.serial);
+        addLog("session", String("Machine session online for ") + machine.serial);
+    } else {
+        clearMachineSessionRetry();
     }
     lastBleActivityAtMs = millis();
     return true;
@@ -6480,7 +6567,7 @@ void handleMachineKeepAlive(const String& serial) {
     String error;
     if (!pingMachineProtocol(error)) {
         lastError = error;
-        markMachineSessionOffline();
+        noteMachineSessionFailure(serial, "keepalive", error);
         sendError(503, error.isEmpty() ? String("machine liveness probe failed") : error);
         return;
     }
@@ -6870,6 +6957,16 @@ void appendStatus(JsonDocument& doc, bool includeRuntimeDiagnostics = false) {
     machineSession["lastPongAtMs"] =
         machineSessionLastPongAtMs.load(std::memory_order_acquire);
     machineSession["pingIntervalMs"] = MACHINE_KEEPALIVE_INTERVAL_MS;
+    machineSession["nimbleClientCount"] = health.nimbleClientCount;
+    machineSession["failureCount"] =
+        machineSessionFailureCount.load(std::memory_order_acquire);
+    machineSession["retryAtMs"] =
+        machineSessionRetryAtMs.load(std::memory_order_acquire);
+    machineSession["retryRemainingMs"] = machineSessionRetryRemainingMs(
+        machineSessionRetrySerial.snapshot());
+    machineSession["lastFailureAtMs"] =
+        machineSessionLastFailureAtMs.load(std::memory_order_acquire);
+    machineSession["lastFailureStage"] = machineSessionLastFailureStage.snapshot();
     doc["standardRecipeCacheReady"] = littleFsReady;
     doc["littleFsReady"] = littleFsReady;
     doc["littleFsTotalBytes"] = health.littleFsTotalBytes;
@@ -14478,8 +14575,9 @@ void handleMachineResourceRequest(const String& serial, const String& resource) 
         return;
     }
     const String canonicalSerial = machine->serial;
-    const bool forced = parseRefreshArg() ||
-        (resource == "summary" && !machineSessionIsOnline(canonicalSerial));
+    const bool forced = parseRefreshArg();
+    const bool establishesMachineSession =
+        resource == "summary" && !machineSessionIsOnline(canonicalSerial);
     ResourceCacheEntry cache;
     const bool hasMetadata = copyResourceCache(canonicalSerial, resource, cache);
     if (hasMetadata) {
@@ -14500,11 +14598,42 @@ void handleMachineResourceRequest(const String& serial, const String& resource) 
         }
     }
     const uint32_t nowMs = millis();
-    const bridge_runtime_policy::CacheDecision cacheDecision =
+    const uint32_t sessionRetryRemainingMs = establishesMachineSession
+        ? machineSessionRetryRemainingMs(canonicalSerial, nowMs)
+        : 0;
+    if (sessionRetryRemainingMs > 0) {
+        server.sendHeader(
+            "Retry-After",
+            String((sessionRetryRemainingMs + 999U) / 1000U));
+        if (hasPayload) {
+            bool filesystemBusy = false;
+            if (!streamCachedResource(cache, true, nullptr, &filesystemBusy)) {
+                sendError(filesystemBusy ? 503 : 500,
+                          filesystemBusy ? String("filesystem is busy")
+                                         : String("cached resource is invalid"));
+            }
+        } else {
+            sendError(503,
+                      String("machine session retry backoff active; retry in ") +
+                          sessionRetryRemainingMs + " ms");
+        }
+        return;
+    }
+    bridge_runtime_policy::CacheDecision cacheDecision =
         bridge_runtime_policy::decideCacheRequest(
             {hasPayload, cache.sampledAtMs, cache.ttlMs, cache.retryAfterMs},
             nowMs,
             forced);
+    if (establishesMachineSession && cacheDecision.enqueueRefresh) {
+        cacheDecision.servePayload = hasPayload;
+        cacheDecision.stale = hasPayload;
+    } else if (establishesMachineSession && !cacheDecision.rejectColdForBackoff &&
+               !bridge_runtime_policy::retryBackoffActive(
+                   {hasPayload, cache.sampledAtMs, cache.ttlMs, cache.retryAfterMs}, nowMs)) {
+        cacheDecision.enqueueRefresh = true;
+        cacheDecision.servePayload = hasPayload;
+        cacheDecision.stale = hasPayload;
+    }
 
     if (cacheDecision.servePayload && !cacheDecision.stale) {
         bool filesystemBusy = false;
@@ -14535,10 +14664,9 @@ void handleMachineResourceRequest(const String& serial, const String& resource) 
         const BleOperation operation = operationForResource(resource);
         submission.operationCode = static_cast<uint16_t>(operation);
         submission.identity = serializeMachineIdentity(*machine).c_str();
-        submission.priority = forced || !hasPayload ? bridge_jobs::Priority::ForcedRead
-                                                    : bridge_jobs::Priority::StaleRefresh;
-        const bool establishesMachineSession =
-            resource == "summary" && !machineSessionIsOnline(canonicalSerial);
+        const bool priorityForced = forced || establishesMachineSession || !hasPayload;
+        submission.priority = priorityForced ? bridge_jobs::Priority::ForcedRead
+                                             : bridge_jobs::Priority::StaleRefresh;
         const uint32_t resourceDeadlineMs = establishesMachineSession
             ? 20000U
             : (resource == "summary" || resource == "features" ? 12000U : 15000U);
@@ -14562,7 +14690,7 @@ void handleMachineResourceRequest(const String& serial, const String& resource) 
         submission.resultUrl = (String("/api/machines/") + canonicalSerial + "/" + resource).c_str();
         submission.coalesceKey = defaultJobCoalesceKey(
             String("machine_") + resource, canonicalSerial, operation, "", "").c_str();
-        enqueued = submitJob(submission, refreshJob, forced || !hasPayload);
+        enqueued = submitJob(submission, refreshJob, priorityForced);
         if (enqueued) {
             updateCacheQueuedJob(canonicalSerial, resource, String(refreshJob.id.c_str()));
         }
@@ -14947,28 +15075,20 @@ void restartAfterStuckBleCleanup(const String& reason) {
 void resetBleClientAfterFailure() {
     markMachineSessionOffline();
     if (client != nullptr) {
-        // Never ask NimBLE to delete a client whose asynchronous termination
-        // is still pending. The callback owns the transition to disconnected;
-        // only then is immediate deletion safe.
+        // Keep one registered client for the lifetime of the BLE stack. Deleting
+        // a client while a failed connection is still settling can defer the
+        // deletion inside NimBLE; dropping our pointer at that point leaks one
+        // of its fixed client slots. A disconnected client is explicitly
+        // supported for subsequent connect() calls and avoids that race.
         String disconnectError;
         if (!disconnectClientAndWait(disconnectError, 3000, true)) {
             restartAfterStuckBleCleanup(disconnectError);
             return;
         }
-        NimBLEClient* clientToDelete = client;
         clearRemoteHandles();
         clearStoredSessionKey();
         cachedDetails = DeviceDetails{};
-        bool deletionAccepted = false;
-        {
-            WorkerBleCallScope deleteCall;
-            deletionAccepted = NimBLEDevice::deleteClient(clientToDelete);
-        }
-        if (!deletionAccepted) {
-            restartAfterStuckBleCleanup("NimBLE rejected disconnected client deletion");
-            return;
-        }
-        client = nullptr;
+        client->setSelfDelete(false, false);
     }
     clientDisconnectPending.store(false, std::memory_order_release);
     clientDisconnectedEvent.store(false, std::memory_order_release);
@@ -15168,6 +15288,10 @@ void updateWorkerOwnedHealth() {
     bridgeHealth.workerBusy = workerJobActive.load(std::memory_order_acquire);
     bridgeHealth.clientCreated = client != nullptr;
     bridgeHealth.clientConnected = client != nullptr && client->isConnected();
+    bridgeHealth.nimbleClientCount = NimBLEDevice::isInitialized()
+        ? static_cast<uint8_t>(std::min<size_t>(
+              UINT8_MAX, NimBLEDevice::getCreatedClientCount()))
+        : 0;
     bridgeHealth.scanInProgress = idleScanInProgress || blockingScanInProgress;
     bridgeHealth.deviceCount = deviceCount;
     bridgeHealth.supportedDeviceCount = supportedDeviceCount;

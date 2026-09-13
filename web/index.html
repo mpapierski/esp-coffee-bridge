@@ -3673,7 +3673,7 @@
     let summary = getMachineCache(serial).summary;
     if (!summary || !machine.online) {
       try {
-        summary = await loadMachineSummary(serial, !machine.online);
+        summary = await loadMachineSummary(serial, false);
       } catch (error) {
         setFlash(`Live summary unavailable for ${machine.alias || machine.serial}: ${error.message}`, "error");
       }
@@ -3726,7 +3726,7 @@
     let summary = getMachineCache(serial).summary;
     if (!summary || !machine.online) {
       try {
-        summary = await loadMachineSummary(serial, !machine.online);
+        summary = await loadMachineSummary(serial, false);
       } catch (error) {
         setFlash(`Live summary unavailable for ${machine.alias || machine.serial}: ${error.message}`, "error");
       }
@@ -3755,7 +3755,7 @@
     let summary = getMachineCache(serial).summary;
     if (!summary || !machine.online) {
       try {
-        summary = await loadMachineSummary(serial, !machine.online);
+        summary = await loadMachineSummary(serial, false);
       } catch (error) {
         setFlash(`Live summary unavailable for ${machine.alias || machine.serial}: ${error.message}`, "error");
       }

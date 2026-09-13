@@ -20,8 +20,9 @@ test("machine badges distinguish protocol session state from scan presence", () 
   assert.match(scope.machinePresenceBadge({ online: true, nearby: false }), /Not seen nearby/);
 });
 
-test("opening any machine route forces summary when its session is offline", () => {
-  assert.equal((html.match(/summary = await loadMachineSummary\(serial, !machine\.online\);/g) || []).length, 3);
+test("opening any machine route requests summary without bypassing retry backoff", () => {
+  assert.equal((html.match(/summary = await loadMachineSummary\(serial, false\);/g) || []).length, 3);
+  assert.doesNotMatch(html, /loadMachineSummary\(serial, !machine\.online\)/);
   assert.match(html, /data-action="reconnect-machine"/);
   assert.doesNotMatch(html, /X-Machine-Lease/);
 });
