@@ -547,7 +547,6 @@ bool appendSerializedLines(const String& serial, const std::vector<String>& line
         error = "failed to lock history storage";
         return false;
     }
-
     const String path = historyPath(serial);
     if (!history_storage::recoverFile(path, error)) {
         return false;
@@ -586,6 +585,7 @@ bool appendSerializedLines(const String& serial, const std::vector<String>& line
         error = "stats history append would consume transactional filesystem headroom";
         return false;
     }
+    history_storage::noteHistoryMutation();
     File file = LittleFS.open(path, "a");
     if (!file) {
         error = "failed to open stats history for append";
@@ -695,6 +695,7 @@ bool patchTimestamp(const String& serial,
         error = "failed to lock history storage";
         return false;
     }
+    history_storage::noteHistoryMutation();
     const String path = historyPath(serial);
     if (!history_storage::recoverFile(path, error)) {
         return false;
@@ -797,6 +798,7 @@ bool deleteEntry(const String& serial,
         error = "failed to lock history storage";
         return false;
     }
+    history_storage::noteHistoryMutation();
     const String path = historyPath(serial);
     if (!history_storage::recoverFile(path, error)) {
         return false;
@@ -1034,6 +1036,7 @@ bool clear(const String& serial, String& error) {
         error = "failed to lock history storage";
         return false;
     }
+    history_storage::noteHistoryMutation();
     const String path = historyPath(serial);
     if (!history_storage::recoverFile(path, error)) {
         return false;
@@ -1059,6 +1062,7 @@ bool clearAll(String& error) {
         error = "failed to lock history storage";
         return false;
     }
+    history_storage::noteHistoryMutation();
     std::vector<String> paths;
     if (!listHistoryPaths(paths, error, true)) {
         return false;

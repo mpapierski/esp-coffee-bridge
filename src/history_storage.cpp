@@ -19,6 +19,7 @@ namespace {
 SemaphoreHandle_t gFilesystemMutex = nullptr;
 portMUX_TYPE gFilesystemMutexInitLock = portMUX_INITIALIZER_UNLOCKED;
 std::atomic<bool> gBulkRestoreMode{false};
+std::atomic<uint32_t> gHistoryGeneration{1};
 portMUX_TYPE gLockDiagnosticsMutex = portMUX_INITIALIZER_UNLOCKED;
 TaskHandle_t gLockOwnerTask = nullptr;
 uint32_t gLockOwnerDepth = 0;
@@ -112,6 +113,14 @@ size_t writeReserveBytes(size_t filesystemBytes) {
         return OPERATIONAL_HEADROOM_BYTES;
     }
     return operationalReserveBytes(filesystemBytes);
+}
+
+uint32_t historyGeneration() {
+    return gHistoryGeneration.load(std::memory_order_acquire);
+}
+
+void noteHistoryMutation() {
+    gHistoryGeneration.fetch_add(1, std::memory_order_release);
 }
 
 bool lockTagged(const char* operation, uint32_t timeoutMs) {
@@ -321,6 +330,15 @@ bool recoverFile(const String& originalPath, String& error) {
     LittleFsTransactionBackend backend;
     const history_file_transaction::RecoveryResult result =
         history_file_transaction::recover(backend, originalPath, backupPath);
+    const bool historyPath = originalPath.startsWith("/brewhist-") ||
+        originalPath.startsWith("brewhist-") ||
+        originalPath.startsWith("/stathist-") ||
+        originalPath.startsWith("stathist-");
+    if (historyPath && result != history_file_transaction::RecoveryResult::Unchanged) {
+        // Recovery may replace or remove the file even when it ultimately
+        // reports an error. Invalidate any optimistic backup snapshot.
+        noteHistoryMutation();
+    }
     switch (result) {
         case history_file_transaction::RecoveryResult::Unchanged:
         case history_file_transaction::RecoveryResult::RestoredBackup:

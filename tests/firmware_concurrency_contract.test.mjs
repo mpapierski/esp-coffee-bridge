@@ -66,5 +66,20 @@ test("filesystem lock diagnostics identify contention and long holders", () => {
   assert.match(status, /historyStorage\.createNestedObject\("lock"\)/);
   assert.match(status, /lastTimeoutBlockedBy/);
   assert.match(source, /Guard filesystem\("resource_cache_read", 1000\)/);
-  assert.match(source, /Guard exportFilesystem\("backup_export", 5000\)/);
+  assert.match(source, /Guard filesystem\("backup_read", 1000\)/);
+});
+
+test("backup export releases LittleFS between bounded reads", () => {
+  const reader = source.slice(
+    source.indexOf("class BufferedBackupLineReader"),
+    source.indexOf("bool processBackupHistory("),
+  );
+  const exporter = source.slice(
+    source.indexOf("void handleBackupExport("),
+    source.indexOf("void handleBackupRestoreFinished("),
+  );
+  assert.match(reader, /Guard filesystem\("backup_read", 1000\)/);
+  assert.match(reader, /history_storage::historyGeneration\(\)/);
+  assert.doesNotMatch(exporter, /exportFilesystem/);
+  assert.match(exporter, /BACKUP_SNAPSHOT_CHANGED_ERROR/);
 });

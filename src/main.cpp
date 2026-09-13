@@ -12141,28 +12141,74 @@ void handleHistoryConfigSave() {
     sendJson(response);
 }
 
+constexpr char BACKUP_SNAPSHOT_CHANGED_ERROR[] =
+    "history changed while the backup snapshot was being read";
+
 class BufferedBackupLineReader {
 public:
-    BufferedBackupLineReader(File& source, const String& path)
-        : source_(source), path_(path) {}
+    BufferedBackupLineReader(const String& path, uint32_t snapshotGeneration)
+        : path_(path), snapshotGeneration_(snapshotGeneration) {}
+
+    bool begin(bool& existsOut, String& error) {
+        existsOut = false;
+        history_storage::Guard filesystem("backup_read", 1000);
+        if (!filesystem) {
+            error = "filesystem is busy while reading the backup snapshot";
+            return false;
+        }
+        if (history_storage::historyGeneration() != snapshotGeneration_) {
+            error = BACKUP_SNAPSHOT_CHANGED_ERROR;
+            return false;
+        }
+        if (!LittleFS.exists(path_)) return true;
+        File source = LittleFS.open(path_, "r");
+        if (!source) {
+            error = String("failed to open backup source ") + path_;
+            return false;
+        }
+        expectedBytes_ = source.size();
+        source.close();
+        existsOut = true;
+        return true;
+    }
 
     bool next(String& line, bool& available, String& error) {
         line = "";
         available = false;
         while (true) {
             if (bufferOffset_ >= bufferLength_) {
-                const int remaining = source_.available();
-                if (remaining <= 0) {
+                if (sourceOffset_ >= expectedBytes_) {
                     available = !line.isEmpty();
                     return true;
                 }
-                bufferLength_ = source_.read(
-                    buffer_, std::min(sizeof(buffer_), static_cast<size_t>(remaining)));
-                bufferOffset_ = 0;
-                if (bufferLength_ == 0) {
-                    error = String("failed to read backup source ") + path_;
-                    return false;
+                {
+                    history_storage::Guard filesystem("backup_read", 1000);
+                    if (!filesystem) {
+                        error = "filesystem is busy while reading the backup snapshot";
+                        return false;
+                    }
+                    if (history_storage::historyGeneration() != snapshotGeneration_) {
+                        error = BACKUP_SNAPSHOT_CHANGED_ERROR;
+                        return false;
+                    }
+                    File source = LittleFS.open(path_, "r");
+                    if (!source || source.size() != expectedBytes_ ||
+                        (sourceOffset_ != 0 && !source.seek(sourceOffset_))) {
+                        if (source) source.close();
+                        error = BACKUP_SNAPSHOT_CHANGED_ERROR;
+                        return false;
+                    }
+                    bufferLength_ = source.read(
+                        buffer_, std::min(sizeof(buffer_), expectedBytes_ - sourceOffset_));
+                    source.close();
+                    if (bufferLength_ == 0 ||
+                        history_storage::historyGeneration() != snapshotGeneration_) {
+                        error = BACKUP_SNAPSHOT_CHANGED_ERROR;
+                        return false;
+                    }
+                    sourceOffset_ += bufferLength_;
                 }
+                bufferOffset_ = 0;
                 bytesSinceYield_ += bufferLength_;
                 if (bytesSinceYield_ >= BACKUP_HTTP_PROGRESS_INTERVAL_BYTES) {
                     // Backup generation runs on the HTTP task. Give the
@@ -12191,8 +12237,10 @@ public:
     }
 
 private:
-    File& source_;
     const String& path_;
+    uint32_t snapshotGeneration_{0};
+    size_t expectedBytes_{0};
+    size_t sourceOffset_{0};
     uint8_t buffer_[512]{};
     size_t bufferOffset_{0};
     size_t bufferLength_{0};
@@ -12202,6 +12250,7 @@ private:
 bool processBackupHistory(const String& path,
                           const String& kind,
                           const String& serial,
+                          uint32_t snapshotGeneration,
                           bool emit,
                           size_t& bundleBytes,
                           String& error) {
@@ -12231,21 +12280,14 @@ bool processBackupHistory(const String& path,
         return false;
     }
 
-    if (!LittleFS.exists(path)) {
-        return true;
-    }
-    File source = LittleFS.open(path, "r");
-    if (!source) {
-        error = String("failed to open backup source ") + path;
-        return false;
-    }
-
-    BufferedBackupLineReader reader(source, path);
+    BufferedBackupLineReader reader(path, snapshotGeneration);
+    bool sourceExists = false;
+    if (!reader.begin(sourceExists, error)) return false;
+    if (!sourceExists) return true;
     String entry;
     String record;
     if (!entry.reserve(512) ||
         !record.reserve(MAX_BACKUP_JSON_LINE_BYTES + 1)) {
-        source.close();
         error = "insufficient memory for a bounded backup history record";
         return false;
     }
@@ -12282,7 +12324,6 @@ bool processBackupHistory(const String& path,
     while (true) {
         bool lineAvailable = false;
         if (!reader.next(entry, lineAvailable, error)) {
-            source.close();
             return false;
         }
         if (!lineAvailable) {
@@ -12298,7 +12339,6 @@ bool processBackupHistory(const String& path,
         sourceEntryDoc.clear();
         const DeserializationError parseError = deserializeJson(sourceEntryDoc, entry);
         if (parseError == DeserializationError::NoMemory) {
-            source.close();
             error = "insufficient memory while parsing backup history";
             return false;
         }
@@ -12321,7 +12361,6 @@ bool processBackupHistory(const String& path,
                                                 normalizedCount,
                                                 normalizationError);
         if (!normalized || normalizedCount != 1 || normalizedLines.size() != 1) {
-            source.close();
             error = normalizationError.isEmpty()
                 ? String("failed to normalize a backup history entry")
                 : normalizationError;
@@ -12332,7 +12371,6 @@ bool processBackupHistory(const String& path,
             ? history_capacity::MIN_BREW_HISTORY_ENTRY_BYTES
             : history_capacity::MIN_STATS_HISTORY_ENTRY_BYTES;
         if (entry.length() + 1 < minimumEntryBytes) {
-            source.close();
             error = "normalized backup entry violates the capacity bound";
             return false;
         }
@@ -12342,30 +12380,29 @@ bool processBackupHistory(const String& path,
                                                       entry.length(),
                                                       maximumRecordEntries) &&
             !flushRecord()) {
-            source.close();
             return false;
         }
         if (!history_capacity::backupRecordEntryFits(record.length(),
                                                       recordEntryCount,
                                                       entry.length(),
                                                       maximumRecordEntries)) {
-            source.close();
             error = "backup history entry exceeds the bounded record limit";
             return false;
         }
         if ((recordEntryCount != 0 && !record.concat(',')) ||
             !record.concat(entry)) {
-            source.close();
             error = "insufficient memory for a backup history record";
             return false;
         }
         recordEntryCount++;
     }
     if (!flushRecord()) {
-        source.close();
         return false;
     }
-    source.close();
+    if (history_storage::historyGeneration() != snapshotGeneration) {
+        error = BACKUP_SNAPSHOT_CHANGED_ERROR;
+        return false;
+    }
     return true;
 }
 
@@ -12386,13 +12423,17 @@ void handleBackupExport() {
         }
     }
 
-    // Hold the shared filesystem lock for the explicit backup operation. This
-    // makes the size preflight and emitted bundle the same immutable snapshot.
-    history_storage::Guard exportFilesystem("backup_export", 5000);
-    if (!exportFilesystem) {
-        server.sendHeader("Retry-After", "1");
-        sendError(503, "filesystem is busy");
-        return;
+    uint32_t snapshotGeneration = 0;
+    size_t filesystemBytes = 0;
+    if (littleFsReady) {
+        history_storage::Guard filesystem("backup_metadata", 1000);
+        if (!filesystem) {
+            server.sendHeader("Retry-After", "1");
+            sendError(503, "filesystem is busy while starting the backup snapshot");
+            return;
+        }
+        snapshotGeneration = history_storage::historyGeneration();
+        filesystemBytes = LittleFS.totalBytes();
     }
 
     String metaLine;
@@ -12406,7 +12447,7 @@ void handleBackupExport() {
         metaDoc["historyBudgetBytes"] = brew_history::budgetBytes();
         metaDoc["statsHistoryBudgetBytes"] = stats_history::budgetBytes();
         metaDoc["writableAggregateLimitBytes"] =
-            history_storage::writableHistoryLimit(LittleFS.totalBytes());
+            history_storage::writableHistoryLimit(filesystemBytes);
         metaDoc["savedMachineCount"] = exportMachines.size();
         metaDoc["littleFsReady"] = littleFsReady;
         metaDoc["exportedAtMs"] = millis();
@@ -12464,6 +12505,7 @@ void handleBackupExport() {
         if (!processBackupHistory(brew_history::filePath(machine.serial),
                                   "history",
                                   machine.serial,
+                                  snapshotGeneration,
                                   false,
                                   bundleBytes,
                                   preflightError)) {
@@ -12472,15 +12514,24 @@ void handleBackupExport() {
         if (!processBackupHistory(stats_history::filePath(machine.serial),
                                   "stats_history",
                                   machine.serial,
+                                  snapshotGeneration,
                                   false,
                                   bundleBytes,
                                   preflightError)) {
             break;
         }
     }
+    if (preflightError.isEmpty() && littleFsReady &&
+        history_storage::historyGeneration() != snapshotGeneration) {
+        preflightError = BACKUP_SNAPSHOT_CHANGED_ERROR;
+    }
     if (!preflightError.isEmpty()) {
         lastError = preflightError;
-        sendError(preflightError.startsWith("generated backup exceeds") ? 507 : 500,
+        const bool transient = preflightError == BACKUP_SNAPSHOT_CHANGED_ERROR ||
+            preflightError.indexOf("filesystem is busy") >= 0;
+        if (transient) server.sendHeader("Retry-After", "1");
+        sendError(transient ? 503
+                            : (preflightError.startsWith("generated backup exceeds") ? 507 : 500),
                   preflightError);
         return;
     }
@@ -12519,17 +12570,24 @@ void handleBackupExport() {
         if (!processBackupHistory(brew_history::filePath(machine.serial),
                                   "history",
                                   machine.serial,
+                                  snapshotGeneration,
                                   true,
                                   emittedBytes,
                                   emitError) ||
             !processBackupHistory(stats_history::filePath(machine.serial),
                                   "stats_history",
                                   machine.serial,
+                                  snapshotGeneration,
                                   true,
                                   emittedBytes,
                                   emitError)) {
             break;
         }
+    }
+
+    if (emitError.isEmpty() && littleFsReady &&
+        history_storage::historyGeneration() != snapshotGeneration) {
+        emitError = BACKUP_SNAPSHOT_CHANGED_ERROR;
     }
 
     if (!emitError.isEmpty()) {

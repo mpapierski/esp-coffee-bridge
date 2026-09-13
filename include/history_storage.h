@@ -38,6 +38,8 @@ struct HistoryUsage {
 
 void setBulkRestoreMode(bool enabled);
 size_t writeReserveBytes(size_t filesystemBytes);
+uint32_t historyGeneration();
+void noteHistoryMutation();
 
 struct FileValidation {
     size_t bytes{0};

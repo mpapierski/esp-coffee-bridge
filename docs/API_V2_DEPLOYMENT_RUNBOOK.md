@@ -88,7 +88,11 @@ API v2 backup export is a read-only parser-verified snapshot capped at 7,500
 KiB. It groups normalized history entries into bounded array records; the cap
 is checked against the smallest valid entries, maximum escaped record
 envelopes, all 32 history files, and bounded non-history records at the full
-6,000 KiB writable-history limit on the 8 MiB partition. Restore is an explicit
+6,000 KiB writable-history limit on the 8 MiB partition. Export releases the
+shared LittleFS mutex between 512-byte reads and verifies a history generation
+token during preflight and emission. Retry a `503` caused by a concurrent
+history change; an already-started response is aborted rather than returning a
+mixed snapshot. Restore is an explicit
 state-replacement operation: it cancels boot-scoped jobs and removes their
 result files plus derived live/recipe caches, stages the upload into independent
 bounded files, and validates the complete bundle. Its peak-space preflight
