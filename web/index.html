@@ -1268,6 +1268,7 @@
       const error = new Error(message);
       error.status = response.status;
       error.data = data;
+      error.retryAfter = response.headers.get("Retry-After");
       throw error;
     }
     return { data, response };
@@ -1343,7 +1344,23 @@
     // Synchronous non-BLE routes such as a validated backup restore may use
     // most of the helper's logical deadline. Job status/result polls remain
     // individually capped at ten seconds above.
-    const result = await fetchJson(path, options, deadlineAt - Date.now());
+    let result;
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        result = await fetchJson(path, options, deadlineAt - Date.now());
+        break;
+      } catch (error) {
+        const method = String(options.method || (options.json !== undefined ? "POST" : "GET")).toUpperCase();
+        const retrySeconds = Number.parseInt(error.retryAfter || "", 10);
+        if (attempt !== 0 || method !== "GET" || error.status !== 503 ||
+            !Number.isFinite(retrySeconds) || retrySeconds < 0) {
+          throw error;
+        }
+        const waitMs = Math.min(retrySeconds * 1000, deadlineAt - Date.now());
+        if (waitMs <= 0) throw error;
+        await new Promise((resolve) => setTimeout(resolve, waitMs));
+      }
+    }
     if ((result.response.status === 202 || result.data?.pending === true) && !result.data?.brew) {
       return resolveBridgeJob(result.data, result.response.headers.get("Location"), deadlineAt);
     }

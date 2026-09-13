@@ -62,6 +62,10 @@ The four resources use the following response rules:
 - Fresh cache: `200 OK` with the existing domain payload plus a `cache` object.
 - Stale cache: `200 OK` with the last good data, `cache.state = "stale"`, the most recent refresh error when applicable, and job metadata when a refresh is queued.
 - Cold cache or `?refresh=1`: `202 Accepted` with `Location: /api/jobs/{id}` and `Retry-After: 1`.
+- Cache-backed reads wait up to one second for LittleFS, load their bounded
+  payload once, and release the filesystem mutex before writing the HTTP
+  response. Clients should retry a `503` carrying `Retry-After`; the bundled
+  web UI retries one safe `GET` automatically.
 - Refresh failure: retain the last good cache and publish the structured error in both the failed job and subsequent stale responses.
 
 Standard-recipe and `MyCoffee` snapshots keep their persistent LittleFS caches. A cache hit remains synchronous; a cold or explicitly forced BLE read is a job. Full `MyCoffee` lists are assembled one bounded slot at a time directly into temporary LittleFS files, then streamed to HTTP in 1 KiB chunks; the firmware never allocates a list-sized JSON document.
@@ -400,7 +404,10 @@ Machine list objects distinguish protocol readiness from scan presence:
     - current APK-backed semantic coverage is limited to byte `0`, mask `0x01` = `ImageTransfer`
     - all remaining non-zero bits are surfaced as raw unknowns so the web UI can expose them without overclaiming meaning
     - live observation on March 13, 2026: a `NICR 756` (`EF_1.00R4__386`) stayed silent on `HI` even though `HU` and `HX` succeeded
-    - the bridge therefore returns and caches `supported: false` for model `756` without opening BLE; this prevents every features refresh from waiting for a known timeout
+    - the bridge therefore returns `supported: false` for model `756` directly
+      from model metadata, without opening BLE or LittleFS; this prevents both
+      the known HI timeout and unrelated filesystem contention from blocking
+      capability discovery
   - `GET /api/machines/{serial}/settings`
     - each `values.<key>` item includes an `options` array of `{ "code", "label" }` pairs from the active family descriptor table
   - `POST /api/machines/{serial}/settings`

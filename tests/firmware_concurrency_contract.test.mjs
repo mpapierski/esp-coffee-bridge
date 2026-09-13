@@ -15,3 +15,36 @@ test("BLE worker wakeups do not share NimBLE's task notification slot", () => {
   );
   assert.doesNotMatch(worker, /ulTaskNotifyTake\(/);
 });
+
+test("cached resources use one bounded filesystem read", () => {
+  const handlerStart = source.lastIndexOf("void handleMachineResourceRequest(");
+  const loader = source.slice(
+    source.indexOf("bool loadCachedResourcePayload("),
+    source.indexOf("bool sendCachedResourcePayload("),
+  );
+  const sender = source.slice(
+    source.indexOf("bool sendCachedResourcePayload("),
+    source.indexOf("void handleMachineResourceRequest("),
+  );
+  const handler = source.slice(
+    handlerStart,
+    source.indexOf("void handleMachineRefreshRequest(", handlerStart),
+  );
+
+  assert.match(loader, /history_storage::Guard filesystem\(1000\)/);
+  assert.doesNotMatch(sender, /LittleFS|history_storage::Guard/);
+  assert.equal((handler.match(/loadCachedResourcePayload\(/g) || []).length, 1);
+  assert.doesNotMatch(handler, /history_storage::Guard/);
+});
+
+test("known unavailable features bypass the filesystem cache", () => {
+  const handlerStart = source.lastIndexOf("void handleMachineResourceRequest(");
+  const handler = source.slice(
+    handlerStart,
+    source.indexOf("void handleMachineRefreshRequest(", handlerStart),
+  );
+  assert.match(
+    handler,
+    /if \(resource == "features" && sendKnownUnavailableMachineFeatures\(\*machine\)\) return;/,
+  );
+});

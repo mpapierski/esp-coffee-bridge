@@ -11338,14 +11338,8 @@ void handleMachineStats(const String& serial) {
     sendJson(response);
 }
 
-void handleMachineFeaturesGet(const String& serial) {
-    SavedMachine* machine = findSavedMachineBySerial(serial);
-    if (machine == nullptr) {
-        sendError(404, "saved machine not found");
-        return;
-    }
-
-    const nivona::ModelInfo modelInfo = nivona::detectModelInfo(toNivonaDetails(*machine));
+bool sendKnownUnavailableMachineFeatures(const SavedMachine& machine) {
+    const nivona::ModelInfo modelInfo = nivona::detectModelInfo(toNivonaDetails(machine));
     if (nivona::isHiFeatureReadKnownUnavailable(modelInfo)) {
         DynamicJsonDocument response(2048);
         response["ok"] = true;
@@ -11353,15 +11347,27 @@ void handleMachineFeaturesGet(const String& serial) {
         response["reasonCode"] = "hi_unavailable_for_model";
         response["reason"] = "This machine model is known not to answer the HI capability request; the bridge skips the live probe.";
         JsonObject machineJson = response.createNestedObject("machine");
-        appendSavedMachineJson(machineJson, *machine);
+        appendSavedMachineJson(machineJson, machine);
         JsonObject featureJson = response.createNestedObject("features");
         featureJson["ok"] = true;
         featureJson["available"] = false;
         featureJson["command"] = nivona::CMD_HI;
         featureJson["source"] = "live-validation";
         sendJson(response);
+        return true;
+    }
+    return false;
+}
+
+void handleMachineFeaturesGet(const String& serial) {
+    SavedMachine* machine = findSavedMachineBySerial(serial);
+    if (machine == nullptr) {
+        sendError(404, "saved machine not found");
         return;
     }
+    if (sendKnownUnavailableMachineFeatures(*machine)) return;
+
+    const nivona::ModelInfo modelInfo = nivona::detectModelInfo(toNivonaDetails(*machine));
 
     String error;
     if (!beginMachineProtocolSession(*machine, error)) {
@@ -14500,41 +14506,44 @@ void enqueueMachineOperation(const String& serial,
     sendAcceptedJob(job);
 }
 
-bool streamCachedResource(const ResourceCacheEntry& cache,
-                          bool stale,
-                          const bridge_jobs::Job* refreshJob = nullptr,
-                          bool* busyOut = nullptr) {
+bool loadCachedResourcePayload(const ResourceCacheEntry& cache,
+                               String& payloadOut,
+                               bool* busyOut = nullptr) {
     if (busyOut != nullptr) {
         *busyOut = false;
     }
-    String payload;
-    {
-        history_storage::Guard filesystem(100);
-        if (!filesystem) {
-            if (busyOut != nullptr) {
-                *busyOut = true;
-            }
-            return false;
+    payloadOut = "";
+    history_storage::Guard filesystem(1000);
+    if (!filesystem) {
+        if (busyOut != nullptr) {
+            *busyOut = true;
         }
-        File file = LittleFS.open(cache.path, "r");
-        if (!file || file.size() <= 2 || file.size() > MAX_RESOURCE_CACHE_BYTES) {
-            if (file) {
-                file.close();
-            }
-            return false;
-        }
-        payload.reserve(file.size() + 2048);
-        uint8_t buffer[512];
-        while (file.available()) {
-            const size_t read = file.read(buffer, sizeof(buffer));
-            if (read == 0 || !payload.concat(reinterpret_cast<const char*>(buffer), read)) {
-                file.close();
-                return false;
-            }
-        }
-        file.close();
+        return false;
     }
+    File file = LittleFS.open(cache.path, "r");
+    if (!file || file.size() <= 2 || file.size() > MAX_RESOURCE_CACHE_BYTES) {
+        if (file) {
+            file.close();
+        }
+        return false;
+    }
+    payloadOut.reserve(file.size() + 2048);
+    uint8_t buffer[512];
+    while (file.available()) {
+        const size_t read = file.read(buffer, sizeof(buffer));
+        if (read == 0 || !payloadOut.concat(reinterpret_cast<const char*>(buffer), read)) {
+            file.close();
+            return false;
+        }
+    }
+    file.close();
+    return true;
+}
 
+bool sendCachedResourcePayload(const ResourceCacheEntry& cache,
+                               String payload,
+                               bool stale,
+                               const bridge_jobs::Job* refreshJob = nullptr) {
     bridge_json::ObjectExtent resourceObject;
     if (!bridge_json::inspectObject(payload.c_str(), payload.length(), resourceObject) ||
         !resourceObject.hasMembers) {
@@ -14575,6 +14584,7 @@ void handleMachineResourceRequest(const String& serial, const String& resource) 
         sendError(404, "saved machine not found");
         return;
     }
+    if (resource == "features" && sendKnownUnavailableMachineFeatures(*machine)) return;
     const String canonicalSerial = machine->serial;
     const bool forced = parseRefreshArg();
     const bool establishesMachineSession =
@@ -14584,18 +14594,15 @@ void handleMachineResourceRequest(const String& serial, const String& resource) 
     if (hasMetadata) {
         reconcileTerminalResourceJob(canonicalSerial, resource, cache);
     }
+    String cachedPayload;
     bool hasPayload = false;
     if (hasMetadata && cache.sampledAtMs != 0 && littleFsReady) {
-        history_storage::Guard filesystem(100);
-        if (!filesystem) {
+        bool filesystemBusy = false;
+        hasPayload = loadCachedResourcePayload(cache, cachedPayload, &filesystemBusy);
+        if (filesystemBusy) {
             server.sendHeader("Retry-After", "1");
             sendError(503, "filesystem is busy");
             return;
-        }
-        File cached = LittleFS.open(cache.path, "r");
-        hasPayload = cached && cached.size() > 2;
-        if (cached) {
-            cached.close();
         }
     }
     const uint32_t nowMs = millis();
@@ -14607,11 +14614,8 @@ void handleMachineResourceRequest(const String& serial, const String& resource) 
             "Retry-After",
             String((sessionRetryRemainingMs + 999U) / 1000U));
         if (hasPayload) {
-            bool filesystemBusy = false;
-            if (!streamCachedResource(cache, true, nullptr, &filesystemBusy)) {
-                sendError(filesystemBusy ? 503 : 500,
-                          filesystemBusy ? String("filesystem is busy")
-                                         : String("cached resource is invalid"));
+            if (!sendCachedResourcePayload(cache, cachedPayload, true)) {
+                sendError(500, "cached resource is invalid");
             }
         } else {
             sendError(503,
@@ -14637,13 +14641,8 @@ void handleMachineResourceRequest(const String& serial, const String& resource) 
     }
 
     if (cacheDecision.servePayload && !cacheDecision.stale) {
-        bool filesystemBusy = false;
-        if (!streamCachedResource(cache, false, nullptr, &filesystemBusy)) {
-            if (filesystemBusy) {
-                server.sendHeader("Retry-After", "1");
-            }
-            sendError(filesystemBusy ? 503 : 500,
-                      filesystemBusy ? String("filesystem is busy") : String("cached resource is invalid"));
+        if (!sendCachedResourcePayload(cache, cachedPayload, false)) {
+            sendError(500, "cached resource is invalid");
         }
         return;
     }
@@ -14698,16 +14697,11 @@ void handleMachineResourceRequest(const String& serial, const String& resource) 
     }
 
     if (cacheDecision.servePayload) {
-        bool filesystemBusy = false;
-        if (!streamCachedResource(cache,
-                                  true,
-                                  enqueued ? &refreshJob : nullptr,
-                                  &filesystemBusy)) {
-            if (filesystemBusy) {
-                server.sendHeader("Retry-After", "1");
-            }
-            sendError(filesystemBusy ? 503 : 500,
-                      filesystemBusy ? String("filesystem is busy") : String("cached resource is invalid"));
+        if (!sendCachedResourcePayload(cache,
+                                       cachedPayload,
+                                       true,
+                                       enqueued ? &refreshJob : nullptr)) {
+            sendError(500, "cached resource is invalid");
         }
         return;
     }

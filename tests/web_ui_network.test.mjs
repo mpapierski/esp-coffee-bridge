@@ -24,3 +24,13 @@ test("header badge never claims AP-only mode from station disconnection alone", 
   assert.match(scope.wifiStatusBadge({ wifiConfigured: true }), /Wi-Fi reconnecting/);
   assert.doesNotMatch(helpers, /AP only/);
 });
+
+test("safe API reads retry once when Retry-After accompanies a 503", () => {
+  const apiHelper = html.slice(
+    html.indexOf("  async function api("),
+    html.indexOf("  function followStaleResourceJob("),
+  );
+  assert.match(apiHelper, /for \(let attempt = 0; attempt < 2; attempt \+= 1\)/);
+  assert.match(apiHelper, /method !== "GET" \|\| error\.status !== 503/);
+  assert.match(apiHelper, /error\.retryAfter/);
+});
