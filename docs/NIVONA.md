@@ -1,10 +1,23 @@
 # Nivona BLE Protocol Notes
 
-This document summarizes the Nivona Android app protocol recovered from `de.nivona.mobileapp` 3.8.6.
+This document summarizes the Nivona Android protocol recovered from two official
+Android app generations:
+
+- `de.nivona.mobileapp` version `3.8.6`
+- `de.nivona.mobile.app.android` (NIVONA Connect) version `1.2.0`
 
 Reverse-engineering artifacts from the APK now live under [`../.analysis/research/`](../.analysis/research/).
 
-The real APK used here was [`../.analysis/research/downloads/de.nivona.mobileapp-3.8.6.apk`](../.analysis/research/downloads/de.nivona.mobileapp-3.8.6.apk), package `de.nivona.mobileapp`, version `3.8.6`.
+The application packages used here were:
+
+- [`../.analysis/research/downloads/de.nivona.mobileapp-3.8.6.apk`](../.analysis/research/downloads/de.nivona.mobileapp-3.8.6.apk)
+  - package `de.nivona.mobileapp`
+  - version `3.8.6`
+- [`../.analysis/research/downloads/de.nivona.mobile.app.android-1.2.0.xapk`](../.analysis/research/downloads/de.nivona.mobile.app.android-1.2.0.xapk)
+  - package `de.nivona.mobile.app.android`
+  - version `1.2.0`, version code `28`
+  - XAPK SHA-256 `61007ea68009d85cd651f31d10371fa26b24f4a86a1fff1ba5b3c36282feef7b`
+  - APKPure release date `2026-05-01`
 
 The ESP32 bridge HTTP API, firmware, and webapp reference lives in [API.md](API.md).
 
@@ -20,13 +33,113 @@ The ESP32 bridge HTTP API, firmware, and webapp reference lives in [API.md](API.
   - Statistics register IDs for the families covered below
   - Brew payload layout
   - Customer-key bootstrap constants
+  - NIVONA Connect `1.2.0` model-prefix catalog and per-model feature tables
+  - NIVONA Connect `1.2.0` outbound `HE` and `HN` payload construction
 - Medium confidence:
   - `HE` and `HS` semantics outside the traced call sites
+  - intended on-wire role of the new `HF` and `HQ` frame definitions
   - Exact meaning of the anonymous `FrameDefinition` flags `a` / `b`
   - Per-model recipe selector mapping outside the families listed below
 - Low confidence:
   - `HS`, `HA`, and `HI` beyond the limited call sites and flags documented here
   - Exhaustive writable/register coverage across all model families
+
+## NIVONA Connect 1.2.0 Findings
+
+### APK identity and implementation
+
+The [APKPure listing](https://apkpure.com/nivona-connect/de.nivona.mobile.app.android)
+describes `1.2.0` as adding the NIVO 8141 PRO, improving NIVO 9000 and NICR 756
+support, and integrating older models into NIVONA Connect. The locally
+downloaded XAPK matches APKPure's published SHA-256 exactly.
+
+Unlike the older Xamarin app, NIVONA Connect is a .NET MAUI application. Its
+Android bytecode is mostly runtime glue; the useful logic was recovered from the
+managed `App.dll`, `Model.dll`, `Comm.dll`, `Eugster.EFLibrary.Core.dll`, and
+`Arendi.BleLibrary.dll` assemblies stored in the ARM64 split's
+`libassembly-store.so` payload.
+
+The new app retains the same protocol lineage:
+
+- `customerId = 65535`
+- the same 48-byte private customer seed as app `3.8.6`
+- the same Arendi BLE and Eugster coffee-machine libraries
+- the same `A` / `N` acknowledgements and core `H*` frame family
+
+### Exact model catalog
+
+NIVONA Connect `1.2.0` selects a specification by applying case-sensitive
+`StartsWith(...)` checks to the BLE device name. These are the complete physical
+device-name prefixes present in `MachineSpecLookup`:
+
+| Device-name prefix(es) | Internal platform | App features beyond the base register/recipe model | MyCoffee slots |
+| --- | --- | --- | --- |
+| `756`, `758`, `759`, `768`, `769`, `778`, `779` | `EF573` | none | `1` |
+| `788`, `789` | `EF573` | none | `5` |
+| `790`, `791`, `792`, `793`, `794`, `795`, `796`, `797`, `799` | `EF253` | none | `5` |
+| `960`, `965`, `970` | `EF698` | Flying Picture, `854 x 480`, rotate-and-flip before upload, no app toggle register | `9` |
+| `7101` | `EF1190` | recipe ordering, return-home before writes, chilled recipes | `17` |
+| `8101`, `8103` | `EF1040` | none | `9` |
+| `8107`, `8111`, `8112`, `8113`, `8115` | `EF1040` | chilled recipes | `9` |
+| `8141` | `EF1187` | chilled recipes | `9` |
+| `9101`, `9103` | `EF1109` | Flying Picture (`800 x 480`, toggle register, no rotation), recipe ordering, return-home before writes, chilled recipes, five auto-on schedules | `17` |
+
+`8111`, `8112`, `8113`, and `8115` clone the complete `8107`
+specification. `9101` similarly clones `9103`. The internal `EF...` identifiers
+are controller-platform names; in particular, `EF573` is not evidence for an
+NICR 573 or generic 5xx product family.
+
+Newly represented articles relative to app `3.8.6` are `7101`, `8111`, `8112`,
+`8113`, `8115`, `8141`, `9101`, and `9103`. Conversely, `660`, `670`, `675`,
+`680`, `920`, `930`, `1030`, and `1040`, which existed in the older app's
+decoder, do not have specifications in NIVONA Connect `1.2.0`.
+
+There is no `570`, `560`, or other `5xx` matcher, and no catch-all machine
+specification. When a connected machine's name does not match the table, the
+connector clears the selected machine and disconnects it. Therefore NIVONA
+Connect `1.2.0` provides no evidence of official NICR 570/560/5xx application
+support. This does not by itself prove that such machines use an incompatible
+wire protocol.
+
+### Feature model
+
+The new app no longer infers most UI features from a coarse family enum. A
+`MachineSpecification` contains per-article lists for device information,
+settings, statistics, care counters, recipes, remote-recipe scratch registers,
+MyCoffee slots, auto-on schedules, process/status maps, and converters.
+
+Four non-register feature flags are assigned to production specifications:
+
+- Flying Picture
+- recipe ordering
+- writing requires a `JOB_RETURN_HOME` action first
+- chilled recipes
+
+A fifth flag, process-percent display, is defined in the model assembly but is
+not assigned to any physical specification in `1.2.0`. Most other features are
+enabled simply by the presence of a typed setting register, including Easy
+Clean Plus, extreme mode, big-picture display mode, QuickSelect, tank-light
+color/brightness/mode, milk-drink enable, milk double-cup, filter state, and the
+maximum brew count before brewing-unit washing.
+
+Flying Picture is also gated by this static per-model feature list. Unlike app
+`3.8.6`, no `1.2.0` call site probes `HI` before exposing image upload.
+
+### Command delta
+
+The direct NIVONA Connect communication layer transmits `HV`, `HL`, `HR`,
+`HA`, `HX`, `HW`, `HB`, `HN`, `HE`, and `HZ`; the inherited Eugster library
+also retains `Hp` and `HU`. This is the same fundamental protocol as app
+`3.8.6`, not a replacement command set.
+
+The only new two-character labels are `HF` and `HQ`. They are registered as
+fixed-size response frames and selected logically for Article ID and PCB
+serial, but the final branch sends `HA` on the wire. Therefore no new outbound
+wire mnemonic is confirmed by this APK. `HS` and `HI` are still parser
+definitions without a direct `1.2.0` send site. Conversely, the older app's
+explicit `HD` reset and `HY` prompt-confirmation call sites are absent from the
+new app; that absence does not invalidate their previously recovered wire
+semantics.
 
 ## Packet Glossary
 
@@ -47,6 +160,8 @@ Confidence score is a working shorthand, not a statistical measure:
 | `HU` | Session setup | Request: `seed4 || verifier2`. Response: `echoed_seed4 || session_key2 || verifier2`. | Fully reversed and live-validated, `0.98` |
 | `HV` | Read software version | Request: empty in the normal app read flow. Response: `11`-byte software-version payload. | APK-traced and live-validated, `0.95` |
 | `HL` | Read serial number | Request: empty in the normal app read flow. Response: `20`-byte serial payload. | APK-traced and live-validated, `0.95` |
+| `HF` | Logical Article ID read in NIVONA Connect | The `1.2.0` parser registers a `17`-byte response and the model maps device-info register `2` to `HF`; however, its current read implementation actually transmits `HA 00 02`. | Parser/model definition only; no direct `HF` transmit site found, `0.45` |
+| `HQ` | Logical PCB serial read in NIVONA Connect | The `1.2.0` parser registers a `16`-byte response and the model maps device-info register `4` to `HQ`; however, its current read implementation actually transmits `HA 00 04`. | Parser/model definition only; no direct `HQ` transmit site found, `0.45` |
 | `HN` | Write image-transfer block for "Flying Picture" | Request: `53` bytes total: big-endian block index plus `51` bytes of image data; final transfer packet uses `FE FE` plus zero padding. Response: `A` or `N`. | APK-traced image-transfer path, `0.85` |
 | `HR` | Read numeric value | Request: big-endian `UInt16` register id. Response: echoed register id plus big-endian signed `Int32` value. | APK-traced and live-validated, `0.95` |
 | `HA` | Read string value | Request: big-endian `UInt16` register id. Response: echoed register id plus `64`-byte string field. Encoding is family-dependent. | Payload shape is clear; semantics remain limited by family and call site, `0.65` |
@@ -64,13 +179,26 @@ Confidence score is a working shorthand, not a statistical measure:
 
 ## App Architecture
 
-The Android Java/Kotlin output is only a Xamarin bridge. The real logic lives in managed assemblies:
+In app `3.8.6`, the Android Java/Kotlin output is only a Xamarin bridge. The real
+logic lives in managed assemblies:
 
 - `Arendi.BleLibrary.dll`
 - `Arendi.DotNETLibrary.dll`
 - `Eugster.EFLibrary.dll`
 - `EugsterMobileApp.Droid.dll`
 - `EugsterMobileApp.dll`
+
+NIVONA Connect `1.2.0` moved to .NET MAUI but kept the same general division.
+Its relevant managed assemblies are:
+
+- `App.dll`
+- `Model.dll`
+- `Comm.dll`
+- `Eugster.EFLibrary.Core.dll`
+- `Arendi.BleLibrary.dll`
+
+They are packaged in the ARM64 split as an Android assembly store with the
+`XABA` payload signature, rather than as loose DLL files.
 
 ## Transport
 
@@ -960,7 +1088,7 @@ Built-in library frame definitions:
 - `HV`, payload `11`
 - `Hp`, payload `24`
 
-Android connector adds:
+The app `3.8.6` Android connector adds:
 
 - `HS`, payload `10`
 - `HR`, payload `6`
@@ -968,6 +1096,17 @@ Android connector adds:
 - `HX`, payload `8`
 - `HL`, payload `20`
 - `HI`, payload `10`
+
+NIVONA Connect `1.2.0` registers the same definitions and also adds:
+
+- `HF`, payload `17`
+- `HQ`, payload `16`
+
+The `HF` / `HQ` definitions should not yet be treated as confirmed request
+commands. The model layer selects those labels for Article ID and PCB serial,
+but `BleCoffeeMachine.ReadRegister(...)` handles both branches by sending an
+`HA` request with the corresponding two-byte device-info ID. No other direct
+`HF` or `HQ` transmit site was found.
 
 Constructor semantics recovered by reflection:
 
@@ -1117,6 +1256,14 @@ Cross-checking direct `ldstr` call sites in `EugsterMobileApp.dll` / `EugsterMob
 - `HI`
   - feature/capability read used by `IsFeatureSupported`
   - current app only checks `response[0] & 0x01` for `ImageTransfer`
+- `HF`
+  - NIVONA Connect `1.2.0` logical Article ID read and `17`-byte parser frame
+  - not a confirmed outbound command: the current implementation sends
+    `HA 00 02` in this branch
+- `HQ`
+  - NIVONA Connect `1.2.0` logical PCB serial read and `16`-byte parser frame
+  - not a confirmed outbound command: the current implementation sends
+    `HA 00 04` in this branch
 
 ## Payload Layouts
 
@@ -1188,6 +1335,24 @@ Encodings:
     - drop every non-letter/non-digit before sending
     - encode each remaining character as a single byte when `<= 0xFF`
     - characters above `0xFF` fall back to `?`
+
+### NIVONA Connect device-information reads
+
+NIVONA Connect `1.2.0` defines this typed device-information register set:
+
+| ID | Meaning | Logical read command | Actual `BleCoffeeMachine.ReadRegister(...)` path |
+| --- | --- | --- | --- |
+| `1` | firmware version | `HV` | dedicated `HV` software-version task |
+| `2` | Article ID | `HF` | sends `HA 00 02`, then applies UTF-8 decoding to the returned payload |
+| `3` | EF serial number | `HL` | dedicated `HL` serial-number task |
+| `4` | PCB serial | `HQ` | sends `HA 00 04`, then applies UTF-8 decoding to the returned payload |
+| `5` | production date | `HR` | defined as a numeric device-info register, but omitted from every model's standard device-info list |
+
+String length metadata is `11` for firmware, `16` for Article ID, `21` for EF
+serial, and `16` for PCB serial. The discrepancy between the logical `HF` / `HQ`
+mapping and the actual `HA` request path may be deliberate compatibility logic
+or an app defect; hardware captures are required before assigning standalone
+wire semantics to `HF` and `HQ`.
 
 ### `HX` read process status
 
@@ -1330,7 +1495,7 @@ Request payload:
   - up to `51` bytes of raw image data for that block
   - short final block is zero-padded by the app
 
-Transfer behavior recovered from the APK:
+Transfer behavior recovered from app `3.8.6`:
 
 - number of data packets:
   - `ceil(image_len / 51)`
@@ -1342,6 +1507,32 @@ Transfer behavior recovered from the APK:
   - bytes `2..52` = `00`
   - default timeout (`null`)
 - write success/failure is handled through the normal `A` / `N` write path
+
+NIVONA Connect `1.2.0` keeps the same 53-byte block and `FE FE` terminator
+format, but substantially changes the transfer policy:
+
+- accepted encoded-image size is `2533..65536` bytes inclusive
+- it polls device readiness every `50 ms` for at most `1 s` before starting
+- each data block uses a `7500 ms` write timeout
+- successful blocks are paced by `10 ms`, except block `40`, after which the
+  app waits `3 s`
+- a timeout is retried up to three attempts for the current block
+- an `N` response also retries the block, without incrementing the timeout
+  attempt counter
+- the terminator uses the normal `2500 ms` timeout
+- deleting an image does not send a special reset command: the app generates
+  and uploads a blank image at the model's required resolution
+- after a successful upload, the UI unconditionally looks up and starts
+  `JOB_RETURN_HOME`, then disables the Flying Picture setting when a toggle
+  register exists; `EF1109` maps that job to `98`, but the `EF698` process map
+  contains no `JOB_RETURN_HOME` entry, so the post-upload behavior on
+  `960`/`965`/`970` needs hardware validation
+
+The feature table permits image upload only for `960`/`965`/`970` and
+`9101`/`9103`. The older `EF698` display uses `854 x 480` and requires the app
+to rotate and flip the encoded image. The `EF1109` display uses `800 x 480`,
+requires no rotation, and has setting register `124` as an explicit enable
+toggle.
 
 Serializer-reproduced request examples:
 
@@ -1355,7 +1546,7 @@ HN terminator with session 12 34:
   packet  = 53 48 4E 0D FC FF B3 07 EF 54 42 CA 94 7B C0 3A 89 94 BA 80 BA 96 BD F9 98 E5 28 E2 AD 15 6B A5 A6 AE D8 5B 77 5A 70 98 38 95 02 CD 91 63 8A 93 DA 1F 3B 57 9B 8D 89 5D D9 72 45 45
 ```
 
-Reset behavior:
+App `3.8.6` reset behavior:
 
 - there is no separate reset command for image transfer
 - `ResetImage()` simply calls `WriteImage(new byte[1], ...)`
@@ -1383,6 +1574,22 @@ Observed payload layout for the standard `MakeCoffee` path:
 - `payload[5] = 0x01`
 - all other bytes zero
 - the optional `noOfCups` argument is ignored by the APK path
+
+NIVONA Connect `1.2.0` exposes two exact 18-byte constructors:
+
+- remote-recipe start:
+  - `[00, process_id_low, 00, 00, 00, 01, 00 x 12]`
+  - the app first writes the model's remote-recipe registers, then uses the
+    machine-specific numeric value mapped to `JOB_PRODUCT` as `process_id`
+- direct process/type start:
+  - `[00, process_id_low, 00, type_low, 00 x 14]`
+  - used for maintenance/state actions and for the EF1040 chilled-recipe
+    compatibility path
+
+For specifications carrying `WritingNeedsReturnHome`, the app first sends the
+direct form with the model's `JOB_RETURN_HOME` process ID and `type = 0` before
+recipe starts and setting writes. In `1.2.0`, that flag is present on `7101`,
+`9101`, and `9103`.
 
 Important managed-app behavior:
 
@@ -1530,9 +1737,55 @@ Recovered from `RecipeFactory`.
 - `6` milk
 - `7` hot water
 
-### Chilled add-ons
+### App 3.8.6 chilled add-ons
 
 - only on chilled `NIVO8000` (`NICR8107`)
+- `8` chilled espresso
+- `9` chilled lungo
+- `10` chilled americano
+
+### NIVONA Connect `EF1190` / `EF1109`
+
+Used by NIVO `7101`, `9101`, and `9103`:
+
+- `0` lungo
+- `1` espresso
+- `2` americano
+- `3` caffe latte
+- `4` cappuccino
+- `5` espresso macchiato
+- `6` flat white
+- `7` latte macchiato
+- `8` milk
+- `9` water
+- `10` chilled lungo
+- `11` chilled espresso
+- `12` chilled americano
+
+### NIVONA Connect `EF1187`
+
+Used by NIVO `8141`:
+
+- `0` espresso
+- `1` lungo
+- `2` americano
+- `3` cappuccino
+- `4` caffe latte
+- `5` latte macchiato
+- `6` milk
+- `7` water
+- `8` chilled espresso
+- `9` chilled lungo
+- `10` chilled americano
+- `11` espresso macchiato
+- `12` coffee pot
+- `13` americano pot
+
+### NIVONA Connect `EF1040` chilled variants
+
+The base `8101` / `8103` table remains selectors `0..7` from Family 8000.
+`8107` and its `8111` / `8112` / `8113` / `8115` clones append:
+
 - `8` chilled espresso
 - `9` chilled lungo
 - `10` chilled americano
@@ -1885,6 +2138,69 @@ These values are recovered from the Android app setting factories. The bridge de
 - `105` coffee temperature
   - `00 00` off
   - `00 01` on
+
+### NIVONA Connect NIVO 9000 (`EF1109`)
+
+The app exposes these numeric setting registers on `9101` / `9103`:
+
+- `100` language
+- `101` Easy Clean Plus delay
+- `102` auto-off delay in minutes
+- `119` water hardness
+- `120` extreme mode
+- `121` big-picture display mode
+- `122` QuickSelect
+- `124` Flying Picture enable
+- `125` maximum number of drinks before brewing-unit washing
+- `126` accent/tank-light color
+- `127` accent/tank-light brightness
+- `128` accent/tank-light mode
+- `129` filter inserted
+
+Five independent auto-on schedules occupy registers `103..117`. Each schedule
+uses three consecutive numeric registers in `(minutes, weekdays, enabled)`
+order:
+
+- `(103, 104, 105)`
+- `(106, 107, 108)`
+- `(109, 110, 111)`
+- `(112, 113, 114)`
+- `(115, 116, 117)`
+
+The weekday register is a bitmask: Monday through Sunday are respectively
+`0x01`, `0x02`, `0x04`, `0x08`, `0x10`, `0x20`, and `0x40`. The enabled value
+uses `0` / `1`; minutes are stored as a numeric minute-of-day value. The model
+also declares IDs `118` (`TimeInStandby`) and `123` (`SmallPicturePreview`) in
+an internal lookup, but neither is included in the production `9101` / `9103`
+user-setting list.
+
+### NIVONA Connect NIVO 8141 (`EF1187`)
+
+- `100` language
+- `101` water hardness
+- `104` auto-off delay
+- `105` milk-drink enable
+- `106` big-picture display mode
+- `107` maximum number of drinks before brewing-unit washing
+- `108` filter inserted
+
+`BigPictureMode` is a display-layout setting and is separate from the Flying
+Picture upload feature; the `8141` specification does not enable `HN` image
+upload.
+
+### NIVONA Connect NIVO 7101 (`EF1190`)
+
+- `100` language
+- `102` auto-off delay
+- `119` water hardness
+- `120` extreme mode
+- `122` QuickSelect
+- `125` maximum number of drinks before brewing-unit washing
+- `128` milk double-cup enable
+- `129` filter inserted
+
+The `7101` has chilled recipes and 17 MyCoffee slots, but no Flying Picture or
+auto-on schedule list in app `1.2.0`.
 
 ### Family 600 / 700 / 79x
 
@@ -2417,6 +2733,11 @@ So current live evidence says:
   - still complete the per-item `HD` reset target tables for recipe-item defaults by family
 - Extend live validation to additional command families
   - especially `HA`, `HS`, and any additional `HI` feature bits beyond `ImageTransfer`
+  - capture Article ID and PCB-serial reads from NIVONA Connect to determine
+    whether `HF` / `HQ` ever appear on the wire or whether `HA 00 02` /
+    `HA 00 04` are the intended final protocol
+  - validate the `1.2.0` `HE` return-home/direct-process variants and tuned
+    `HN` upload timing on `EF1109`, `EF1187`, or `EF1190` hardware
 - Map the `Hp` 24-byte response body from live captures
   - APK `3.8.6` confirms the exact frame shape and that the official code does not parse the payload
   - remaining work is to correlate byte changes with machine state across controlled before/after experiments
