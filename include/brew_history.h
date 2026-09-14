@@ -51,6 +51,7 @@ using PageEntryVisitor = bool (*)(JsonObjectConst entry,
                                   size_t entryId,
                                   void* context,
                                   String& error);
+using ProgressCallback = void (*)(void* context);
 
 size_t clampBudgetBytes(size_t requestedBytes, size_t upperBytes);
 void configureBudget(size_t requestedBytes,
@@ -100,6 +101,13 @@ bool loadPage(const String& serial,
               String& error);
 bool clear(const String& serial, String& error);
 bool clearAll(String& error);
+bool findNewestByStringField(const String& serial,
+                             const char* field,
+                             const String& value,
+                             JsonObject entryOut,
+                             String& error,
+                             ProgressCallback progress = nullptr,
+                             void* progressContext = nullptr);
 void buildAcceptedEntry(JsonVariantConst request,
                         JsonObjectConst recipe,
                         const nivona::ProcessStatus& processStatus,

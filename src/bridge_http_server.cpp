@@ -93,7 +93,23 @@ void BridgeHttpServer::on(const char* uri,
                           HTTPMethod method,
                           Handler handler,
                           Handler uploadHandler) {
-    routes_.push_back({String(uri), method, std::move(handler), std::move(uploadHandler)});
+    on(uri,
+       method,
+       std::move(handler),
+       std::move(uploadHandler),
+       DEFAULT_MAX_MULTIPART_REQUEST_BYTES);
+}
+
+void BridgeHttpServer::on(const char* uri,
+                          HTTPMethod method,
+                          Handler handler,
+                          Handler uploadHandler,
+                          size_t maximumMultipartRequestBytes) {
+    routes_.push_back({String(uri),
+                       method,
+                       std::move(handler),
+                       std::move(uploadHandler),
+                       maximumMultipartRequestBytes});
 }
 
 void BridgeHttpServer::onNotFound(Handler handler) {
@@ -111,11 +127,13 @@ void BridgeHttpServer::setRequestLifecycle(BeforeRequest before,
 void BridgeHttpServer::configureEvents(uint32_t bootNonce,
                                        StatusRenderer statusRenderer,
                                        JobRenderer jobRenderer,
+                                       BrewRenderer brewRenderer,
                                        void* context) {
     eventBootNonce_ = bootNonce;
     eventCounter_ = 1;
     statusRenderer_ = statusRenderer;
     jobRenderer_ = jobRenderer;
+    brewRenderer_ = brewRenderer;
     eventContext_ = context;
 }
 
@@ -137,7 +155,7 @@ bool BridgeHttpServer::begin() {
     config.max_uri_handlers = 8;
     config.max_resp_headers = 8;
     config.backlog_conn = 6;
-    config.lru_purge_enable = false;
+    config.lru_purge_enable = true;
     config.recv_wait_timeout = 5;
     config.send_wait_timeout = 2;
     config.uri_match_fn = httpd_uri_match_wildcard;
@@ -177,10 +195,17 @@ bool BridgeHttpServer::begin() {
             return false;
         }
     }
+    const uint32_t nowMs = millis();
+    taskHeartbeatAtMs_.store(nowMs, std::memory_order_release);
+    lastHealthProbeQueuedAtMs_.store(nowMs, std::memory_order_release);
+    healthProbePending_.store(false, std::memory_order_release);
+    running_.store(true, std::memory_order_release);
     return true;
 }
 
 void BridgeHttpServer::stop() {
+    running_.store(false, std::memory_order_release);
+    healthProbePending_.store(false, std::memory_order_release);
     if (handle_ != nullptr) {
         httpd_stop(handle_);
         handle_ = nullptr;
@@ -213,7 +238,16 @@ esp_err_t BridgeHttpServer::websocketThunk(httpd_req_t* request) {
 void BridgeHttpServer::eventWorkThunk(void* context) {
     auto* server = static_cast<BridgeHttpServer*>(context);
     if (server != nullptr) {
+        server->updateTaskHeartbeat();
         server->drainEventWork();
+    }
+}
+
+void BridgeHttpServer::healthProbeThunk(void* context) {
+    auto* server = static_cast<BridgeHttpServer*>(context);
+    if (server != nullptr) {
+        server->updateTaskHeartbeat();
+        server->healthProbePending_.store(false, std::memory_order_release);
     }
 }
 
@@ -270,6 +304,7 @@ bool BridgeHttpServer::readBody(httpd_req_t* request, String& bodyOut) {
     size_t received = 0;
     char buffer[512];
     while (received < request->content_len) {
+        updateTaskHeartbeat();
         const size_t wanted = std::min(sizeof(buffer), request->content_len - received);
         const int count = httpd_req_recv(request, buffer, wanted);
         if (count <= 0) {
@@ -283,10 +318,12 @@ bool BridgeHttpServer::readBody(httpd_req_t* request, String& bodyOut) {
     return true;
 }
 
-bool BridgeHttpServer::processMultipart(httpd_req_t* request, const Handler& uploadHandler) {
+bool BridgeHttpServer::processMultipart(httpd_req_t* request,
+                                        const Handler& uploadHandler,
+                                        size_t maximumRequestBytes) {
     const size_t contentTypeLength = httpd_req_get_hdr_value_len(request, "Content-Type");
     if (contentTypeLength == 0 || contentTypeLength > 512 ||
-        request->content_len == 0 || request->content_len > MAX_MULTIPART_REQUEST_BYTES) {
+        request->content_len == 0 || request->content_len > maximumRequestBytes) {
         return false;
     }
     std::unique_ptr<char[]> contentType(new (std::nothrow) char[contentTypeLength + 1]);
@@ -338,6 +375,7 @@ bool BridgeHttpServer::processMultipart(httpd_req_t* request, const Handler& upl
     size_t received = 0;
     uint8_t buffer[1024];
     while (received < request->content_len) {
+        updateTaskHeartbeat();
         const size_t wanted = std::min(sizeof(buffer), request->content_len - received);
         const int count = httpd_req_recv(request, reinterpret_cast<char*>(buffer), wanted);
         if (count <= 0 || !parser.feed(buffer, static_cast<size_t>(count))) {
@@ -362,6 +400,7 @@ bool BridgeHttpServer::processMultipart(httpd_req_t* request, const Handler& upl
 }
 
 esp_err_t BridgeHttpServer::dispatch(httpd_req_t* request) {
+    updateTaskHeartbeat();
     const uint32_t startedAtUs = micros();
     bool lifecycleEntered = beforeRequest_ == nullptr || beforeRequest_(requestLifecycleContext_);
     if (!lifecycleEntered) {
@@ -388,7 +427,9 @@ esp_err_t BridgeHttpServer::dispatch(httpd_req_t* request) {
     Route* route = findRoute(context.uri, context.method);
     bool requestValid = true;
     if (route != nullptr && route->uploadHandler) {
-        requestValid = processMultipart(request, route->uploadHandler);
+        requestValid = processMultipart(request,
+                                        route->uploadHandler,
+                                        route->maximumMultipartRequestBytes);
         if (requestValid) {
             route->handler();
         }
@@ -404,10 +445,11 @@ esp_err_t BridgeHttpServer::dispatch(httpd_req_t* request) {
     }
 
     if (!requestValid && !context.responseStarted) {
+        const size_t maximumRequestBytes = route != nullptr && route->uploadHandler
+            ? route->maximumMultipartRequestBytes
+            : MAX_JSON_BODY_BYTES;
         httpd_resp_set_status(request,
-                              request->content_len > MAX_MULTIPART_REQUEST_BYTES ||
-                                      ((route == nullptr || !route->uploadHandler) &&
-                                       request->content_len > MAX_JSON_BODY_BYTES)
+                              request->content_len > maximumRequestBytes
                                   ? "413 Payload Too Large"
                                   : "400 Bad Request");
         httpd_resp_set_type(request, "application/json");
@@ -418,6 +460,8 @@ esp_err_t BridgeHttpServer::dispatch(httpd_req_t* request) {
     if (context.chunked && !context.responseFinished && !context.closeRequested) {
         finishChunked(context);
     }
+
+    updateTaskHeartbeat();
 
     current_ = nullptr;
     if (afterRequest_ != nullptr) {
@@ -472,6 +516,21 @@ String BridgeHttpServer::header(const String& name) const {
     return String(value.get());
 }
 
+bool BridgeHttpServer::headerEquals(const char* name, const char* expected) const {
+    if (current_ == nullptr || current_->request == nullptr ||
+        name == nullptr || expected == nullptr) {
+        return false;
+    }
+    const size_t expectedLength = std::strlen(expected);
+    const size_t actualLength =
+        httpd_req_get_hdr_value_len(current_->request, name);
+    if (actualLength != expectedLength || actualLength >= 96) return false;
+    char value[96];
+    return httpd_req_get_hdr_value_str(
+               current_->request, name, value, sizeof(value)) == ESP_OK &&
+        std::strcmp(value, expected) == 0;
+}
+
 HTTPUpload& BridgeHttpServer::upload() {
     return upload_;
 }
@@ -494,30 +553,39 @@ void BridgeHttpServer::setContentLength(size_t length) {
 void BridgeHttpServer::applyResponseMetadata(RequestContext& context,
                                              int code,
                                              const char* contentType) {
-    context.responseStatus = statusText(code);
-    context.responseType = contentType != nullptr ? contentType : "text/plain";
-    httpd_resp_set_status(context.request, context.responseStatus.c_str());
-    httpd_resp_set_type(context.request, context.responseType.c_str());
+    httpd_resp_set_status(context.request, statusText(code));
+    httpd_resp_set_type(context.request, contentType != nullptr ? contentType : "text/plain");
     for (const auto& header : context.responseHeaders) {
         httpd_resp_set_hdr(context.request, header.first.c_str(), header.second.c_str());
     }
 }
 
 void BridgeHttpServer::send(int code, const char* contentType, const String& body) {
+    send(code, contentType, body.c_str(), body.length());
+}
+
+void BridgeHttpServer::send(int code, const char* contentType, const char* body) {
+    send(code,
+         contentType,
+         body != nullptr ? body : "",
+         body != nullptr ? std::strlen(body) : 0);
+}
+
+void BridgeHttpServer::send(int code,
+                            const char* contentType,
+                            const char* body,
+                            size_t length) {
     if (current_ == nullptr || current_->responseFinished) return;
+    updateTaskHeartbeat();
     applyResponseMetadata(*current_, code, contentType);
-    if (body.length() == 0 && current_->contentLengthSet) {
+    if (length == 0 && current_->contentLengthSet) {
         current_->chunked = true;
         current_->responseStarted = true;
         return;
     }
     current_->responseStarted = true;
     current_->responseFinished = true;
-    httpd_resp_send(current_->request, body.c_str(), body.length());
-}
-
-void BridgeHttpServer::send(int code, const char* contentType, const char* body) {
-    send(code, contentType, String(body != nullptr ? body : ""));
+    httpd_resp_send(current_->request, body, length);
 }
 
 void BridgeHttpServer::send_P(int code,
@@ -551,6 +619,7 @@ bool BridgeHttpServer::sendContent(const char* content, size_t length) {
     if (length == 0) {
         return finishChunked(*current_);
     }
+    updateTaskHeartbeat();
     if (httpd_resp_send_chunk(current_->request, content, length) != ESP_OK) {
         current_->closeRequested = true;
         return false;
@@ -673,6 +742,13 @@ String BridgeHttpServer::nextEventSequence() {
 }
 
 bool BridgeHttpServer::sendEvent(EventClient& client, const String& payload) {
+    return sendEvent(client, payload.c_str(), payload.length());
+}
+
+bool BridgeHttpServer::sendEvent(EventClient& client,
+                                 const char* payload,
+                                 size_t length) {
+    updateTaskHeartbeat();
     if (handle_ == nullptr || client.fd < 0 ||
         httpd_ws_get_fd_info(handle_, client.fd) != HTTPD_WS_CLIENT_WEBSOCKET) {
         const int fd = client.fd;
@@ -683,14 +759,64 @@ bool BridgeHttpServer::sendEvent(EventClient& client, const String& payload) {
     frame.final = true;
     frame.fragmented = false;
     frame.type = HTTPD_WS_TYPE_TEXT;
-    frame.payload = reinterpret_cast<uint8_t*>(const_cast<char*>(payload.c_str()));
-    frame.len = payload.length();
+    frame.payload = reinterpret_cast<uint8_t*>(const_cast<char*>(payload));
+    frame.len = length;
     if (httpd_ws_send_frame_async(handle_, client.fd, &frame) != ESP_OK) {
         const int fd = client.fd;
         httpd_sess_trigger_close(handle_, fd);
         removeEventClient(fd);
         return false;
     }
+    return true;
+}
+
+bool BridgeHttpServer::renderStatusEventMessage(const char* type,
+                                                bool hello,
+                                                size_t& lengthOut) {
+    lengthOut = 0;
+    if (statusRenderer_ == nullptr || type == nullptr) return false;
+
+    char sequence[40];
+    std::snprintf(sequence,
+                  sizeof(sequence),
+                  "%08lx-%lu",
+                  static_cast<unsigned long>(eventBootNonce_),
+                  static_cast<unsigned long>(eventCounter_++));
+    const int prefixLength = hello
+        ? std::snprintf(statusMessage_.data(),
+                        statusMessage_.size(),
+                        "{\"type\":\"hello\",\"eventProtocolVersion\":2,"
+                        "\"apiVersion\":2,\"sequence\":\"%s\",\"status\":",
+                        sequence)
+        : std::snprintf(statusMessage_.data(),
+                        statusMessage_.size(),
+                        "{\"type\":\"%s\",\"sequence\":\"%s\",\"status\":",
+                        type,
+                        sequence);
+    if (prefixLength < 0 || static_cast<size_t>(prefixLength) >= statusMessage_.size()) {
+        return false;
+    }
+
+    const bool resync = std::strcmp(type, "resync") == 0;
+    const char* suffix = resync ? ",\"reason\":\"event_overflow\"}" : "}";
+    const size_t suffixLength = std::strlen(suffix);
+    const size_t prefixBytes = static_cast<size_t>(prefixLength);
+    if (prefixBytes + suffixLength + 1 >= statusMessage_.size()) return false;
+
+    size_t statusLength = 0;
+    const size_t statusCapacity = statusMessage_.size() - prefixBytes - suffixLength;
+    if (!statusRenderer_(statusMessage_.data() + prefixBytes,
+                         statusCapacity,
+                         statusLength,
+                         eventContext_) ||
+        statusLength == 0 || statusLength >= statusCapacity) {
+        return false;
+    }
+    std::memcpy(statusMessage_.data() + prefixBytes + statusLength,
+                suffix,
+                suffixLength);
+    lengthOut = prefixBytes + statusLength + suffixLength;
+    statusMessage_[lengthOut] = '\0';
     return true;
 }
 
@@ -710,42 +836,20 @@ void BridgeHttpServer::sendErrorEvent(EventClient& client,
 }
 
 void BridgeHttpServer::sendHello(EventClient& client) {
-    String status;
-    if (statusRenderer_ == nullptr || !statusRenderer_(status, eventContext_)) {
+    size_t length = 0;
+    if (!renderStatusEventMessage("hello", true, length)) {
         sendErrorEvent(client, "status_unavailable", "bridge status is temporarily unavailable");
         return;
     }
-    DynamicJsonDocument event(512);
-    event["type"] = "hello";
-    event["eventProtocolVersion"] = 1;
-    event["apiVersion"] = 2;
-    event["sequence"] = nextEventSequence();
-    event["status"] = serialized(status.c_str(), status.length());
-    String payload;
-    payload.reserve(status.length() + 160);
-    if (event.overflowed() || serializeJson(event, payload) == 0) {
-        sendErrorEvent(client, "status_unavailable", "bridge status event could not be serialized");
-        return;
-    }
-    sendEvent(client, payload);
+    sendEvent(client, statusMessage_.data(), length);
 }
 
 void BridgeHttpServer::sendStatusToAll(const char* type) {
     if (eventClientCount_.load(std::memory_order_acquire) == 0 || statusRenderer_ == nullptr) return;
-    String status;
-    if (!statusRenderer_(status, eventContext_)) return;
-    DynamicJsonDocument event(512);
-    event["type"] = type;
-    event["sequence"] = nextEventSequence();
-    event["status"] = serialized(status.c_str(), status.length());
-    if (std::strcmp(type, "resync") == 0) {
-        event["reason"] = "event_overflow";
-    }
-    String payload;
-    payload.reserve(status.length() + 128);
-    if (event.overflowed() || serializeJson(event, payload) == 0) return;
+    size_t length = 0;
+    if (!renderStatusEventMessage(type, false, length)) return;
     for (EventClient& client : eventClients_) {
-        if (client.fd >= 0) sendEvent(client, payload);
+        if (client.fd >= 0) sendEvent(client, statusMessage_.data(), length);
     }
     lastStatusEventAtMs_.store(millis(), std::memory_order_release);
 }
@@ -787,7 +891,31 @@ void BridgeHttpServer::sendJobToWatchers(const char* id) {
     }
 }
 
+void BridgeHttpServer::sendBrewToAll(const char* id) {
+    if (brewRenderer_ == nullptr) return;
+    String brew;
+    const EventJobLookup lookup = brewRenderer_(String(id), brew, eventContext_);
+    if (lookup != EventJobLookup::Found) {
+        sendStatusToAll("resync");
+        return;
+    }
+    DynamicJsonDocument event(384);
+    event["type"] = "brew";
+    event["sequence"] = nextEventSequence();
+    event["brew"] = serialized(brew.c_str(), brew.length());
+    String payload;
+    payload.reserve(brew.length() + 112);
+    if (event.overflowed() || serializeJson(event, payload) == 0) {
+        sendStatusToAll("resync");
+        return;
+    }
+    for (EventClient& client : eventClients_) {
+        if (client.fd >= 0) sendEvent(client, payload);
+    }
+}
+
 esp_err_t BridgeHttpServer::handleWebsocket(httpd_req_t* request) {
+    updateTaskHeartbeat();
     const int fd = httpd_req_to_sockfd(request);
     if (request->method == HTTP_GET) {
         if (!validateOrigin(request)) {
@@ -857,10 +985,35 @@ void BridgeHttpServer::notifyJobChanged(const char* id) {
     portEXIT_CRITICAL(&eventChangesMutex_);
 }
 
+void BridgeHttpServer::notifyBrewChanged(const char* id) {
+    portENTER_CRITICAL(&eventChangesMutex_);
+    eventChanges_.markBrew(id);
+    portEXIT_CRITICAL(&eventChangesMutex_);
+}
+
 void BridgeHttpServer::markStatusChanged() {
     portENTER_CRITICAL(&eventChangesMutex_);
     eventChanges_.markStatus();
     portEXIT_CRITICAL(&eventChangesMutex_);
+}
+
+bool BridgeHttpServer::sendStatusSnapshot() {
+    sendHeader("Cache-Control", "no-store");
+    sendHeader("Access-Control-Allow-Origin", "*");
+    size_t length = 0;
+    if (statusRenderer_ == nullptr ||
+        !statusRenderer_(statusMessage_.data(),
+                         statusMessage_.size(),
+                         length,
+                         eventContext_) ||
+        length == 0 || length >= statusMessage_.size()) {
+        constexpr char ERROR[] =
+            "{\"ok\":false,\"error\":\"response JSON exceeded its bounded capacity\"}";
+        send(507, "application/json", ERROR, sizeof(ERROR) - 1);
+        return false;
+    }
+    send(200, "application/json", statusMessage_.data(), length);
+    return true;
 }
 
 void BridgeHttpServer::requestEventWork() {
@@ -878,7 +1031,36 @@ void BridgeHttpServer::requestEventWork() {
     }
 }
 
+void BridgeHttpServer::updateTaskHeartbeat() {
+    taskHeartbeatAtMs_.store(millis(), std::memory_order_release);
+    // ESP-IDF reports the high-water mark in bytes.
+    taskStackHighWaterBytes_.store(
+        static_cast<uint32_t>(uxTaskGetStackHighWaterMark(nullptr)),
+        std::memory_order_release);
+}
+
+void BridgeHttpServer::markTaskProgress() {
+    updateTaskHeartbeat();
+}
+
+void BridgeHttpServer::tickHealthProbe(uint32_t nowMs) {
+    if (!running_.load(std::memory_order_acquire) || handle_ == nullptr ||
+        healthProbePending_.load(std::memory_order_acquire) ||
+        !elapsedAtLeast(nowMs,
+                        lastHealthProbeQueuedAtMs_.load(std::memory_order_acquire),
+                        HEALTH_PROBE_INTERVAL_MS)) {
+        return;
+    }
+    healthProbePending_.store(true, std::memory_order_release);
+    lastHealthProbeQueuedAtMs_.store(nowMs, std::memory_order_release);
+    if (httpd_queue_work(handle_, healthProbeThunk, this) != ESP_OK) {
+        healthProbeQueueFailures_.fetch_add(1, std::memory_order_acq_rel);
+        healthProbePending_.store(false, std::memory_order_release);
+    }
+}
+
 void BridgeHttpServer::tickEvents(uint32_t nowMs, bool active) {
+    tickHealthProbe(nowMs);
     if (eventClientCount_.load(std::memory_order_acquire) == 0) {
         portENTER_CRITICAL(&eventChangesMutex_);
         eventChanges_.take();
@@ -914,13 +1096,43 @@ void BridgeHttpServer::drainEventWork() {
         return;
     }
     if (batch.statusDirty) sendStatusToAll();
-    for (size_t index = 0; index < batch.jobCount; ++index) {
-        sendJobToWatchers(batch.jobIds[index].data());
+    for (size_t index = 0; index < batch.count; ++index) {
+        if (batch.kinds[index] == EventChangeKind::Brew) {
+            sendBrewToAll(batch.ids[index].data());
+        } else {
+            sendJobToWatchers(batch.ids[index].data());
+        }
     }
 }
 
 size_t BridgeHttpServer::websocketClientCount() const {
     return eventClientCount_.load(std::memory_order_acquire);
+}
+
+bool BridgeHttpServer::running() const {
+    return running_.load(std::memory_order_acquire);
+}
+
+uint32_t BridgeHttpServer::taskHeartbeatAtMs() const {
+    return taskHeartbeatAtMs_.load(std::memory_order_acquire);
+}
+
+uint32_t BridgeHttpServer::taskHeartbeatAgeMs(uint32_t nowMs) const {
+    const int32_t ageMs = static_cast<int32_t>(
+        nowMs - taskHeartbeatAtMs_.load(std::memory_order_acquire));
+    return ageMs >= 0 ? static_cast<uint32_t>(ageMs) : 0;
+}
+
+uint32_t BridgeHttpServer::taskStackHighWaterBytes() const {
+    return taskStackHighWaterBytes_.load(std::memory_order_acquire);
+}
+
+bool BridgeHttpServer::healthProbePending() const {
+    return healthProbePending_.load(std::memory_order_acquire);
+}
+
+uint32_t BridgeHttpServer::healthProbeQueueFailures() const {
+    return healthProbeQueueFailures_.load(std::memory_order_acquire);
 }
 
 } // namespace bridge_http

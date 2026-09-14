@@ -221,6 +221,7 @@ bool decodePacketAssumed(const ByteVector& packet,
                          bool encrypted,
                          ByteVector& payloadOut,
                          String& error);
+bool decodeHpResponse(const std::vector<ByteVector>& chunks, String& error);
 bool parseHuResponsePayload(const ByteVector& payload, const ByteVector& seed, ByteVector& sessionKeyOut, String& error);
 bool parseSessionHexString(const String& sessionHex, ByteVector& sessionKeyOut, String& error);
 bool parseCommandString(const String& commandText, char commandOut[3], String& error);

@@ -2,6 +2,9 @@
 
 `esp-coffee-bridge` is an ESP32 Wi-Fi/BLE bridge for coffee machines that use a proprietary Bluetooth Low Energy protocol.
 
+The firmware target is an ESP32-S3-N16R8 module: 16 MB quad-I/O flash and
+8 MB octal-I/O PSRAM.
+
 The official mobile apps are constrained by the same short-range BLE link as the machine itself, so in practice they are most useful when you are already standing right next to the coffee machine. This project takes the opposite approach: put a small ESP32 next to the machine permanently, let it handle the BLE conversation locally, and expose the machine over normal Wi-Fi through a local web UI and HTTP API.
 
 That only works because the bridge reimplements the vendor protocol from reverse-engineered traffic, APK analysis, and family-specific register mapping. The reverse-engineering notes live in [docs/NIVONA.md](docs/NIVONA.md).
@@ -13,6 +16,7 @@ Core pieces:
 - onboard saved-machine web UI
 - JSON API for pairing, remembered machines, recipes, settings, stats, and diagnostics
 - HTTP OTA upload for remote firmware updates
+- persistent ESP-IDF crash dumps with guarded post-reboot download
 
 ## Home Assistant
 
@@ -35,7 +39,7 @@ The intended workflow is:
 4. use the onboard web UI or HTTP API to:
    - scan and probe nearby BLE devices
    - pair and save supported machines by alias in bridge memory
-   - watch online/offline state and last-seen presence from idle scans
+   - distinguish a validated online protocol session from last-seen BLE presence
    - browse standard drinks and `MyCoffee` saved recipes
    - brew drinks quickly or with temporary machine-valid customizations
    - inspect beverage counters, maintenance counters, and settings
@@ -52,11 +56,13 @@ The intended workflow is:
 
 ## Web App Features
 
-- `Dashboard`: lists remembered machines with alias/model/family, online or offline state, last-seen presence, and quick open or forget actions.
+- `Dashboard`: lists remembered machines with alias/model/family, validated online or offline session state, separate nearby/last-seen presence, and quick open or forget actions.
+- Machine sessions reuse one NimBLE client and apply bounded reconnect backoff, so a sleeping or unavailable machine cannot exhaust the bridge's BLE client table.
 - `Add machine flow`: scans nearby BLE devices, highlights likely supported coffee machines, probes a device before saving it, and also supports manual offline add by BLE address, serial number, and optional model.
 - `Live machine summary`: shows current status summary, process label/code, operator message label/code, progress, and whether the APK-backed `HY` host-confirm path is currently suggested.
 - `Standard drinks`: lists the built-in drink selectors, supports quick brew, and opens a per-drink customization view.
 - `Temporary brew customization`: refreshes current standard drink values from the machine, can warm the full standard-drink cache from the machine, and sends temporary overrides such as strength, aroma, temperature, cup mode, and amount fields without overwriting the machine's saved recipe.
+- `Durable brew queue`: accepts drinks while a machine is offline, tracks command acceptance separately from physical preparation/completion, pauses for water/beans/operator prompts or ambiguous outcomes, and survives reboot/OTA without replaying a possibly delivered command.
 - `Brew history`: stores a bounded per-machine history in LittleFS with the final applied recipe snapshot, a stable recipe fingerprint, optional source or actor metadata, UTC timestamps from either NTP or the fallback client-seeded clock, and a runtime-adjustable cap from the system page.
 - `Counter history`: stores a separate bounded per-machine timeline of beverage and maintenance counters, snapshots only when live values change, and captures local machine use started from the front panel.
 - `MyCoffee / saved recipes`: stores saved custom recipe snapshots in LittleFS too, exposes explicit refresh buttons, shows recipe details, and edits persisted custom recipes where the machine family supports them.
@@ -73,11 +79,21 @@ pio run
 
 ## First Flash Over USB
 
-Adjust `upload_port` in `platformio.ini` if needed or pass it on the command line:
+The first flash installs the N16R8 memory configuration, an 8 MiB LittleFS
+partition, and the dedicated core-dump partition as well as the firmware.
+Adjust `upload_port` in `platformio.ini` if needed or pass it on the command
+line:
 
 ```bash
 pio run -t upload
 ```
+
+An existing bridge flashed with an older partition table also needs this
+one-time USB upload; application-only OTA updates cannot change the partition
+table. The LittleFS start address is unchanged, and the filesystem grows on
+first mount without formatting existing data. Back up the bridge before this
+layout upgrade, and do not later reinstall a partition table that shrinks
+LittleFS back to 960 KiB.
 
 ## Network / Access
 
@@ -137,12 +153,12 @@ You can also let an AI agent drive the bridge over HTTP. A custom OpenClaw skill
 That skill teaches the agent to:
 
 - discover remembered machines with `GET /api/machines`
-- preflight machine state with `GET /api/machines/{serial}/summary`
+- inspect machine state with `GET /api/machines/{serial}/summary`
 - enumerate drinks and machine-valid override options with `GET /api/machines/{serial}/recipes` and `GET /api/machines/{serial}/recipes/{selector}`
 - read beverage counters with `GET /api/machines/{serial}/stats`
-- issue temporary brew commands with `POST /api/machines/{serial}/brew`
+- enqueue temporary brews with a unique `correlationId`, then follow `GET /api/brews/{brewId}` until the physical outcome is terminal
 
-Because it uses the bridge's live `writableFields` and `options` data, the agent can stay inside model-specific limits instead of guessing bean counts, aroma codes, or temperature options. The skill also checks `/summary` first and avoids brewing when the machine is offline, busy, or reporting a non-zero operator message.
+Because it uses the bridge's live `writableFields` and `options` data, the agent can stay inside model-specific limits instead of guessing bean counts, aroma codes, or temperature options. The bridge itself establishes the machine session when the queued brew reaches the head, waits through temporary offline periods, and reports water/beans/operator intervention separately from completion.
 
 Example prompts:
 

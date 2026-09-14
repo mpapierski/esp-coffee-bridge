@@ -29,12 +29,69 @@ constexpr uint32_t clampWaitToDeadline(uint32_t requestedMs,
     return std::min(std::min(requestedMs, maximumWaitMs), deadlineRemaining(nowMs, deadlineAtMs));
 }
 
+// A heartbeat can advance on another core immediately after the caller reads
+// nowMs. Treat that tiny apparent future timestamp as fresh, not as a wrapped
+// multi-week stall.
+constexpr bool heartbeatExpired(uint32_t nowMs,
+                                uint32_t heartbeatAtMs,
+                                uint32_t stallTimeoutMs) {
+    const int32_t ageMs = static_cast<int32_t>(nowMs - heartbeatAtMs);
+    return ageMs >= 0 && static_cast<uint32_t>(ageMs) >= stallTimeoutMs;
+}
+
 constexpr bool watchdogShouldReboot(bool jobActive,
                                     bool transportCallActive,
                                     uint32_t nowMs,
                                     uint32_t heartbeatAtMs,
                                     uint32_t stallTimeoutMs) {
-    return jobActive && transportCallActive && elapsedAtLeast(nowMs, heartbeatAtMs, stallTimeoutMs);
+    return jobActive && transportCallActive &&
+        heartbeatExpired(nowMs, heartbeatAtMs, stallTimeoutMs);
+}
+
+constexpr bool httpHeartbeatExpired(bool serverRunning,
+                                    uint32_t nowMs,
+                                    uint32_t heartbeatAtMs,
+                                    uint32_t stallTimeoutMs) {
+    return serverRunning && heartbeatExpired(nowMs, heartbeatAtMs, stallTimeoutMs);
+}
+
+constexpr bool criticalMemory(uint32_t freeHeap,
+                              uint32_t largestFreeBlock,
+                              uint32_t minimumFreeHeap,
+                              uint32_t minimumLargestBlock) {
+    return freeHeap < minimumFreeHeap || largestFreeBlock < minimumLargestBlock;
+}
+
+constexpr bool sustainedCondition(bool condition,
+                                  bool observationActive,
+                                  uint32_t nowMs,
+                                  uint32_t observedAtMs,
+                                  uint32_t durationMs) {
+    return condition && observationActive &&
+        elapsedAtLeast(nowMs, observedAtMs, durationMs);
+}
+
+constexpr bool recentFailure(uint32_t failureCount,
+                             uint32_t nowMs,
+                             uint32_t failureAtMs,
+                             uint32_t recentWindowMs) {
+    return failureCount != 0 && !elapsedAtLeast(nowMs, failureAtMs, recentWindowMs);
+}
+
+constexpr uint32_t exponentialRetryDelay(uint32_t failureCount,
+                                         uint32_t initialDelayMs,
+                                         uint32_t maximumDelayMs) {
+    if (failureCount == 0 || initialDelayMs == 0 || maximumDelayMs == 0) {
+        return 0;
+    }
+    uint32_t delayMs = std::min(initialDelayMs, maximumDelayMs);
+    for (uint32_t failure = 1; failure < failureCount && delayMs < maximumDelayMs; ++failure) {
+        if (delayMs > maximumDelayMs / 2U) {
+            return maximumDelayMs;
+        }
+        delayMs *= 2U;
+    }
+    return std::min(delayMs, maximumDelayMs);
 }
 
 constexpr bool retainWorkerResultFile(bool resource,
@@ -121,13 +178,14 @@ struct SessionSnapshot {
     bool connected{false};
     bool handlesDiscovered{false};
     bool huSessionReady{false};
-    bool recreateBeforeNextJob{false};
+    bool resetBeforeNextJob{false};
     std::string target;
 };
 
 // Small, transport-agnostic state machine for the worker's reuse contract.
 // Transport must expose createClient(), connect(target), discoverHandles(),
-// establishHuSession(), read(operation), disconnect(), and destroyClient().
+// establishHuSession(), read(operation), disconnect(), and resetClient(). The
+// reset clears connection-scoped state while retaining the registered client.
 template <typename Transport>
 class ReusableSession {
 public:
@@ -163,11 +221,15 @@ private:
     TransportOutcome prepare(Transport& transport,
                              const std::string& target,
                              bool requireHuSession) {
-        if (state_.recreateBeforeNextJob) {
+        if (state_.resetBeforeNextJob) {
             if (state_.clientCreated) {
-                transport.destroyClient();
+                transport.resetClient();
             }
-            state_ = {};
+            state_.connected = false;
+            state_.handlesDiscovered = false;
+            state_.huSessionReady = false;
+            state_.resetBeforeNextJob = false;
+            state_.target.clear();
         }
 
         if (state_.connected && state_.target != target) {
@@ -210,7 +272,7 @@ private:
     }
 
     void invalidateAfterFailure() {
-        state_.recreateBeforeNextJob = true;
+        state_.resetBeforeNextJob = true;
         state_.connected = false;
         state_.handlesDiscovered = false;
         state_.huSessionReady = false;

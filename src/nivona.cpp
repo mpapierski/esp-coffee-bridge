@@ -776,6 +776,37 @@ bool decodePacketAssumed(const ByteVector& packet,
     return true;
 }
 
+bool decodeHpResponse(const std::vector<ByteVector>& chunks, String& error) {
+    ByteVector packet = selectPacketForCommand(chunks, "Hp");
+    if (!chunkIsWholePacketForCommand(packet, "Hp")) {
+        const ByteVector joined = packet;
+        packet.clear();
+        constexpr size_t HP_PACKET_SIZE = 1 + 2 + 24 + 1 + 1;
+        for (size_t offset = 0; offset + HP_PACKET_SIZE <= joined.size(); ++offset) {
+            if (joined[offset] == START_BYTE &&
+                joined[offset + 1] == 'H' && joined[offset + 2] == 'p' &&
+                joined[offset + HP_PACKET_SIZE - 1] == END_BYTE) {
+                packet.assign(joined.begin() + offset,
+                              joined.begin() + offset + HP_PACKET_SIZE);
+                break;
+            }
+        }
+    }
+    if (packet.empty()) {
+        error = "Hp response not found";
+        return false;
+    }
+    ByteVector payload;
+    if (!decodePacketAssumed(packet, "Hp", nullptr, false, payload, error)) {
+        return false;
+    }
+    if (payload.size() != 24) {
+        error = "Hp response payload must contain exactly 24 bytes";
+        return false;
+    }
+    return true;
+}
+
 bool parseHuResponsePayload(const ByteVector& payload, const ByteVector& seed, ByteVector& sessionKeyOut, String& error) {
     sessionKeyOut.clear();
     if (payload.size() != 8) {
@@ -1183,20 +1214,20 @@ void annotateProcessStatus(ProcessStatus& status) {
         return;
     }
 
-    if ((status.process == 3 || status.process == 8) && status.message == 0) {
-        status.summary = "ready";
-        return;
-    }
-    if (status.process == 4 || status.process == 11) {
-        status.summary = "preparing";
-        return;
-    }
     if (status.message == 20) {
         status.summary = "flush required";
         return;
     }
     if (status.message >= 1 && status.message <= 6) {
         status.summary = "attention";
+        return;
+    }
+    if ((status.process == 3 || status.process == 8) && status.message == 0) {
+        status.summary = "ready";
+        return;
+    }
+    if (status.process == 4 || status.process == 11) {
+        status.summary = "preparing";
         return;
     }
     if (status.process == 0 && status.subProcess == 0 && status.message == 0 && status.progress == 0) {

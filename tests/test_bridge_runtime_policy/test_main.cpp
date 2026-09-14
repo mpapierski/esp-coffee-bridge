@@ -77,6 +77,59 @@ void test_deadlines_wait_clamping_and_watchdog_heartbeat_are_wraparound_safe() {
     TEST_ASSERT_TRUE(bridge_runtime_policy::watchdogShouldReboot(true, true, 19U, heartbeat, 45U));
     TEST_ASSERT_FALSE(bridge_runtime_policy::watchdogShouldReboot(true, false, 100U, heartbeat, 45U));
     TEST_ASSERT_FALSE(bridge_runtime_policy::watchdogShouldReboot(false, true, 100U, heartbeat, 45U));
+    TEST_ASSERT_FALSE(bridge_runtime_policy::watchdogShouldReboot(
+        true, true, 100U, 101U, 45U));
+}
+
+void test_global_recovery_thresholds_are_bounded_and_wraparound_safe() {
+    const uint32_t heartbeat = UINT32_MAX - 25U;
+    TEST_ASSERT_FALSE(bridge_runtime_policy::httpHeartbeatExpired(
+        true, 18U, heartbeat, 45U));
+    TEST_ASSERT_TRUE(bridge_runtime_policy::httpHeartbeatExpired(
+        true, 19U, heartbeat, 45U));
+    TEST_ASSERT_FALSE(bridge_runtime_policy::httpHeartbeatExpired(
+        false, 100U, heartbeat, 45U));
+    TEST_ASSERT_FALSE(bridge_runtime_policy::httpHeartbeatExpired(
+        true, 100U, 101U, 45U));
+
+    TEST_ASSERT_FALSE(bridge_runtime_policy::criticalMemory(
+        12U * 1024U, 4U * 1024U, 12U * 1024U, 4U * 1024U));
+    TEST_ASSERT_TRUE(bridge_runtime_policy::criticalMemory(
+        12U * 1024U - 1U, 8U * 1024U, 12U * 1024U, 4U * 1024U));
+    TEST_ASSERT_TRUE(bridge_runtime_policy::criticalMemory(
+        24U * 1024U, 4U * 1024U - 1U, 12U * 1024U, 4U * 1024U));
+
+    const uint32_t pressureStarted = UINT32_MAX - 1000U;
+    TEST_ASSERT_FALSE(bridge_runtime_policy::sustainedCondition(
+        true, true, 3998U, pressureStarted, 5000U));
+    TEST_ASSERT_TRUE(bridge_runtime_policy::sustainedCondition(
+        true, true, 3999U, pressureStarted, 5000U));
+    TEST_ASSERT_FALSE(bridge_runtime_policy::sustainedCondition(
+        false, true, 5000U, pressureStarted, 5000U));
+    TEST_ASSERT_FALSE(bridge_runtime_policy::sustainedCondition(
+        true, false, 5000U, pressureStarted, 5000U));
+
+    TEST_ASSERT_TRUE(bridge_runtime_policy::recentFailure(
+        1U, 18U, heartbeat, 45U));
+    TEST_ASSERT_FALSE(bridge_runtime_policy::recentFailure(
+        1U, 19U, heartbeat, 45U));
+    TEST_ASSERT_FALSE(bridge_runtime_policy::recentFailure(
+        0U, 18U, heartbeat, 45U));
+}
+
+void test_session_retry_backoff_saturates_without_overflow() {
+    TEST_ASSERT_EQUAL_UINT32(
+        0U, bridge_runtime_policy::exponentialRetryDelay(0U, 5000U, 60000U));
+    TEST_ASSERT_EQUAL_UINT32(
+        5000U, bridge_runtime_policy::exponentialRetryDelay(1U, 5000U, 60000U));
+    TEST_ASSERT_EQUAL_UINT32(
+        10000U, bridge_runtime_policy::exponentialRetryDelay(2U, 5000U, 60000U));
+    TEST_ASSERT_EQUAL_UINT32(
+        40000U, bridge_runtime_policy::exponentialRetryDelay(4U, 5000U, 60000U));
+    TEST_ASSERT_EQUAL_UINT32(
+        60000U, bridge_runtime_policy::exponentialRetryDelay(5U, 5000U, 60000U));
+    TEST_ASSERT_EQUAL_UINT32(
+        60000U, bridge_runtime_policy::exponentialRetryDelay(UINT32_MAX, 5000U, 60000U));
 }
 
 void test_successful_cache_and_spool_results_survive_until_publication() {
@@ -115,7 +168,9 @@ void test_full_history_rejects_append_without_removing_existing_bytes() {
     TEST_ASSERT_FALSE(history_retention::appendFits(
         SIZE_MAX - 10U, 20U, SIZE_MAX));
 
-    TEST_ASSERT_EQUAL_UINT32(720U * 1024U,
+    TEST_ASSERT_EQUAL_UINT32(8U * 1024U * 1024U,
+                             history_capacity::LITTLEFS_PARTITION_BYTES);
+    TEST_ASSERT_EQUAL_UINT32(7500U * 1024U,
                              history_capacity::MAX_GENERATED_BACKUP_BYTES);
 }
 
@@ -193,8 +248,8 @@ public:
         disconnectCalls++;
     }
 
-    void destroyClient() {
-        destroyCalls++;
+    void resetClient() {
+        resetCalls++;
     }
 
     uint16_t timeoutOperation{0};
@@ -203,7 +258,7 @@ public:
     uint32_t discoveryCalls{0};
     uint32_t sessionCalls{0};
     uint32_t disconnectCalls{0};
-    uint32_t destroyCalls{0};
+    uint32_t resetCalls{0};
     std::vector<uint16_t> reads;
     std::vector<std::string> connectedTargets;
 };
@@ -228,7 +283,7 @@ void test_adjacent_jobs_reuse_one_connection_discovery_and_hu_session() {
     TEST_ASSERT_EQUAL_UINT32(3U, transport.reads.size());
 }
 
-void test_first_timeout_aborts_crawl_and_next_job_recreates_client() {
+void test_first_timeout_aborts_crawl_and_next_job_resets_existing_client() {
     FakeTransport transport;
     ReusableSession<FakeTransport> session;
     const std::array<uint16_t, 3> crawl{{200U, 201U, 202U}};
@@ -240,12 +295,12 @@ void test_first_timeout_aborts_crawl_and_next_job_recreates_client() {
     TEST_ASSERT_EQUAL_UINT32(2U, transport.reads.size());
     TEST_ASSERT_EQUAL_UINT16(200U, transport.reads[0]);
     TEST_ASSERT_EQUAL_UINT16(201U, transport.reads[1]);
-    TEST_ASSERT_TRUE(session.snapshot().recreateBeforeNextJob);
+    TEST_ASSERT_TRUE(session.snapshot().resetBeforeNextJob);
 
     // A refresh failure must leave the last good data untouched.
     std::string cachedSnapshot = "last-good";
     const std::string failedCandidate = "partial-new-data";
-    if (!session.snapshot().recreateBeforeNextJob) {
+    if (!session.snapshot().resetBeforeNextJob) {
         cachedSnapshot = failedCandidate;
     }
     TEST_ASSERT_EQUAL_STRING("last-good", cachedSnapshot.c_str());
@@ -255,12 +310,12 @@ void test_first_timeout_aborts_crawl_and_next_job_recreates_client() {
     TEST_ASSERT_EQUAL_INT(
         static_cast<int>(TransportOutcome::Success),
         static_cast<int>(session.runReadJob(transport, "machine-a", true, recovery.begin(), recovery.end())));
-    TEST_ASSERT_EQUAL_UINT32(1U, transport.destroyCalls);
-    TEST_ASSERT_EQUAL_UINT32(2U, transport.createCalls);
+    TEST_ASSERT_EQUAL_UINT32(1U, transport.resetCalls);
+    TEST_ASSERT_EQUAL_UINT32(1U, transport.createCalls);
     TEST_ASSERT_EQUAL_UINT32(2U, transport.connectCalls);
     TEST_ASSERT_EQUAL_UINT32(2U, transport.discoveryCalls);
     TEST_ASSERT_EQUAL_UINT32(2U, transport.sessionCalls);
-    TEST_ASSERT_FALSE(session.snapshot().recreateBeforeNextJob);
+    TEST_ASSERT_FALSE(session.snapshot().resetBeforeNextJob);
 }
 
 } // namespace
@@ -270,11 +325,13 @@ int main(int, char**) {
     RUN_TEST(test_cache_freshness_and_backoff_are_wraparound_safe);
     RUN_TEST(test_forced_refresh_bypasses_cache_and_failure_keeps_last_good_snapshot);
     RUN_TEST(test_deadlines_wait_clamping_and_watchdog_heartbeat_are_wraparound_safe);
+    RUN_TEST(test_global_recovery_thresholds_are_bounded_and_wraparound_safe);
+    RUN_TEST(test_session_retry_backoff_saturates_without_overflow);
     RUN_TEST(test_successful_cache_and_spool_results_survive_until_publication);
     RUN_TEST(test_oversized_legacy_history_becomes_a_lossless_preservation_floor);
     RUN_TEST(test_full_history_rejects_append_without_removing_existing_bytes);
     RUN_TEST(test_persistence_equality_ignores_presence_and_generation_only);
     RUN_TEST(test_adjacent_jobs_reuse_one_connection_discovery_and_hu_session);
-    RUN_TEST(test_first_timeout_aborts_crawl_and_next_job_recreates_client);
+    RUN_TEST(test_first_timeout_aborts_crawl_and_next_job_resets_existing_client);
     return UNITY_END();
 }

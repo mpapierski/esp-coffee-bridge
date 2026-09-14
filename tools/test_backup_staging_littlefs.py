@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise the production staging helper against hash-pinned LittleFS 2.5.
+"""Exercise staging and growth against the runtime-pinned LittleFS source.
 
 Downloads only upstream test dependencies into a temporary directory. Requires
 network access plus a host C/C++ compiler; does not access any bridge device.
@@ -12,11 +12,12 @@ from pathlib import Path
 from urllib.request import urlopen
 
 ROOT = Path(__file__).resolve().parents[1]
+LITTLEFS_COMMIT = "f53a0cc961a8acac85f868b431d2f3e58e447ba3"
 SOURCES = {
-    "lfs.c": "c4de0850d8629f511b91217334c2cc2e75e89cd24f1f7b40b483df3d5762a918",
-    "lfs.h": "6c747c5b51813beb7979e632ba3076b2d674b5419541a450e3b02a27d7bee310",
-    "lfs_util.c": "8e1376a90e923a2897388a54ebaa756ad3ea07a0e2a87e73c0045515c0a82685",
-    "lfs_util.h": "3c8b6799cb057c3243015e7a09c501f1c8db859898f6e40dbce587538274cd3f",
+    "lfs.c": "0b9845f350c33aa448a916847d2246b76c8e296eed8e7e296ae0430242cfda6c",
+    "lfs.h": "a8c8d70f0863fbbc46ce17c5dc7673b40f1b3c9e7e10f3bf33fd28f03dc67703",
+    "lfs_util.c": "f2fbde533670560434bd9f5a547174cc7c5a4670a02c47b4bd85180dced8b2ec",
+    "lfs_util.h": "03e912a6e9894c9d10c61f5da22b89ebe0bb778af67972d7b67a5f160731bf72",
 }
 
 
@@ -24,7 +25,10 @@ def main() -> None:
     with tempfile.TemporaryDirectory(prefix="bridge-lfs-test-") as temporary:
         work = Path(temporary)
         for name, expected in SOURCES.items():
-            url = f"https://raw.githubusercontent.com/littlefs-project/littlefs/v2.5.0/{name}"
+            url = (
+                "https://raw.githubusercontent.com/littlefs-project/littlefs/"
+                f"{LITTLEFS_COMMIT}/{name}"
+            )
             with urlopen(url, timeout=30) as response:
                 data = response.read()
             if sha256(data).hexdigest() != expected:

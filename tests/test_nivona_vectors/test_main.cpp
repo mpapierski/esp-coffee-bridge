@@ -40,6 +40,26 @@ void test_build_packet_matches_documented_request_vectors() {
     assertHexEquals("5348521F1D014D033DEE45", nivona::buildPacket("HR", decodeHex("00D5000004D2"), nullptr, true));
 }
 
+void test_hp_liveness_response_requires_valid_24_byte_payload() {
+    ByteVector payload(24, 0x2A);
+    const ByteVector packet = nivona::buildPacket("Hp", payload, nullptr, false);
+    std::vector<ByteVector> split{
+        ByteVector(packet.begin(), packet.begin() + 20),
+        ByteVector(packet.begin() + 20, packet.end()),
+    };
+    String error;
+    TEST_ASSERT_TRUE_MESSAGE(nivona::decodeHpResponse(split, error), error.c_str());
+
+    std::vector<ByteVector> mixed{decodeHex("534100BE45"), split[0], split[1]};
+    TEST_ASSERT_TRUE_MESSAGE(nivona::decodeHpResponse(mixed, error), error.c_str());
+
+    std::vector<ByteVector> shortResponse{
+        nivona::buildPacket("Hp", ByteVector(23, 0x2A), nullptr, false),
+    };
+    TEST_ASSERT_FALSE(nivona::decodeHpResponse(shortResponse, error));
+    TEST_ASSERT_EQUAL_STRING("Hp response payload must contain exactly 24 bytes", error.c_str());
+}
+
 void test_live_hu_vector_round_trips_through_decoder_and_payload_validator() {
     const ByteVector seed = decodeHex("12314BF7");
     const ByteVector verifier = nivona::deriveHuVerifier(seed, 0, seed.size());
@@ -148,6 +168,17 @@ void test_hx_confirmable_messages_are_flagged_for_host_confirm() {
         TEST_ASSERT_EQUAL_STRING("flush required", status.summary.c_str());
         TEST_ASSERT_TRUE(status.hostConfirmSuggested);
     }
+}
+
+void test_hx_operator_message_takes_priority_over_preparing_process() {
+    std::vector<ByteVector> chunks{
+        nivona::buildPacket("HX", decodeHex("0004000000040000"), nullptr, true),
+    };
+    nivona::ProcessStatus status;
+    String error;
+    TEST_ASSERT_TRUE_MESSAGE(nivona::decodeHxResponse(chunks, true, status, error), error.c_str());
+    TEST_ASSERT_EQUAL_STRING("attention", status.summary.c_str());
+    TEST_ASSERT_EQUAL_STRING("fill up water", status.messageLabel.c_str());
 }
 
 void test_hx_decoder_ignores_leading_ack_frame_in_mixed_batch() {
@@ -265,12 +296,14 @@ int main(int argc, char** argv) {
     UNITY_BEGIN();
     RUN_TEST(test_rc4_transform_vectors_match_documented_examples);
     RUN_TEST(test_build_packet_matches_documented_request_vectors);
+    RUN_TEST(test_hp_liveness_response_requires_valid_24_byte_payload);
     RUN_TEST(test_live_hu_vector_round_trips_through_decoder_and_payload_validator);
     RUN_TEST(test_live_hr_response_decodes_without_session_echo);
     RUN_TEST(test_live_hr_response_rejects_incorrect_session_echo_expectation);
     RUN_TEST(test_hx_ready_vector_decodes_to_apk_backed_labels);
     RUN_TEST(test_unknown_hx_message_code_stays_raw_and_unlabeled);
     RUN_TEST(test_hx_confirmable_messages_are_flagged_for_host_confirm);
+    RUN_TEST(test_hx_operator_message_takes_priority_over_preparing_process);
     RUN_TEST(test_hx_decoder_ignores_leading_ack_frame_in_mixed_batch);
     RUN_TEST(test_family_700_standard_recipe_lookup_and_layout_match_apk_offsets);
     RUN_TEST(test_family_900_standard_recipe_layout_tracks_split_temperatures_and_scaled_fluids);

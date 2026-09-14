@@ -68,17 +68,28 @@ public:
     using Handler = std::function<void()>;
     using BeforeRequest = bool (*)(void* context);
     using AfterRequest = void (*)(uint32_t durationUs, void* context);
-    using StatusRenderer = bool (*)(String& jsonOut, void* context);
+    using StatusRenderer = bool (*)(char* jsonOut,
+                                    size_t capacity,
+                                    size_t& lengthOut,
+                                    void* context);
     using JobRenderer = EventJobLookup (*)(const String& id,
                                            String& jsonOut,
                                            bool& terminalOut,
                                            void* context);
+    using BrewRenderer = EventJobLookup (*)(const String& id,
+                                            String& jsonOut,
+                                            void* context);
 
     explicit BridgeHttpServer(uint16_t port = 80);
     ~BridgeHttpServer();
 
     void on(const char* uri, HTTPMethod method, Handler handler);
     void on(const char* uri, HTTPMethod method, Handler handler, Handler uploadHandler);
+    void on(const char* uri,
+            HTTPMethod method,
+            Handler handler,
+            Handler uploadHandler,
+            size_t maximumMultipartRequestBytes);
     void onNotFound(Handler handler);
     void collectHeaders(const char*[], size_t) {}
 
@@ -88,6 +99,7 @@ public:
     void configureEvents(uint32_t bootNonce,
                          StatusRenderer statusRenderer,
                          JobRenderer jobRenderer,
+                         BrewRenderer brewRenderer,
                          void* context = nullptr);
 
     bool begin();
@@ -99,12 +111,14 @@ public:
     String arg(const String& name) const;
     bool hasHeader(const String& name) const;
     String header(const String& name) const;
+    bool headerEquals(const char* name, const char* expected) const;
     HTTPUpload& upload();
 
     void sendHeader(const String& name, const String& value, bool first = false);
     void setContentLength(size_t length);
     void send(int code, const char* contentType, const String& body);
     void send(int code, const char* contentType, const char* body);
+    void send(int code, const char* contentType, const char* body, size_t length);
     void send_P(int code,
                 const char* contentType,
                 PGM_P body,
@@ -117,9 +131,20 @@ public:
     BridgeHttpClient client();
 
     void notifyJobChanged(const char* id);
+    void notifyBrewChanged(const char* id);
     void markStatusChanged();
+    bool sendStatusSnapshot();
     void tickEvents(uint32_t nowMs, bool active);
     size_t websocketClientCount() const;
+    bool running() const;
+    uint32_t taskHeartbeatAtMs() const;
+    uint32_t taskHeartbeatAgeMs(uint32_t nowMs) const;
+    uint32_t taskStackHighWaterBytes() const;
+    bool healthProbePending() const;
+    uint32_t healthProbeQueueFailures() const;
+    // Long synchronous handlers call this while making bounded progress. The
+    // queued health probe runs on this same task and cannot do so for them.
+    void markTaskProgress();
 
 private:
     friend class BridgeHttpClient;
@@ -129,6 +154,7 @@ private:
         HTTPMethod method{HTTP_GET};
         Handler handler;
         Handler uploadHandler;
+        size_t maximumMultipartRequestBytes{0};
     };
 
     struct RequestContext {
@@ -138,8 +164,6 @@ private:
         String body;
         std::vector<std::pair<String, String>> args;
         std::vector<std::pair<String, String>> responseHeaders;
-        String responseType;
-        String responseStatus;
         size_t contentLength{0};
         size_t streamedBytes{0};
         bool contentLengthSet{false};
@@ -156,22 +180,27 @@ private:
     };
 
     static constexpr size_t MAX_JSON_BODY_BYTES = 8192;
-    static constexpr size_t MAX_MULTIPART_REQUEST_BYTES = 2 * 1024 * 1024;
+    static constexpr size_t DEFAULT_MAX_MULTIPART_REQUEST_BYTES = 2 * 1024 * 1024;
     static constexpr size_t MAX_EVENT_CLIENTS = 4;
     static constexpr uint32_t EVENT_DIRTY_MIN_INTERVAL_MS = 200;
     static constexpr uint32_t EVENT_ACTIVE_STATUS_INTERVAL_MS = 1000;
     static constexpr uint32_t EVENT_IDLE_STATUS_INTERVAL_MS = 5000;
+    static constexpr uint32_t HEALTH_PROBE_INTERVAL_MS = 5000;
+    static constexpr size_t STATUS_MESSAGE_CAPACITY = 5120;
 
     static esp_err_t dispatchThunk(httpd_req_t* request);
     static esp_err_t websocketThunk(httpd_req_t* request);
     static void eventWorkThunk(void* context);
+    static void healthProbeThunk(void* context);
     static void closeSessionThunk(httpd_handle_t handle, int fd);
     static void ignoreGlobalContextFree(void*) {}
 
     esp_err_t dispatch(httpd_req_t* request);
     esp_err_t handleWebsocket(httpd_req_t* request);
     bool readBody(httpd_req_t* request, String& bodyOut);
-    bool processMultipart(httpd_req_t* request, const Handler& uploadHandler);
+    bool processMultipart(httpd_req_t* request,
+                          const Handler& uploadHandler,
+                          size_t maximumRequestBytes);
     Route* findRoute(const String& uri, HTTPMethod method);
     void parseQuery(httpd_req_t* request, RequestContext& context);
     void applyResponseMetadata(RequestContext& context, int code, const char* contentType);
@@ -189,14 +218,21 @@ private:
     void sendStatusToAll(const char* type = "status");
     void sendJob(EventClient& client, const char* id);
     void sendJobToWatchers(const char* id);
+    void sendBrewToAll(const char* id);
     void sendErrorEvent(EventClient& client,
                         const char* code,
                         const char* message,
                         const char* jobId = nullptr);
     bool sendEvent(EventClient& client, const String& payload);
+    bool sendEvent(EventClient& client, const char* payload, size_t length);
+    bool renderStatusEventMessage(const char* type,
+                                  bool hello,
+                                  size_t& lengthOut);
     String nextEventSequence();
     void drainEventWork();
     void requestEventWork();
+    void updateTaskHeartbeat();
+    void tickHealthProbe(uint32_t nowMs);
 
     uint16_t port_{80};
     httpd_handle_t handle_{nullptr};
@@ -212,14 +248,22 @@ private:
     uint32_t eventCounter_{1};
     StatusRenderer statusRenderer_{nullptr};
     JobRenderer jobRenderer_{nullptr};
+    BrewRenderer brewRenderer_{nullptr};
     void* eventContext_{nullptr};
     std::array<EventClient, MAX_EVENT_CLIENTS> eventClients_{};
     std::atomic<size_t> eventClientCount_{0};
+    std::array<char, STATUS_MESSAGE_CAPACITY> statusMessage_{};
     portMUX_TYPE eventChangesMutex_ = portMUX_INITIALIZER_UNLOCKED;
     EventChanges eventChanges_;
     bool eventWorkQueued_{false};
     uint32_t lastEventDispatchAtMs_{0};
     std::atomic<uint32_t> lastStatusEventAtMs_{0};
+    std::atomic<bool> running_{false};
+    std::atomic<uint32_t> taskHeartbeatAtMs_{0};
+    std::atomic<uint32_t> taskStackHighWaterBytes_{0};
+    std::atomic<bool> healthProbePending_{false};
+    std::atomic<uint32_t> healthProbeQueueFailures_{0};
+    std::atomic<uint32_t> lastHealthProbeQueuedAtMs_{0};
 };
 
 } // namespace bridge_http

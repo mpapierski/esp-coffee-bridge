@@ -8,7 +8,11 @@
 #include <string>
 
 namespace {
-uint8_t flash[240][4096]; // Match partitions_ota.csv: 960 KiB.
+constexpr size_t BLOCK_BYTES = 4096;
+constexpr size_t LEGACY_BLOCK_COUNT = (960 * 1024) / BLOCK_BYTES;
+constexpr size_t BLOCK_COUNT = history_capacity::LITTLEFS_PARTITION_BYTES / BLOCK_BYTES;
+static_assert(history_capacity::LITTLEFS_PARTITION_BYTES % BLOCK_BYTES == 0);
+uint8_t flash[BLOCK_COUNT][BLOCK_BYTES]; // Match the 8 MiB partition.
 size_t programmed = 0;
 int readBlock(const lfs_config*, lfs_block_t block, lfs_off_t offset, void* data, lfs_size_t bytes) {
     memcpy(data, &flash[block][offset], bytes);
@@ -23,8 +27,23 @@ int programBlock(const lfs_config*, lfs_block_t block, lfs_off_t offset, const v
     programmed += bytes;
     return 0;
 }
-int eraseBlock(const lfs_config*, lfs_block_t block) { memset(flash[block], 255, 4096); return 0; }
+int eraseBlock(const lfs_config*, lfs_block_t block) { memset(flash[block], 255, BLOCK_BYTES); return 0; }
 int sync(const lfs_config*) { return 0; }
+
+void configure(lfs_config& cfg, size_t blockCount) {
+    cfg = {};
+    cfg.read = readBlock;
+    cfg.prog = programBlock;
+    cfg.erase = eraseBlock;
+    cfg.sync = sync;
+    cfg.read_size = 16;
+    cfg.prog_size = 16;
+    cfg.block_size = BLOCK_BYTES;
+    cfg.block_count = blockCount;
+    cfg.block_cycles = 500;
+    cfg.cache_size = 512;
+    cfg.lookahead_size = 32;
+}
 
 class Store {
 public:
@@ -72,13 +91,71 @@ std::string record(size_t index) {
     return bytes + '\n';
 }
 
+void growLegacyFilesystem() {
+    memset(flash, 255, sizeof(flash));
+    programmed = 0;
+    lfs_config cfg{};
+    configure(cfg, LEGACY_BLOCK_COUNT);
+    lfs_t fs{};
+    assert(lfs_format(&fs, &cfg) == 0);
+    // esp_littlefs mounts with block_count=0 so LittleFS reads the legacy
+    // count from its superblock, then grow_on_mount supplies the partition's
+    // new physical block count to lfs_fs_grow.
+    cfg.block_count = 0;
+    assert(lfs_mount(&fs, &cfg) == 0);
+    const std::string retained(64 * 1024, 'H');
+    append(fs, "history.jsonl", retained);
+    assert(lfs_unmount(&fs) == 0);
+
+    assert(lfs_mount(&fs, &cfg) == 0);
+    assert(lfs_fs_grow(&fs, BLOCK_COUNT) == 0);
+    assert(readFile(fs, "history.jsonl") == retained);
+
+    const std::string beyondLegacyCapacity(1024 * 1024, 'G');
+    append(fs, "grown.bin", beyondLegacyCapacity);
+    assert(lfs_fs_size(&fs) > LEGACY_BLOCK_COUNT);
+    assert(lfs_unmount(&fs) == 0);
+    assert(lfs_mount(&fs, &cfg) == 0);
+    assert(readFile(fs, "history.jsonl") == retained);
+    assert(readFile(fs, "grown.bin") == beyondLegacyCapacity);
+    assert(lfs_unmount(&fs) == 0);
+    printf("growth passed: 960 KiB filesystem expanded to 8 MiB\n");
+}
+
+void maximumBackupFits() {
+    memset(flash, 255, sizeof(flash));
+    programmed = 0;
+    lfs_config cfg{};
+    configure(cfg, BLOCK_COUNT);
+    lfs_t fs{};
+    assert(lfs_format(&fs, &cfg) == 0);
+    assert(lfs_mount(&fs, &cfg) == 0);
+
+    Store store(fs);
+    backup_staging::Writer<Store> writer(store);
+    uint8_t buffer[1460];
+    memset(buffer, 'U', sizeof(buffer));
+    size_t remaining = backup_staging::MAX_BYTES;
+    while (remaining > 0) {
+        const size_t bytes = std::min(remaining, sizeof(buffer));
+        assert(writer.write(buffer, bytes));
+        remaining -= bytes;
+    }
+    writer.close();
+    assert(writer.size() == backup_staging::MAX_BYTES);
+    const size_t allocated = size_t(lfs_fs_size(&fs)) * BLOCK_BYTES;
+    constexpr size_t MINIMUM_STAGING_RESERVE = 192 * 1024 + 24576 + 256;
+    assert(sizeof(flash) - allocated >= MINIMUM_STAGING_RESERVE);
+    assert(lfs_unmount(&fs) == 0);
+    printf("maximum backup passed: %zu bytes staged with %zu bytes free\n",
+           backup_staging::MAX_BYTES, sizeof(flash) - allocated);
+}
+
 void restore(bool interrupt) {
     memset(flash, 255, sizeof(flash));
     programmed = 0;
     lfs_config cfg{};
-    cfg.read = readBlock; cfg.prog = programBlock; cfg.erase = eraseBlock; cfg.sync = sync;
-    cfg.read_size = 16; cfg.prog_size = 16; cfg.block_size = 4096; cfg.block_count = 240;
-    cfg.block_cycles = 500; cfg.cache_size = 512; cfg.lookahead_size = 32;
+    configure(cfg, BLOCK_COUNT);
     lfs_t fs{};
     assert(lfs_format(&fs, &cfg) == 0);
     assert(lfs_mount(&fs, &cfg) == 0);
@@ -156,4 +233,4 @@ void restore(bool interrupt) {
 }
 } // namespace
 
-int main() { restore(false); restore(true); }
+int main() { growLegacyFilesystem(); maximumBackupFits(); restore(false); restore(true); }
