@@ -5981,6 +5981,18 @@ bool fetchDeviceDetails(String& error) {
         }
     }
 
+    if (details.serial.isEmpty() && !details.ad06Ascii.isEmpty()) {
+        // DIS 2A25 is optional in the vendor's own initialization path, and live
+        // Type 573 and 8000-family machines omit it while carrying their identity
+        // in AD06. Only accept a value that resolves to a known family, because
+        // AD06 is a writable device-name characteristic.
+        DeviceDetails candidate;
+        candidate.serial = details.ad06Ascii;
+        if (!detectModelInfo(candidate).familyKey.isEmpty()) {
+            details.serial = details.ad06Ascii;
+        }
+    }
+
     cachedDetails = details;
     error         = details.lastError;
     return true;
